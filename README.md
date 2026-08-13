@@ -29,13 +29,26 @@
 
 > 当前“可报价池集合”是每个跟踪 Token 各选 1 个 Raydium Standard、1 个 Orca Whirlpool、1 个 Meteora DLMM，共 **6 个池**。V0 的 18 个候选池仍用于发现/核验，但 Raydium CLMM 和 Meteora DAMM v2 尚未进入本地 Quote 引擎，因此 V2 没有声称“18 个池全部可报价”。
 
+### V3 当前子模块状态
+
+| 子模块 | 状态 | 当前证据 |
+|---|---|---|
+| 统一 `SwapQuote` 与两腿闭环计算 | ✅ 已完成并验证 | Mint / 金额连续性、同池拒绝、signed profit、slot 范围均有单元测试 |
+| Raydium Standard 双方向 Quote | ✅ 已接入 V3 实际路径 | `WSOL → Token` 与 `Token → WSOL` 均由真实 Pool State + vault 计算 |
+| Orca Whirlpool 双方向 Quote | ✅ 已接入 V3 实际路径 | 两个方向均使用真实 Whirlpool/TickArray/Mint 状态和官方 core Quote |
+| Raydium ↔ Orca 两腿闭环 | ✅ 已真实验证 | BONK/WIF 双方向共 4 条真实主网闭环 |
+| Meteora 参与跨池路径 | ⏳ 未完成 | V2 单池 Quote 已完成，但尚未接入 V3 通用闭环枚举 |
+| 多输入金额利润曲线 | ⏳ 未完成 | 当前闭环验收输入固定为 0.01 WSOL |
+| 执行成本 / 净利润模型 | ⏳ 未完成 | Priority Fee / Jito Tip 等尚未扣除 |
+| 实时 Opportunity Engine / 记录统计 | ⏳ 未完成 | 尚未进入连续监控 |
+
 ## 当前阶段成功标准
 
 V3 只有满足以下条件才会标记完成：
 
 1. 对同一 Token 的不同可报价池，以同一输入资产和输入金额计算可比较的真实本地 Quote。
 2. 建立两腿闭环，例如 `WSOL → BONK → WSOL`，不能只比较表面价格。
-3. 明确区分毛利润和净利润；净利润至少扣除两腿 DEX fee，并为后续 Priority Fee / Jito Tip / 交易成本预留独立成本项。
+3. 明确区分毛利润和净利润；两腿 DEX fee 已体现在各腿 Quote 输出中，净利润还需进一步扣除 Priority Fee / Jito Tip / 其他执行成本。
 4. 对多个输入金额计算闭环结果，避免把某一个固定金额的价差误当成可执行机会。
 5. 实时依赖账户变化后，只重算受影响池，并更新对应 Token 的跨池机会。
 6. 机会记录至少包含时间、slot、Token、买入池、卖出池、输入金额、两腿输出、毛利润/收益率和可解释的成本字段。
@@ -206,6 +219,42 @@ V3 开始前完成了一次独立基础设施优化，并保持业务代码不�
 - 缓存命中后再次完成真实 Pool Discovery、主网 owner、Helius HTTP/WSS、Raydium、Orca、Meteora 和依赖账户 WSS 全链路回归。
 - 临时生成 `Cargo.lock` 的 one-shot workflow 已删除，仓库只保留正式 CI。
 
+### V3.1 — 统一 Quote 与 Raydium ↔ Orca 两腿闭环
+
+第一组 V3 业务逻辑已在正式 CI Run `31691663172` 中完成真实验证。
+
+实现内容：
+
+- 新增统一 `SwapQuote`：记录 DEX、Pool、输入/输出 Mint、输入/输出 raw amount 与快照 slot。
+- 新增 `evaluate_round_trip`：严格要求两腿 Mint 连续、第二腿输入金额等于第一腿真实输出、最终回到原始资产，并拒绝同一 Pool 自循环。
+- 利润使用 signed `i128`，亏损不会发生无符号下溢。
+- `gross_profit_raw = final_amount - input_amount`；Raydium/Orca 的 DEX swap fee 已经体现在各腿 Quote 输出中，因此这里尚未再扣 Priority Fee、Jito Tip 等链上执行成本。
+- 记录 `oldest_slot / newest_slot`，为后续机会新鲜度约束保留依据。
+- Raydium Standard 与 Orca Whirlpool 的外层报价均已从固定 `0.01 WSOL` 拆成可接收任意输入 Mint / amount 的双方向 Quote 接口。
+- 正式命令 `round-trip-check` 被主程序路由和 CI 真实调用，不是仅测试代码。
+
+单元测试由 78 增加到 **82 passed / 0 failed**，新增测试覆盖：
+
+1. `SwapQuote` 空 Pool / 空 Mint / 同 Mint / 零金额拒绝。
+2. 盈利闭环与 slot 范围计算。
+3. 亏损使用 signed profit，不发生 underflow。
+4. 同池、Mint 断链、两腿金额不连续全部拒绝。
+
+Run `31691663172` 的 0.01 WSOL 真实主网闭环快照：
+
+| Token | 路径 | 初始输入 | 第一腿 Token 输出 | 最终 WSOL | gross profit | gross return |
+|---|---|---:|---:|---:|---:|---:|
+| BONK | Raydium → Orca | 0.01 WSOL | 326,904.27740 BONK | 0.009971942 WSOL | -0.000028058 SOL | -28 bps（整数截断） |
+| BONK | Orca → Raydium | 0.01 WSOL | 327,492.55156 BONK | 0.009965672 WSOL | -0.000034328 SOL | -34 bps（整数截断） |
+| WIF | Raydium → Orca | 0.01 WSOL | 5.449899 WIF | 0.009983824 WSOL | -0.000016176 SOL | -16 bps（整数截断） |
+| WIF | Orca → Raydium | 0.01 WSOL | 5.454291 WIF | 0.009958072 WSOL | -0.000041928 SOL | -41 bps（整数截断） |
+
+四条路径的两腿在当次检查中分别使用同一 slot：BONK=`439001952`，WIF=`439001953`。
+
+> **这次真实快照没有出现可盈利机会。** 四条闭环都为负收益，而且这里还没有扣 Priority Fee / Jito Tip 等执行成本。该结果只证明闭环计算链已经工作，不证明策略可盈利，也不说明未来不会出现正机会。
+
+同一 CI 最后一关继续真实收到 Orca TickArray 更新并触发 V2 Quote 重算，说明 V3 改动没有破坏实时状态链路。
+
 ### V0 监控候选筛选规则
 
 当前研究期默认：
@@ -314,28 +363,41 @@ V3 开始前完成了一次独立基础设施优化，并保持业务代码不�
 
 这说明 `minContextSlot` 的一致性保护按预期拒绝了落后节点，同时也说明真实联网 CI 存在外部节点短暂滞后的非确定性，后续若频率增加再单独设计有限重试策略。
 
+### V3 新模型首次提交被 Clippy 判为 dead code
+
+`SwapQuote` / `RoundTripOpportunity` / `evaluate_round_trip` 第一版只有单元测试调用，生产路径尚未使用，因此 Clippy 在 `-D warnings` 下拒绝通过。
+
+处理方式：没有加入 `allow(dead_code)`。将 Raydium / Orca 报价外层重构为真正支持任意输入方向，并新增生产命令 `round-trip-check`，让统一 Quote 与闭环计算真正进入实时主网验收路径。随后 Clippy 真实通过。
+
+### V3 一次性重构 workflow 无权修改正式 workflow
+
+用于生成较大 `app.rs` 重构的一次性 runner 能修改普通仓库内容，但 GitHub 拒绝其同时 push `.github/workflows/ci.yml`，报错为缺少 workflow 更新权限。
+
+处理方式：没有放宽 Token 权限。runner 只提交业务 `app.rs`，正式 `ci.yml` 由已授权 GitHub 连接器单独更新；所有 one-shot workflow 随后删除。最终正式 CI Run `31691663172` 完整通过。
+
 ## 当前问题 / 阻塞 / 风险
 
 - 当前开发主要依赖 GitHub Actions 进行 Rust 编译和真实联网测试，因为本次 ChatGPT 执行环境没有可直接使用的 Rust toolchain。
-- Cargo 缓存已经启用并真实命中；当前缓存归档约 **958 MB**，恢复/解压仍约需 27 秒，但相比数分钟冷编译明显更低。缓存 key 已绑定 Rust 版本和依赖锁文件，避免跨不兼容工具链静默复用。
+- Cargo 缓存已经启用并真实命中；当前缓存归档约 **958 MB**，恢复/解压仍需二十多秒，但相比数分钟冷编译明显更低。缓存 key 已绑定 Rust 版本和依赖锁文件，避免跨不兼容工具链静默复用。
 - `actions/checkout@v4` 当前有 Node.js 20 弃用警告；GitHub 强制使用 Node 24，本项目 CI 仍成功。该警告目前不影响业务验证。
 - `HELIUS_API_KEY` 没有写入仓库或 Git 历史，仅由 GitHub Actions Secret 在运行时注入。
 - DEX REST API 的 TVL 属于动态外部数据，不能视为链上实时成交价格。
 - 当前可报价池只有 6 个：每个 Token 的 Raydium Standard / Orca Whirlpool / Meteora DLMM 各 1 个。Raydium CLMM、Meteora DAMM v2 尚未进入 Quote 引擎。
 - Orca 当前真实可报价池均为经典 SPL Token 且非 Adaptive Fee；Token-2022 transfer fee 和 Adaptive Fee Oracle 尚无当前实池验证证据。
-- **当前还没有任何证据证明跨池套利策略可盈利。** V3 才开始计算、记录和统计真实闭环机会。
+- **目前只完成了 Raydium ↔ Orca、固定 0.01 WSOL 的首批闭环快照；4 条路径当次均为负收益。尚无正收益套利证据，也尚未扣 Priority Fee / Jito Tip 等执行成本。**
 - 当前 GitHub App 无权读取个人 Billing Usage API，因此 README 不记录猜测的 Actions 剩余额度；需要从 GitHub `Settings → Billing & Licensing` 查看真实账户用量。
 
 ## 下一步
 
 V3 当前计划：
 
-1. 先做统一的“单池双方向 Quote”接口，让三个 DEX 的输出进入同一可比较数据结构。
-2. 实现同 Token 两池闭环：例如 `WSOL → BONK（池 A）→ WSOL（池 B）`，反方向也计算。
-3. 为一个机会测试多个输入金额，先得到毛利润曲线，再逐步加入交易成本模型。
-4. 把实时依赖账户更新接到 Opportunity Engine，只重算受影响池和相关 Token 的路径。
-5. 记录真实机会的 slot、路径、金额、收益和持续情况；这一阶段仍然不接钱包、不下单。
-6. 需要连续 24–72 小时采样时停止使用 GitHub Actions 当长期运行环境，转到常驻 Linux VPS。
+1. 将 Meteora DLMM 接入统一双方向 `SwapQuote`，让三个已支持 DEX 都进入同一闭环接口。
+2. 从手工 Raydium ↔ Orca 两条方向扩展为三个 DEX 的全部不同 Pool 有向组合，自动枚举路径。
+3. 为每条路径测试多个输入金额，得到真实毛利润曲线，并选择候选最优输入规模。
+4. 增加独立执行成本模型：Priority Fee、Jito Tip、其他交易固定成本；避免重复扣已经包含在 Quote 中的 DEX fee。
+5. 把实时依赖账户更新接到 Opportunity Engine，只重算受影响池和相关 Token 的路径。
+6. 记录真实机会的 slot、路径、金额、收益和持续情况；这一阶段仍然不接钱包、不下单。
+7. 需要连续 24–72 小时采样时停止使用 GitHub Actions 当长期运行环境，转到常驻 Linux VPS。
 
 ## 开发与记录约定
 
@@ -375,4 +437,7 @@ V3 当前计划：
 - 提交 `Cargo.lock`，固定当前 Rust 依赖解析结果。
 - CI 加入 Cargo registry/git/target 缓存和同分支并发取消策略；首次缓存约 **958 MB**。
 - Run `31689455003` Attempt 2 真实 cache hit：`cargo check` 4.20 秒、`cargo test` 4.55 秒，78 个测试和全部真实联网回归通过。
-- 缓存命中回归期间真实收到 Meteora `BinArray` 更新并触发 Quote 重算，说明基础设施优化没有破坏 V2 实时链路。
+- V3.1 新增统一 `SwapQuote` / `RoundTripOpportunity` 与闭环校验；新增 4 组单元测试。
+- V3.1 将 Raydium Standard / Orca Whirlpool 改为可接受任意输入 Mint / amount 的双方向 Quote，并新增正式 `round-trip-check`。
+- V3.1 最终 CI Run `31691663172`：**82 passed / 0 failed**；BONK/WIF 的 Raydium ↔ Orca 共 4 条真实两腿闭环全部计算成功。
+- 当次 4 条闭环均为负收益，当前仍无可盈利证据；V3 保持进行中。
