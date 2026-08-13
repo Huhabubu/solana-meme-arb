@@ -360,7 +360,7 @@ mod tests {
     fn rejects_missing_expected_program_id() {
         let pools = vec![pool("pool-a", None)];
         let owners = vec![Some("program-a".into())];
-        assert!(verify_pool_accounts(&pools, &[None]).is_err());
+        assert!(verify_pool_accounts(&pools, &owners).is_err());
     }
 
     #[test]
