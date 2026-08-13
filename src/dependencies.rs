@@ -1,8 +1,8 @@
 use anyhow::Result;
-use orca_whirlpools_client::Whirlpool;
+use commons::dlmm::accounts::LbPair;
 
 use crate::{
-    dex::{meteora_dlmm::MeteoraLbPair, raydium_amm::RaydiumAmmV4State},
+    dex::raydium_amm::RaydiumAmmV4State,
     model::PoolInfo,
     state::{DependencyAccount, DependencyKind, PoolDependencies},
 };
@@ -23,11 +23,10 @@ pub fn raydium_standard_dependencies(
 
 pub fn orca_whirlpool_dependencies(
     pool: &PoolInfo,
-    whirlpool: &Whirlpool,
     existing_tick_arrays: &[String],
     oracle_address: Option<&str>,
 ) -> Result<PoolDependencies> {
-    let mut accounts = Vec::with_capacity(4 + existing_tick_arrays.len());
+    let mut accounts = Vec::with_capacity(2 + existing_tick_arrays.len());
     accounts.push(DependencyAccount::new(
         &pool.address,
         DependencyKind::PoolState,
@@ -44,13 +43,12 @@ pub fn orca_whirlpool_dependencies(
 
     // 当前 BONK/WIF Orca 池已实证为经典 SPL Token，官方 quote 不需要 Mint 状态参与数学。
     // 若未来支持 Token-2022 transfer fee，这里必须把 token_mint_a / token_mint_b 加入依赖。
-    let _ = whirlpool;
     PoolDependencies::new(pool.clone(), accounts)
 }
 
 pub fn meteora_dlmm_dependencies(
     pool: &PoolInfo,
-    lb_pair: &MeteoraLbPair,
+    lb_pair: &LbPair,
     bin_arrays: &[String],
     bitmap_extension_address: Option<&str>,
 ) -> Result<PoolDependencies> {
@@ -88,7 +86,9 @@ pub fn meteora_dlmm_dependencies(
 #[cfg(test)]
 mod tests {
     use anchor_client::solana_sdk::pubkey::Pubkey;
-    use orca_whirlpools_client::{Whirlpool, WHIRLPOOL_DISCRIMINATOR};
+    use anchor_lang::Discriminator;
+    use commons::dlmm::accounts::LbPair;
+    use std::mem::size_of;
 
     use super::*;
     use crate::{
@@ -96,9 +96,6 @@ mod tests {
         model::Dex,
         state::DependencyKind,
     };
-    use anchor_lang::Discriminator;
-    use commons::dlmm::accounts::LbPair;
-    use std::mem::size_of;
 
     fn pool(dex: Dex, address: &str) -> PoolInfo {
         PoolInfo {
@@ -132,35 +129,28 @@ mod tests {
             raydium_standard_dependencies(&pool(Dex::Raydium, "pool-a"), &state).unwrap();
 
         assert_eq!(dependencies.accounts.len(), 3);
-        assert!(dependencies
-            .accounts
-            .iter()
-            .any(|account| account.address == "coin-vault" && account.kind == DependencyKind::TokenVault));
-        assert!(dependencies
-            .accounts
-            .iter()
-            .any(|account| account.address == "pc-vault" && account.kind == DependencyKind::TokenVault));
+        assert!(dependencies.accounts.iter().any(|account| {
+            account.address == "coin-vault" && account.kind == DependencyKind::TokenVault
+        }));
+        assert!(dependencies.accounts.iter().any(|account| {
+            account.address == "pc-vault" && account.kind == DependencyKind::TokenVault
+        }));
     }
 
     #[test]
     fn orca_dependencies_only_include_existing_tick_arrays_and_optional_oracle() {
-        let mut data = vec![0u8; Whirlpool::LEN];
-        data[..8].copy_from_slice(&WHIRLPOOL_DISCRIMINATOR);
-        let whirlpool = Whirlpool::from_bytes(&data).unwrap();
         let ticks = vec!["tick-a".to_owned(), "tick-b".to_owned()];
         let dependencies = orca_whirlpool_dependencies(
             &pool(Dex::Orca, "pool-a"),
-            &whirlpool,
             &ticks,
             Some("oracle"),
         )
         .unwrap();
 
         assert_eq!(dependencies.accounts.len(), 4);
-        assert!(dependencies
-            .accounts
-            .iter()
-            .any(|account| account.address == "oracle" && account.kind == DependencyKind::Oracle));
+        assert!(dependencies.accounts.iter().any(|account| {
+            account.address == "oracle" && account.kind == DependencyKind::Oracle
+        }));
         assert!(!dependencies
             .accounts
             .iter()
