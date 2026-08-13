@@ -15,21 +15,6 @@ pub enum DependencyKind {
     TokenMint,
 }
 
-impl DependencyKind {
-    pub fn is_dynamic_quote_trigger(self) -> bool {
-        matches!(
-            self,
-            Self::PoolState
-                | Self::TokenVault
-                | Self::TickArray
-                | Self::Oracle
-                | Self::BinArray
-                | Self::BitmapExtension
-                | Self::TokenMint
-        )
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct DependencyAccount {
     pub address: String,
@@ -163,10 +148,6 @@ impl QuoteState {
         let mut addresses = self.pools_by_account.keys().cloned().collect::<Vec<_>>();
         addresses.sort();
         addresses
-    }
-
-    pub fn account(&self, address: &str) -> Option<&VersionedAccountData> {
-        self.account_data.get(address)
     }
 
     /// 同 slot 的新通知仍接受，因为一个账户在同一 slot 内可能出现新的最终状态；
