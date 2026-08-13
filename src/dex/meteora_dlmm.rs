@@ -134,6 +134,14 @@ pub fn quote_exact_in(
     .context("Meteora official exact-input quote failed")
 }
 
+/// Meteora commons 当前以 anyhow 文本区分“池在该方向无法完整填满输入”。
+/// 只检查整个 error chain 中官方根因的精确文本，其他 Quote 错误不能被误判为流动性不足。
+pub fn is_pool_out_of_liquidity(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.to_string() == "Pool out of liquidity")
+}
+
 fn validate_anchor_account<T: Discriminator>(
     data: &[u8],
     body_size: usize,
@@ -246,6 +254,17 @@ mod tests {
         assert_eq!(account.owner, owner);
         assert_eq!(account.data, vec![1, 2, 3]);
         assert!(quote_mint_account("invalid", &[]).is_err());
+    }
+
+    #[test]
+    fn identifies_only_nested_official_pool_out_of_liquidity_error() {
+        let error = anyhow::anyhow!("Pool out of liquidity")
+            .context("Meteora official exact-input quote failed");
+        assert!(is_pool_out_of_liquidity(&error));
+
+        let other = anyhow::anyhow!("Active bin array not found")
+            .context("Meteora official exact-input quote failed");
+        assert!(!is_pool_out_of_liquidity(&other));
     }
 
     #[test]
