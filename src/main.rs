@@ -28,7 +28,7 @@ async fn main() -> Result<()> {
             bail!("{} / WSOL: no exact pools found", token.symbol);
         }
 
-        println!("\n========== {}/WSOL ==========" , token.symbol);
+        println!("\n========== {}/WSOL ==========", token.symbol);
         for pool in pools {
             println!(
                 "{:<16} {:<44} TVL ${:>12.2}  {}",
