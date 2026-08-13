@@ -3,7 +3,10 @@ use reqwest::Client;
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::{model::{Dex, PoolInfo}, serde_utils::number_from_value};
+use crate::{
+    model::{Dex, PoolInfo},
+    serde_utils::number_from_value,
+};
 
 const BASE_URL: &str = "https://api-v3.raydium.io/pools/info/mint";
 
@@ -60,7 +63,10 @@ pub async fn fetch_pools(client: &Client, mint_x: &str, mint_y: &str) -> Result<
 fn parse_response(body: &str, mint_x: &str, mint_y: &str) -> Result<Vec<PoolInfo>> {
     let envelope: Envelope = serde_json::from_str(body).context("invalid Raydium JSON")?;
     if !envelope.success {
-        bail!("Raydium API error: {}", envelope.msg.unwrap_or_else(|| "unknown error".into()));
+        bail!(
+            "Raydium API error: {}",
+            envelope.msg.unwrap_or_else(|| "unknown error".into())
+        );
     }
 
     let page = envelope.data.context("Raydium response missing data")?;
@@ -79,7 +85,12 @@ fn parse_response(body: &str, mint_x: &str, mint_y: &str) -> Result<Vec<PoolInfo
             Ok(info)
         })
         .collect::<Result<Vec<_>>>()
-        .map(|pools| pools.into_iter().filter(|pool| pool.matches_pair(mint_x, mint_y)).collect())
+        .map(|pools| {
+            pools
+                .into_iter()
+                .filter(|pool| pool.matches_pair(mint_x, mint_y))
+                .collect()
+        })
 }
 
 #[cfg(test)]
