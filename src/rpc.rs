@@ -74,7 +74,9 @@ fn parse_account_owners(body: &str) -> Result<Vec<Option<String>>> {
         bail!("Solana RPC error {}: {}", error.code, error.message);
     }
 
-    let result = envelope.result.context("Solana RPC response missing result")?;
+    let result = envelope
+        .result
+        .context("Solana RPC response missing result")?;
     Ok(result
         .value
         .into_iter()
