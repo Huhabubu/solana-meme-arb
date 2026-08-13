@@ -128,6 +128,19 @@ jobs:
           fi
           cargo run -- meteora-quote-check
 
+      # V3 第一层：真实计算 Raydium/Orca 双方向两腿闭环，允许结果为负但必须完成金额与 Mint 连续性校验。
+      - name: Live V3 Raydium Orca round-trip verification
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        timeout-minutes: 3
+        env:
+          HELIUS_API_KEY: ${{ secrets.HELIUS_API_KEY }}
+        run: |
+          if [ -z "$HELIUS_API_KEY" ]; then
+            echo "HELIUS_API_KEY secret is not configured; V3 round-trip verification skipped."
+            exit 0
+          fi
+          cargo run -- round-trip-check
+
       # V2 最后一层：订阅真正参与报价的 Pool/Vault/TickArray/BinArray 等依赖账户，
       # 收到真实变更后必须能映射回受影响 Pool 并触发对应报价重算。
       - name: Live quote dependency WSS routing verification
