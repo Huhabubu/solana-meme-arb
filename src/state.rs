@@ -128,8 +128,7 @@ impl QuoteState {
                 .or_default()
                 .insert(pool_address.clone());
         }
-        self.dependencies_by_pool
-            .insert(pool_address, dependencies);
+        self.dependencies_by_pool.insert(pool_address, dependencies);
         Ok(())
     }
 
@@ -218,13 +217,13 @@ impl QuoteState {
     fn remove_reverse_index(&mut self, dependencies: &PoolDependencies) {
         let pool_address = &dependencies.pool.address;
         for account in &dependencies.accounts {
-            let remove_account_key = if let Some(pools) = self.pools_by_account.get_mut(&account.address)
-            {
-                pools.remove(pool_address);
-                pools.is_empty()
-            } else {
-                false
-            };
+            let remove_account_key =
+                if let Some(pools) = self.pools_by_account.get_mut(&account.address) {
+                    pools.remove(pool_address);
+                    pools.is_empty()
+                } else {
+                    false
+                };
             if remove_account_key {
                 self.pools_by_account.remove(&account.address);
             }
@@ -376,8 +375,18 @@ mod tests {
             )
             .unwrap();
 
-        assert!(state.apply_account_update("vault", version(10, 1)).unwrap().accepted);
-        assert!(state.apply_account_update("vault", version(10, 2)).unwrap().accepted);
+        assert!(
+            state
+                .apply_account_update("vault", version(10, 1))
+                .unwrap()
+                .accepted
+        );
+        assert!(
+            state
+                .apply_account_update("vault", version(10, 2))
+                .unwrap()
+                .accepted
+        );
         assert_eq!(state.account("vault").unwrap().data, vec![2]);
 
         let result = state.apply_account_update("vault", version(9, 3)).unwrap();
@@ -399,7 +408,9 @@ mod tests {
             )
             .unwrap();
 
-        assert!(state.apply_account_update("unknown", version(1, 1)).is_err());
+        assert!(state
+            .apply_account_update("unknown", version(1, 1))
+            .is_err());
         assert!(state
             .apply_account_update(
                 "vault",
@@ -429,10 +440,11 @@ mod tests {
             .unwrap();
 
         assert_eq!(state.missing_accounts_for_pool("pool-a").unwrap().len(), 2);
-        state
-            .apply_account_update("pool-a", version(1, 1))
-            .unwrap();
-        assert_eq!(state.missing_accounts_for_pool("pool-a").unwrap(), vec!["vault"]);
+        state.apply_account_update("pool-a", version(1, 1)).unwrap();
+        assert_eq!(
+            state.missing_accounts_for_pool("pool-a").unwrap(),
+            vec!["vault"]
+        );
         state.apply_account_update("vault", version(1, 2)).unwrap();
         assert!(state
             .missing_accounts_for_pool("pool-a")

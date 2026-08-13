@@ -91,11 +91,7 @@ mod tests {
     use std::mem::size_of;
 
     use super::*;
-    use crate::{
-        dex::meteora_dlmm::decode_lb_pair,
-        model::Dex,
-        state::DependencyKind,
-    };
+    use crate::{dex::meteora_dlmm::decode_lb_pair, model::Dex, state::DependencyKind};
 
     fn pool(dex: Dex, address: &str) -> PoolInfo {
         PoolInfo {
@@ -140,12 +136,9 @@ mod tests {
     #[test]
     fn orca_dependencies_only_include_existing_tick_arrays_and_optional_oracle() {
         let ticks = vec!["tick-a".to_owned(), "tick-b".to_owned()];
-        let dependencies = orca_whirlpool_dependencies(
-            &pool(Dex::Orca, "pool-a"),
-            &ticks,
-            Some("oracle"),
-        )
-        .unwrap();
+        let dependencies =
+            orca_whirlpool_dependencies(&pool(Dex::Orca, "pool-a"), &ticks, Some("oracle"))
+                .unwrap();
 
         assert_eq!(dependencies.accounts.len(), 4);
         assert!(dependencies.accounts.iter().any(|account| {

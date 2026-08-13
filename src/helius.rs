@@ -323,9 +323,7 @@ pub async fn subscribe_accounts_and_wait_for_update(
                         code,
                         message,
                     } => {
-                        bail!(
-                            "Helius WSS RPC error request={request_id:?} code={code}: {message}"
-                        );
+                        bail!("Helius WSS RPC error request={request_id:?} code={code}: {message}");
                     }
                     ServerEvent::Other => {}
                 },
@@ -359,13 +357,9 @@ pub async fn subscribe_and_wait_for_update(
         .iter()
         .map(|pool| pool.address.clone())
         .collect::<Vec<_>>();
-    let update = subscribe_accounts_and_wait_for_update(
-        config,
-        &addresses,
-        &HashSet::new(),
-        wait_timeout,
-    )
-    .await?;
+    let update =
+        subscribe_accounts_and_wait_for_update(config, &addresses, &HashSet::new(), wait_timeout)
+            .await?;
     let pool = pools
         .iter()
         .find(|pool| pool.address == update.address)

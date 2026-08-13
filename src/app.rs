@@ -13,8 +13,7 @@ use solana_pubkey::Pubkey;
 use crate::{
     config::HeliusConfig,
     dependencies::{
-        meteora_dlmm_dependencies, orca_whirlpool_dependencies,
-        raydium_standard_dependencies,
+        meteora_dlmm_dependencies, orca_whirlpool_dependencies, raydium_standard_dependencies,
     },
     dex::{
         meteora::DLMM_PROGRAM_ID,
@@ -34,9 +33,7 @@ use crate::{
     discovery::{
         discover_pair, select_monitoring_candidates, MAX_POOLS_PER_DEX, MIN_MONITOR_TVL_USD,
     },
-    helius::{
-        check_http, subscribe_accounts_and_wait_for_update, subscribe_and_wait_for_update,
-    },
+    helius::{check_http, subscribe_accounts_and_wait_for_update, subscribe_and_wait_for_update},
     model::{Dex, PoolInfo},
     rpc::{fetch_account_owners, fetch_accounts, verify_pool_accounts, PUBLIC_MAINNET_RPC},
     state::{DependencyKind, PoolDependencies, QuoteState, VersionedAccountData},
@@ -116,7 +113,12 @@ fn token_symbol_for_pool(pool: &PoolInfo) -> Result<&'static str> {
         .iter()
         .find(|token| pool.matches_pair(token.mint, WSOL))
         .map(|token| token.symbol)
-        .with_context(|| format!("pool is not part of the tracked token universe: {}", pool.address))
+        .with_context(|| {
+            format!(
+                "pool is not part of the tracked token universe: {}",
+                pool.address
+            )
+        })
 }
 
 async fn run_discover(client: &Client) -> Result<()> {
@@ -205,11 +207,7 @@ async fn run_raydium_quote_check(client: &Client) -> Result<()> {
     Ok(())
 }
 
-async fn quote_raydium_pool(
-    client: &Client,
-    config: &HeliusConfig,
-    pool: &PoolInfo,
-) -> Result<()> {
+async fn quote_raydium_pool(client: &Client, config: &HeliusConfig, pool: &PoolInfo) -> Result<()> {
     let pool_batch = fetch_accounts(
         client,
         config.http_url().as_str(),
@@ -227,7 +225,10 @@ async fn quote_raydium_pool(
     }
     let state = decode_amm_v4(&pool_account.data)?;
     if !pool.matches_pair(&state.coin_mint, &state.pc_mint) {
-        bail!("Raydium decoded mints do not match discovery metadata for {}", pool.address);
+        bail!(
+            "Raydium decoded mints do not match discovery metadata for {}",
+            pool.address
+        );
     }
 
     let vault_addresses = vec![state.coin_vault.clone(), state.pc_vault.clone()];
@@ -247,8 +248,7 @@ async fn quote_raydium_pool(
     let pc_vault_data = vault_batch.accounts[1]
         .as_ref()
         .context("Raydium pc vault missing")?;
-    if coin_vault_data.owner != SPL_TOKEN_PROGRAM_ID
-        || pc_vault_data.owner != SPL_TOKEN_PROGRAM_ID
+    if coin_vault_data.owner != SPL_TOKEN_PROGRAM_ID || pc_vault_data.owner != SPL_TOKEN_PROGRAM_ID
     {
         bail!("Raydium AMM v4 vault is not owned by the classic SPL Token program");
     }
@@ -381,12 +381,17 @@ async fn quote_orca_pool(client: &Client, config: &HeliusConfig, pool: &PoolInfo
     let mint_a = whirlpool.token_mint_a.to_string();
     let mint_b = whirlpool.token_mint_b.to_string();
     if !pool.matches_pair(&mint_a, &mint_b) {
-        bail!("Orca decoded mints do not match discovery metadata for {}", pool.address);
+        bail!(
+            "Orca decoded mints do not match discovery metadata for {}",
+            pool.address
+        );
     }
     let snapshot_tick_indexes =
         tick_array_start_indexes(whirlpool.tick_current_index, whirlpool.tick_spacing);
     if snapshot_tick_indexes != initial_tick_indexes {
-        bail!("Orca tick array dependency changed while building coherent snapshot; retry required");
+        bail!(
+            "Orca tick array dependency changed while building coherent snapshot; retry required"
+        );
     }
     if needs_oracle(&whirlpool) != adaptive_fee {
         bail!("Orca adaptive-fee configuration changed while building snapshot");
@@ -488,20 +493,11 @@ async fn run_meteora_quote_check(client: &Client) -> Result<()> {
     Ok(())
 }
 
-async fn quote_meteora_pool(
-    client: &Client,
-    config: &HeliusConfig,
-    pool: &PoolInfo,
-) -> Result<()> {
+async fn quote_meteora_pool(client: &Client, config: &HeliusConfig, pool: &PoolInfo) -> Result<()> {
     let bitmap_address = bitmap_extension_address(&pool.address)?;
     let initial_addresses = vec![pool.address.clone(), bitmap_address.clone()];
-    let initial = fetch_accounts(
-        client,
-        config.http_url().as_str(),
-        &initial_addresses,
-        None,
-    )
-    .await?;
+    let initial =
+        fetch_accounts(client, config.http_url().as_str(), &initial_addresses, None).await?;
     let initial_pool_account = initial.accounts[0]
         .as_ref()
         .with_context(|| format!("Meteora LbPair account missing: {}", pool.address))?;
@@ -512,7 +508,10 @@ async fn quote_meteora_pool(
     let initial_mint_x = initial_lb_pair.token_x_mint.to_string();
     let initial_mint_y = initial_lb_pair.token_y_mint.to_string();
     if !pool.matches_pair(&initial_mint_x, &initial_mint_y) {
-        bail!("Meteora decoded mints do not match discovery metadata for {}", pool.address);
+        bail!(
+            "Meteora decoded mints do not match discovery metadata for {}",
+            pool.address
+        );
     }
     let initial_bitmap = initial.accounts[1]
         .as_ref()
@@ -583,7 +582,9 @@ async fn quote_meteora_pool(
         METEORA_BIN_ARRAY_TAKE_COUNT,
     )?;
     if snapshot_swap_for_y != swap_for_y || snapshot_bin_addresses != initial_bin_addresses {
-        bail!("Meteora BinArray dependency changed while building coherent snapshot; retry required");
+        bail!(
+            "Meteora BinArray dependency changed while building coherent snapshot; retry required"
+        );
     }
 
     let clock = decode_clock(
@@ -626,7 +627,11 @@ async fn quote_meteora_pool(
         bail!("Meteora official quote returned zero output");
     }
 
-    let output_mint = if snapshot_swap_for_y { &mint_y } else { &mint_x };
+    let output_mint = if snapshot_swap_for_y {
+        &mint_y
+    } else {
+        &mint_x
+    };
     let output_account = if snapshot_swap_for_y {
         mint_y_account
     } else {
@@ -681,7 +686,10 @@ async fn build_pool_dependencies(
             if pool.pool_type != "Standard"
                 || pool.program_id.as_deref() != Some(RAYDIUM_AMM_V4_PROGRAM_ID)
             {
-                bail!("unsupported Raydium pool in V2 quoteable universe: {}", pool.address);
+                bail!(
+                    "unsupported Raydium pool in V2 quoteable universe: {}",
+                    pool.address
+                );
             }
             let batch = fetch_accounts(
                 client,
@@ -715,18 +723,19 @@ async fn build_pool_dependencies(
                 bail!("Orca dependency Whirlpool owner mismatch");
             }
             let whirlpool = decode_whirlpool(&account.data)?;
-            let pool_pubkey = Pubkey::from_str(&pool.address).context("invalid Orca pool address")?;
-            let tick_addresses = tick_array_start_indexes(
-                whirlpool.tick_current_index,
-                whirlpool.tick_spacing,
-            )
-            .iter()
-            .map(|index| {
-                get_tick_array_address(&pool_pubkey, *index, Some(program_id))
-                    .map(|(address, _)| address.to_string())
-                    .map_err(|error| anyhow::anyhow!("failed to derive Orca TickArray PDA: {error}"))
-            })
-            .collect::<Result<Vec<_>>>()?;
+            let pool_pubkey =
+                Pubkey::from_str(&pool.address).context("invalid Orca pool address")?;
+            let tick_addresses =
+                tick_array_start_indexes(whirlpool.tick_current_index, whirlpool.tick_spacing)
+                    .iter()
+                    .map(|index| {
+                        get_tick_array_address(&pool_pubkey, *index, Some(program_id))
+                            .map(|(address, _)| address.to_string())
+                            .map_err(|error| {
+                                anyhow::anyhow!("failed to derive Orca TickArray PDA: {error}")
+                            })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
             let tick_batch = fetch_accounts(
                 client,
                 config.http_url().as_str(),
@@ -746,7 +755,9 @@ async fn build_pool_dependencies(
             let oracle_address = if needs_oracle(&whirlpool) {
                 Some(
                     get_oracle_address(&pool_pubkey, Some(program_id))
-                        .map_err(|error| anyhow::anyhow!("failed to derive Orca Oracle PDA: {error}"))?
+                        .map_err(|error| {
+                            anyhow::anyhow!("failed to derive Orca Oracle PDA: {error}")
+                        })?
                         .0
                         .to_string(),
                 )
@@ -758,7 +769,8 @@ async fn build_pool_dependencies(
         Dex::MeteoraDlmm => {
             let bitmap_address = bitmap_extension_address(&pool.address)?;
             let addresses = vec![pool.address.clone(), bitmap_address.clone()];
-            let batch = fetch_accounts(client, config.http_url().as_str(), &addresses, None).await?;
+            let batch =
+                fetch_accounts(client, config.http_url().as_str(), &addresses, None).await?;
             let account = batch.accounts[0]
                 .as_ref()
                 .context("Meteora dependency LbPair missing")?;
@@ -796,7 +808,10 @@ async fn build_pool_dependencies(
     }
 }
 
-async fn build_quote_state(client: &Client, config: &HeliusConfig) -> Result<(QuoteState, Vec<PoolInfo>)> {
+async fn build_quote_state(
+    client: &Client,
+    config: &HeliusConfig,
+) -> Result<(QuoteState, Vec<PoolInfo>)> {
     let mut state = QuoteState::new();
     let mut pools = Vec::new();
     let mut seen = HashSet::new();
@@ -838,8 +853,9 @@ async fn preload_state_accounts(
         bail!("dependency snapshot account count mismatch");
     }
     for (address, account) in addresses.iter().zip(batch.accounts.into_iter()) {
-        let account = account
-            .with_context(|| format!("registered quote dependency account is missing: {address}"))?;
+        let account = account.with_context(|| {
+            format!("registered quote dependency account is missing: {address}")
+        })?;
         state.apply_account_update(
             address,
             VersionedAccountData {
@@ -852,7 +868,10 @@ async fn preload_state_accounts(
     for pool in pools {
         let missing = state.missing_accounts_for_pool(&pool.address)?;
         if !missing.is_empty() {
-            bail!("pool {} still has missing dependency accounts: {missing:?}", pool.address);
+            bail!(
+                "pool {} still has missing dependency accounts: {missing:?}",
+                pool.address
+            );
         }
     }
     Ok(())
@@ -978,14 +997,8 @@ async fn run_dependency_wss_check(client: &Client) -> Result<()> {
             dependencies.pool.address, dependencies.pool.dex
         );
         recompute_pool_quote(client, &config, &dependencies.pool).await?;
-        refresh_pool_dependencies(
-            client,
-            &config,
-            &mut state,
-            &dependencies.pool,
-            update.slot,
-        )
-        .await?;
+        refresh_pool_dependencies(client, &config, &mut state, &dependencies.pool, update.slot)
+            .await?;
         if !state
             .missing_accounts_for_pool(&dependencies.pool.address)?
             .is_empty()
