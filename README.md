@@ -6,29 +6,29 @@
 
 ## 当前进度
 
-**当前阶段：V1 — Helius RPC/WSS 实时池账户订阅**
+**当前阶段：V2 — DEX Pool State 解析与本地 Swap Quote**
 
 | 阶段 | 内容 | 状态 |
 |---|---|---|
 | Stage 0 | 仓库、Rust 工程骨架、GitHub Actions CI | ✅ 已完成并验证 |
 | V0 | BONK / WIF 跨 DEX 池发现与链上账户核验 | ✅ 已完成并验证 |
-| V1 | Helius RPC/WSS 实时池账户订阅 | 🔄 Secret 已配置，真实 Helius 端到端验证已触发 |
-| V2 | DEX Pool State 解析与本地 Swap Quote | ⏳ 未开始 |
+| V1 | Helius RPC/WSS 实时池账户订阅 | ✅ 已完成并验证 |
+| V2 | DEX Pool State 解析与本地 Swap Quote | 🔄 当前进行 |
 | V3 | 跨池套利机会计算、记录与统计 | ⏳ 未开始 |
 | V4 | 原子交易构造与 `simulateTransaction` | ⏳ 未开始 |
 | V5 | 小额实盘执行与 Jito 集成 | ⏳ 未开始 |
 
 ## 当前阶段成功标准
 
-V1 只有满足以下条件才会标记完成：
+V2 只有满足以下条件才会标记完成：
 
-1. Helius HTTP RPC 可真实连接并完成基础请求。
-2. Helius WSS（WebSocket Secure，安全 WebSocket 连接）可真实建立连接。
-3. 对 V0 选出的真实 Pool Account 发起 `accountSubscribe`。
-4. 至少真实收到池账户更新通知，并能识别通知属于哪个池、哪个 DEX。
-5. 断线、无效订阅响应等基础错误不能静默吞掉。
-6. 新增逻辑有对应测试，并通过 `cargo fmt`、`cargo check`、`cargo clippy`、`cargo test`。
-7. V1 端到端真实连接测试通过后才标记完成。
+1. 对当前实际监控的 Raydium、Orca、Meteora 池分别识别其链上状态结构。
+2. 从 Helius `accountNotification` 的原始账户数据中解析出本地报价真正需要的字段。
+3. 不依赖 DEX REST API 的价格字段完成至少一个池型的本地 Swap Quote。
+4. 对每个解析/计算函数设计对应单元测试，并加入真实链上状态回归样本。
+5. 对计算结果与官方 SDK / 官方报价来源做交叉核对；误差无法解释时不进入套利判断层。
+6. 新增代码继续通过 `cargo fmt`、`cargo check`、`cargo clippy -D warnings`、`cargo test`。
+7. V2 端到端真实数据验证通过后才进入 V3。
 
 ## 已验证结果
 
@@ -57,9 +57,9 @@ GitHub Actions 已在真实 runner 上完成：
 - WIF：98 个精确交易对池被发现，筛选 9 个监控候选池。
 - 18 个候选 Pool Account：**18/18 链上存在，18/18 owner 与预期 DEX Program 一致**。
 
-### V1 — 当前已验证部分
+### V1 — Helius 实时订阅
 
-当前代码层验证 CI：Run `31674224014`，结果 `success`。
+最终验收 CI：Run `31675468153`，结果 `success`。
 
 - `cargo fmt` ✅
 - `cargo check` ✅
@@ -67,13 +67,14 @@ GitHub Actions 已在真实 runner 上完成：
 - 单元测试：**34 passed / 0 failed** ✅
 - V0 真实 DEX Pool Discovery 回归测试 ✅
 - V0 Solana Mainnet Pool Account owner 回归核验 ✅
-- `tokio-tungstenite 0.30.0` 已在实际 GitHub Runner / Rust `1.97.1` 上编译通过。
-- Helius 配置读取、HTTP `getVersion` 响应解析、`accountSubscribe` 请求构造、订阅确认解析、`accountNotification` 解析、`subscription id ↔ PoolInfo` 映射均有单元测试覆盖。
-- WSS 逻辑要求：全部候选池收到订阅确认，并且至少收到一个真实账户更新，才允许端到端函数返回成功。
-- 上一次 CI **尚未完成真实 Helius HTTP/WSS 验证**，日志明确输出：`HELIUS_API_KEY secret is not configured; V1 live verification skipped.`
-- 2026-08-13 用户已配置 `HELIUS_API_KEY` Repository Secret；新的真实端到端验证已通过本次 README 提交触发。结果出来前仍不把 V1 标记为完成。
+- GitHub Actions Secret `HELIUS_API_KEY` 已确认可被工作流安全读取，日志中仅显示 `***`。
+- Helius HTTP `getVersion` 真实通过：当次返回 `Solana core 4.2.0-rc.1`。
+- Helius WSS 真实建立连接并对 **18 个候选池**发送 `accountSubscribe`。
+- 18 个候选池的订阅确认全部完成后，真实收到 Pool Account 更新。
+- 首次验收更新：`slot=438970104`，DEX=`Meteora DLMM`，Pool=`6oFWm7KPLfxnwMb3z5xwBoXNSPP3JJyirAPqPSiVcnsp`，`subscription=6580461`。
+- 该通知已通过 `subscription id ↔ PoolInfo` 映射回正确 DEX 和 Pool Account。
 
-因此只有新的 Helius 真实联网步骤成功后，才能宣称 V1 完成。
+因此 V1 的 HTTP、WSS、真实 Pool 订阅和通知映射链路均已有实际运行证据。
 
 ### V0 监控候选筛选规则
 
@@ -82,11 +83,11 @@ GitHub Actions 已在真实 runner 上完成：
 - `MIN_MONITOR_TVL_USD = 1,000`
 - `MAX_POOLS_PER_DEX = 3`
 
-目的只是避免在 V1 阶段把免费 RPC/WSS 配额浪费在大量灰尘池上。**这两个值不是最终套利执行阈值，也不代表 TVL 低于 1,000 美元的池永远没有机会。**
+目的只是避免把免费 RPC/WSS 配额浪费在大量灰尘池上。**这两个值不是最终套利执行阈值，也不代表 TVL 低于 1,000 美元的池永远没有机会。**
 
 ### V0 真实候选池快照
 
-以下 TVL 是 2026-08-13 最终验收时 API 返回的动态快照，只用于记录当时的筛选依据，后续会变化。
+以下 TVL 是 2026-08-13 验收时 API 返回的动态快照，只用于记录当时的筛选依据，后续会变化。
 
 #### BONK / WSOL
 
@@ -148,25 +149,39 @@ GitHub Actions 已在真实 runner 上完成：
 
 V1 首次完整编译后，`clippy -D warnings` 拒绝了“先 `is_some()` 再 `expect()`”的取值方式。没有屏蔽 lint，而是改成 `if let Some(update)` 模式匹配。修复后 `clippy` 与全部测试通过。
 
+### V1 Helius WSS 首次真实连接触发 Rustls CryptoProvider panic
+
+第一次注入真实 Helius Secret 后，HTTP 已成功，但 WSS 在 TLS 初始化时 panic：`rustls 0.23.43` 无法自动确定进程级 `CryptoProvider`。
+
+根因：`tokio-tungstenite` 的 Rustls 依赖关闭了默认特性，当前依赖组合没有提供唯一的 TLS 加密后端。
+
+处理方式：
+
+1. 保留失败 CI：Run `31675055836`。
+2. 核对 `rustls 0.23.43` 官方特性定义。
+3. 在 `Cargo.toml` 显式启用 `rustls` 的 `ring` CryptoProvider。
+4. 不绕过 panic、不关闭 TLS 校验。
+5. 重新执行全部格式、编译、Clippy、测试、真实 Pool Discovery、链上 owner 校验和 Helius HTTP/WSS 测试。
+6. 修复后 Run `31675468153` 全部成功，并真实收到 Pool Account 更新。
+
 ## 当前问题 / 阻塞 / 风险
 
 - 当前开发主要依赖 GitHub Actions 进行 Rust 编译和真实联网测试，因为本次 ChatGPT 执行环境没有可直接使用的 Rust toolchain。
-- `HELIUS_API_KEY` Repository Secret 已由用户配置；当前正在等待新的真实 Helius HTTP/WSS 端到端测试结果。
 - `actions/checkout@v4` 当前在 GitHub runner 上有 Node.js 20 弃用警告；GitHub 当前强制使用 Node 24，本项目 CI 仍成功。后续单独处理，不与套利业务逻辑混改。
-- 用户提供的临时 Helius API Key **没有写入仓库，也没有提交到 Git 历史**；仅由 GitHub Actions Secret 在运行时注入。
+- `HELIUS_API_KEY` 没有写入仓库或 Git 历史，仅由 GitHub Actions Secret 在运行时注入。
 - DEX REST API 的 TVL 属于动态外部数据，不能视为链上实时成交价格。
-- 当前只证明“V0 完整链路 + V1 协议/代码逻辑”有效，**没有任何证据证明套利策略可盈利**。
+- 当前已经证明实时订阅链路有效；**尚未证明我们能正确解析各池状态、正确本地报价或策略可盈利**。
+- 当前 GitHub App 无权读取个人 Billing Usage API，因此 README 不记录猜测的 Actions 剩余额度；需要从 GitHub `Settings → Billing & Licensing` 查看真实账户用量。
 
 ## 下一步
 
-V1 剩余步骤：
+V2 当前计划：
 
-1. 等待本次 `cargo run -- helius-check` 的真实结果。
-2. 真实验证 Helius HTTP `getVersion`。
-3. 真实建立 Helius WSS 连接并订阅当前候选池。
-4. 要求全部订阅得到确认，并至少收到一个真实 `accountNotification`。
-5. 核对通知能够通过 `subscription id` 映射回正确 Pool Account / DEX。
-6. 端到端测试通过后才把 V1 标记为完成，然后进入 V2。
+1. 先梳理当前 18 个候选池分别属于哪些真实池型。
+2. 从最简单且流动性较深的池型开始解析真实账户数据。
+3. 为账户布局解析函数加入固定链上样本测试。
+4. 实现本地 Swap Quote，并与官方报价交叉核对。
+5. 一个池型完整通过后再扩展到下一个池型，避免同时写三套未验证逻辑。
 
 ## 开发与记录约定
 
@@ -195,11 +210,11 @@ V1 剩余步骤：
 
 - Stage 0 完成并验证。
 - V0 Pool Discovery 完成并验证。
-- V0 最终 CI：23 个单元测试全部通过。
 - BONK/WIF 共 18 个监控候选 Pool Account 完成链上存在性与 owner 核验。
-- 修复 Raydium v3 `mintA / mintB` 字段兼容问题。
-- 增加灰尘池筛选和链上账户核验。
-- V1 Helius 配置、HTTP/WSS 协议层与订阅映射逻辑已实现。
-- V1 当前单元测试提升至 **34 passed / 0 failed**。
-- 修复 V1 `clippy` 的不必要 `expect` 问题。
-- 用户已配置 `HELIUS_API_KEY` Repository Secret；已触发新的 V1 Helius 真实联网验证，等待实际结果。
+- V1 Helius 配置、HTTP/WSS 协议层与订阅映射逻辑完成。
+- V1 单元测试：**34 passed / 0 failed**。
+- 第一次真实 Helius WSS 测试暴露 Rustls CryptoProvider 配置问题，失败记录保留。
+- 显式启用 `ring` CryptoProvider 后重新验收。
+- V1 最终 CI Run `31675468153`：全部步骤成功。
+- Helius HTTP 和 WSS 均真实通过，18 个候选池已订阅并收到真实 Meteora DLMM Pool Account 更新。
+- V1 正式完成，进入 V2 Pool State 解析与本地 Swap Quote。
