@@ -1,11 +1,6 @@
 use std::{collections::HashMap, mem::size_of, str::FromStr};
 
-use anchor_client::solana_sdk::{
-    account::Account,
-    clock::Clock,
-    pubkey::Pubkey,
-    sysvar,
-};
+use anchor_client::solana_sdk::{account::Account, clock::Clock, pubkey::Pubkey, sysvar};
 use anchor_lang::Discriminator;
 use anyhow::{bail, Context, Result};
 use commons::dlmm::accounts::{BinArray, BinArrayBitmapExtension, LbPair};
@@ -233,14 +228,14 @@ mod tests {
         let address = Pubkey::new_from_array([5u8; 32]).to_string();
 
         assert_eq!(
-            build_bin_array_map(vec![(address.clone(), bin_array)]).unwrap().len(),
+            build_bin_array_map(vec![(address.clone(), bin_array)])
+                .unwrap()
+                .len(),
             1
         );
-        assert!(build_bin_array_map(vec![
-            (address.clone(), bin_array),
-            (address, bin_array)
-        ])
-        .is_err());
+        assert!(
+            build_bin_array_map(vec![(address.clone(), bin_array), (address, bin_array)]).is_err()
+        );
         assert!(build_bin_array_map(vec![("invalid".into(), bin_array)]).is_err());
     }
 
