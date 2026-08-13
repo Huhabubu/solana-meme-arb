@@ -1,0 +1,302 @@
+name: v3-liquidity-points-once
+
+on:
+  push:
+    paths:
+      - '.github/workflows/v3-liquidity-points-once.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  refactor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Model Meteora insufficient-liquidity curve points
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+
+          meteora_path = Path('src/dex/meteora_dlmm.rs')
+          meteora = meteora_path.read_text()
+          anchor = '''    .context("Meteora official exact-input quote failed")\n}\n\nfn validate_anchor_account<T: Discriminator>(\n'''
+          replacement = '''    .context("Meteora official exact-input quote failed")\n}\n\n/// Meteora commons 当前以 anyhow 文本区分“池在该方向无法完整填满输入”。\n/// 只检查整个 error chain 中官方根因的精确文本，其他 Quote 错误不能被误判为流动性不足。\npub fn is_pool_out_of_liquidity(error: &anyhow::Error) -> bool {\n    error\n        .chain()\n        .any(|cause| cause.to_string() == "Pool out of liquidity")\n}\n\nfn validate_anchor_account<T: Discriminator>(\n'''
+          if meteora.count(anchor) != 1:
+              raise SystemExit('meteora classifier insertion point mismatch')
+          meteora = meteora.replace(anchor, replacement, 1)
+
+          test_anchor = '''    #[test]\n    fn quote_wrapper_rejects_zero_input_before_official_math() {\n'''
+          test = '''    #[test]\n    fn identifies_only_nested_official_pool_out_of_liquidity_error() {\n        let error = anyhow::anyhow!("Pool out of liquidity")\n            .context("Meteora official exact-input quote failed");\n        assert!(is_pool_out_of_liquidity(&error));\n\n        let other = anyhow::anyhow!("Active bin array not found")\n            .context("Meteora official exact-input quote failed");\n        assert!(!is_pool_out_of_liquidity(&other));\n    }\n\n'''
+          if meteora.count(test_anchor) != 1:
+              raise SystemExit('meteora test insertion point mismatch')
+          meteora = meteora.replace(test_anchor, test + test_anchor, 1)
+          meteora_path.write_text(meteora)
+
+          app_path = Path('src/app.rs')
+          app = app_path.read_text()
+
+          old_import = '''            clock_sysvar_address, decode_bin_array, decode_bitmap_extension, decode_clock,\n            decode_lb_pair, quote_exact_in as quote_meteora_exact_in, quote_mint_account,\n            swap_for_y_for_input,\n'''
+          new_import = '''            clock_sysvar_address, decode_bin_array, decode_bitmap_extension, decode_clock,\n            decode_lb_pair, is_pool_out_of_liquidity as is_meteora_pool_out_of_liquidity,\n            quote_exact_in as quote_meteora_exact_in, quote_mint_account, swap_for_y_for_input,\n'''
+          if app.count(old_import) != 1:
+              raise SystemExit('app import replacement mismatch')
+          app = app.replace(old_import, new_import, 1)
+
+          generic_start = app.index('async fn quote_supported_pool_amounts(')
+          generic_end = app.index('async fn run_meteora_quote_check', generic_start)
+          generic = r'''async fn quote_supported_pool_amounts(
+              client: &Client,
+              config: &HeliusConfig,
+              pool: &PoolInfo,
+              input_mint: &str,
+              amounts_in: &[u64],
+          ) -> Result<Vec<Option<SwapQuote>>> {
+              match pool.dex {
+                  Dex::Raydium => Ok(quote_raydium_pool_amounts(
+                      client, config, pool, input_mint, amounts_in,
+                  )
+                  .await?
+                  .into_iter()
+                  .map(|quote| Some(quote.swap))
+                  .collect()),
+                  Dex::Orca => Ok(
+                      quote_orca_pool_amounts(client, config, pool, input_mint, amounts_in)
+                          .await?
+                          .into_iter()
+                          .map(|quote| Some(quote.swap))
+                          .collect(),
+                  ),
+                  Dex::MeteoraDlmm => Ok(quote_meteora_pool_amounts(
+                      client, config, pool, input_mint, amounts_in,
+                  )
+                  .await?
+                  .into_iter()
+                  .map(|quote| quote.map(|quote| quote.swap))
+                  .collect()),
+                  Dex::MeteoraDammV2 => {
+                      bail!("Meteora DAMM v2 is not part of the V3 quoteable universe")
+                  }
+              }
+          }
+
+          async fn run_round_trip_check(client: &Client) -> Result<()> {
+              let config = HeliusConfig::from_env()?;
+              let mut verified_routes = 0usize;
+              let mut evaluated_points = 0usize;
+              let mut unavailable_points = 0usize;
+
+              for token in tracked_tokens() {
+                  let (_, candidates) = discover_candidates(client, token).await?;
+                  let pools = supported_quote_pools(&candidates);
+                  if pools.len() != 3 {
+                      bail!(
+                          "{}/WSOL expected exactly 3 V3 quoteable pools, got {}",
+                          token.symbol,
+                          pools.len()
+                      );
+                  }
+                  let routes = directed_route_indices(pools.len());
+                  if routes.len() != 6 {
+                      bail!(
+                          "{}/WSOL expected 6 directed two-pool routes, got {}",
+                          token.symbol,
+                          routes.len()
+                      );
+                  }
+
+                  for (first_index, second_index) in routes {
+                      let first_pool = &pools[first_index];
+                      let second_pool = &pools[second_index];
+                      let first_points = quote_supported_pool_amounts(
+                          client,
+                          &config,
+                          first_pool,
+                          WSOL,
+                          &ROUND_TRIP_PROBE_LAMPORTS,
+                      )
+                      .await?;
+                      if first_points.len() != ROUND_TRIP_PROBE_LAMPORTS.len() {
+                          bail!("V3 first-leg quote point count mismatch");
+                      }
+
+                      let mut first_available = Vec::new();
+                      let mut first_indices = Vec::new();
+                      let mut intermediate_inputs = Vec::new();
+                      for (index, point) in first_points.iter().enumerate() {
+                          if let Some(quote) = point {
+                              first_indices.push(index);
+                              intermediate_inputs.push(quote.amount_out);
+                              first_available.push(quote.clone());
+                          } else {
+                              println!(
+                                  "{}/WSOL V3 curve point unavailable: {}->{} input={} stage=first_leg reason=insufficient_liquidity",
+                                  token.symbol,
+                                  first_pool.dex,
+                                  second_pool.dex,
+                                  ROUND_TRIP_PROBE_LAMPORTS[index]
+                              );
+                              unavailable_points += 1;
+                          }
+                      }
+                      if first_available.is_empty() {
+                          bail!("V3 route has no executable first-leg probe amount");
+                      }
+                      let first_slot = first_available[0].snapshot_slot;
+                      if first_available
+                          .iter()
+                          .any(|quote| quote.snapshot_slot != first_slot)
+                      {
+                          bail!("V3 first-leg curve mixed multiple snapshots");
+                      }
+
+                      let second_points = quote_supported_pool_amounts(
+                          client,
+                          &config,
+                          second_pool,
+                          token.mint,
+                          &intermediate_inputs,
+                      )
+                      .await?;
+                      if second_points.len() != first_available.len() {
+                          bail!("V3 second-leg quote point count mismatch");
+                      }
+
+                      let mut curve_first = Vec::new();
+                      let mut curve_second = Vec::new();
+                      let mut curve_indices = Vec::new();
+                      for ((index, first_quote), second_point) in first_indices
+                          .into_iter()
+                          .zip(first_available.into_iter())
+                          .zip(second_points.into_iter())
+                      {
+                          if let Some(second_quote) = second_point {
+                              curve_indices.push(index);
+                              curve_first.push(first_quote);
+                              curve_second.push(second_quote);
+                          } else {
+                              println!(
+                                  "{}/WSOL V3 curve point unavailable: {}->{} input={} stage=second_leg reason=insufficient_liquidity",
+                                  token.symbol,
+                                  first_pool.dex,
+                                  second_pool.dex,
+                                  ROUND_TRIP_PROBE_LAMPORTS[index]
+                              );
+                              unavailable_points += 1;
+                          }
+                      }
+                      if curve_first.is_empty() {
+                          bail!("V3 route has no fully executable probe amount");
+                      }
+                      let second_slot = curve_second[0].snapshot_slot;
+                      if curve_second
+                          .iter()
+                          .any(|quote| quote.snapshot_slot != second_slot)
+                      {
+                          bail!("V3 second-leg curve mixed multiple snapshots");
+                      }
+                      let curve = evaluate_round_trip_curve(&curve_first, &curve_second)?;
+                      if curve.len() != curve_indices.len() {
+                          bail!("V3 evaluated curve/index count mismatch");
+                      }
+
+                      for (index, opportunity) in curve_indices.into_iter().zip(curve.iter()) {
+                          if opportunity.base_mint != WSOL
+                              || opportunity.intermediate_mint != token.mint
+                          {
+                              bail!("V3 round trip produced unexpected mints");
+                          }
+                          if opportunity.input_amount != ROUND_TRIP_PROBE_LAMPORTS[index] {
+                              bail!("V3 round-trip result no longer matches original probe amount");
+                          }
+                          println!(
+                              "{}/WSOL V3 curve point: {}->{} input={} token_out={} final={} gross_profit_raw={} gross_return_ppm={} slots={}..{}",
+                              token.symbol,
+                              first_pool.dex,
+                              second_pool.dex,
+                              opportunity.input_amount,
+                              opportunity.intermediate_amount,
+                              opportunity.final_amount,
+                              opportunity.gross_profit_raw,
+                              opportunity.gross_return_ppm,
+                              opportunity.oldest_slot,
+                              opportunity.newest_slot
+                          );
+                          evaluated_points += 1;
+                      }
+                      println!(
+                          "{}/WSOL V3 curve verified: {}->{} evaluated={} unavailable={} first_slot={} second_slot={}",
+                          token.symbol,
+                          first_pool.dex,
+                          second_pool.dex,
+                          curve.len(),
+                          ROUND_TRIP_PROBE_LAMPORTS.len() - curve.len(),
+                          first_slot,
+                          second_slot
+                      );
+                      verified_routes += 1;
+                  }
+              }
+
+              let expected_routes = tracked_tokens().len() * 6;
+              let expected_points = expected_routes * ROUND_TRIP_PROBE_LAMPORTS.len();
+              if verified_routes != expected_routes
+                  || evaluated_points + unavailable_points != expected_points
+              {
+                  bail!(
+                      "V3 curve verification count mismatch: expected {expected_routes} routes/{expected_points} accounted points, got {verified_routes} routes/{} evaluated/{unavailable_points} unavailable",
+                      evaluated_points
+                  );
+              }
+              println!(
+                  "V3 all-DEX multi-size round-trip verification passed for {verified_routes} routes: {evaluated_points} evaluated, {unavailable_points} insufficient-liquidity points"
+              );
+              Ok(())
+          }
+
+          '''
+          app = app[:generic_start] + generic + app[generic_end:]
+
+          old_single = '''    quote_meteora_pool_amounts(client, config, pool, input_mint, &[amount_in])\n        .await?\n        .pop()\n        .context("Meteora single-amount quote batch returned no result")\n'''
+          new_single = '''    quote_meteora_pool_amounts(client, config, pool, input_mint, &[amount_in])\n        .await?\n        .pop()\n        .context("Meteora single-amount quote batch returned no result")?\n        .context("Meteora single-amount quote is unavailable due to insufficient liquidity")\n'''
+          if app.count(old_single) != 1:
+              raise SystemExit('meteora single wrapper replacement mismatch')
+          app = app.replace(old_single, new_single, 1)
+
+          app = app.replace(
+              ') -> Result<Vec<MeteoraLiveQuote>> {\n    if amounts_in.is_empty() {\n        bail!("Meteora quote batch must contain at least one amount");\n    }',
+              ') -> Result<Vec<Option<MeteoraLiveQuote>>> {\n    if amounts_in.is_empty() {\n        bail!("Meteora quote batch must contain at least one amount");\n    }',
+              1,
+          )
+
+          old_quote = '''        let quote = quote_meteora_exact_in(\n            &pool.address,\n            &lb_pair,\n            amount_in,\n            snapshot_swap_for_y,\n            bin_arrays.clone(),\n            bitmap.as_ref(),\n            &clock,\n            &quote_mint_x,\n            &quote_mint_y,\n        )?;\n        if quote.amount_out == 0 {\n            bail!("Meteora official quote returned zero output");\n        }\n'''
+          new_quote = '''        let quote = match quote_meteora_exact_in(\n            &pool.address,\n            &lb_pair,\n            amount_in,\n            snapshot_swap_for_y,\n            bin_arrays.clone(),\n            bitmap.as_ref(),\n            &clock,\n            &quote_mint_x,\n            &quote_mint_y,\n        ) {\n            Ok(quote) => quote,\n            Err(error) if is_meteora_pool_out_of_liquidity(&error) => {\n                results.push(None);\n                continue;\n            }\n            Err(error) => return Err(error),\n        };\n        if quote.amount_out == 0 {\n            bail!("Meteora official quote returned zero output");\n        }\n'''
+          if app.count(old_quote) != 1:
+              raise SystemExit('meteora per-amount quote replacement mismatch')
+          app = app.replace(old_quote, new_quote, 1)
+
+          old_push = '''        results.push(MeteoraLiveQuote {\n            swap,\n            active_id: lb_pair.active_id,\n            bin_array_count: snapshot_bin_addresses.len(),\n            swap_for_y: snapshot_swap_for_y,\n            fee: quote.fee,\n            protocol_fee: quote.protocol_fee,\n            output_decimals,\n        });\n'''
+          new_push = '''        results.push(Some(MeteoraLiveQuote {\n            swap,\n            active_id: lb_pair.active_id,\n            bin_array_count: snapshot_bin_addresses.len(),\n            swap_for_y: snapshot_swap_for_y,\n            fee: quote.fee,\n            protocol_fee: quote.protocol_fee,\n            output_decimals,\n        }));\n'''
+          if app.count(old_push) != 1:
+              raise SystemExit('meteora result push replacement mismatch')
+          app = app.replace(old_push, new_push, 1)
+          app_path.write_text(app)
+          PY
+
+      - name: Install stable Rust
+        run: |
+          rustup update stable
+          rustup default stable
+          rustup component add rustfmt
+
+      - name: Format changed Rust code
+        run: cargo fmt --all
+
+      - name: Commit liquidity handling
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/app.rs src/dex/meteora_dlmm.rs
+          git diff --cached --quiet && { echo "No liquidity handling changes produced"; exit 1; }
+          git commit -m "feat: model insufficient-liquidity curve points"
+          git push
