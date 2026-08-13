@@ -2,7 +2,24 @@ name: ci
 
 on:
   push:
+    branches:
+      - main
+    paths:
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/**"
   pull_request:
+    paths:
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/**"
+
+# 同一分支快速连续提交时，只保留最新一次 CI，避免旧提交继续消耗 Actions 时间。
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   rust:
