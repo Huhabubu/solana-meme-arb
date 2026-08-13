@@ -104,7 +104,7 @@ pub fn quote_exact_in(
     } else {
         bail!("input mint is not part of this Orca Whirlpool");
     };
-n
+
     swap_quote_by_input_token(
         amount_in,
         specified_token_a,
