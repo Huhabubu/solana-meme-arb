@@ -24,17 +24,11 @@ impl HeliusConfig {
     }
 
     pub fn http_url(&self) -> String {
-        format!(
-            "https://mainnet.helius-rpc.com/?api-key={}",
-            self.api_key
-        )
+        format!("https://mainnet.helius-rpc.com/?api-key={}", self.api_key)
     }
 
     pub fn wss_url(&self) -> String {
-        format!(
-            "wss://mainnet.helius-rpc.com/?api-key={}",
-            self.api_key
-        )
+        format!("wss://mainnet.helius-rpc.com/?api-key={}", self.api_key)
     }
 }
 
