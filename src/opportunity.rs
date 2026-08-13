@@ -63,6 +63,7 @@ pub struct RoundTripOpportunity {
     pub final_amount: u64,
     pub gross_profit_raw: i128,
     pub gross_return_bps: i128,
+    pub gross_return_ppm: i128,
     pub oldest_slot: u64,
     pub newest_slot: u64,
 }
@@ -101,10 +102,8 @@ pub fn evaluate_round_trip(
     }
 
     let gross_profit_raw = i128::from(second_leg.amount_out) - i128::from(first_leg.amount_in);
-    let gross_return_bps = gross_profit_raw
-        .checked_mul(10_000)
-        .expect("u64-sized quote difference multiplied by 10,000 fits i128")
-        / i128::from(first_leg.amount_in);
+    let gross_return_bps = scaled_return(gross_profit_raw, first_leg.amount_in, 10_000)?;
+    let gross_return_ppm = scaled_return(gross_profit_raw, first_leg.amount_in, 1_000_000)?;
 
     Ok(RoundTripOpportunity {
         first_leg: first_leg.clone(),
@@ -116,9 +115,40 @@ pub fn evaluate_round_trip(
         final_amount: second_leg.amount_out,
         gross_profit_raw,
         gross_return_bps,
+        gross_return_ppm,
         oldest_slot: first_leg.snapshot_slot.min(second_leg.snapshot_slot),
         newest_slot: first_leg.snapshot_slot.max(second_leg.snapshot_slot),
     })
+}
+
+/// 同一路径的多金额曲线按索引成对验算。每个点仍复用 `evaluate_round_trip` 的
+/// Mint、金额连续性与不同 Pool 校验，不允许批量接口绕过单点安全条件。
+pub fn evaluate_round_trip_curve(
+    first_legs: &[SwapQuote],
+    second_legs: &[SwapQuote],
+) -> Result<Vec<RoundTripOpportunity>> {
+    if first_legs.is_empty() {
+        bail!("round-trip curve must contain at least one point");
+    }
+    if first_legs.len() != second_legs.len() {
+        bail!("round-trip curve leg count mismatch");
+    }
+
+    first_legs
+        .iter()
+        .zip(second_legs)
+        .map(|(first, second)| evaluate_round_trip(first, second))
+        .collect()
+}
+
+fn scaled_return(profit_raw: i128, input_amount: u64, scale: i128) -> Result<i128> {
+    if input_amount == 0 {
+        bail!("return input amount must be positive");
+    }
+    profit_raw
+        .checked_mul(scale)
+        .map(|value| value / i128::from(input_amount))
+        .ok_or_else(|| anyhow::anyhow!("scaled return overflow"))
 }
 
 #[cfg(test)]
@@ -186,8 +216,20 @@ mod tests {
         assert_eq!(opportunity.final_amount, 1_010_000);
         assert_eq!(opportunity.gross_profit_raw, 10_000);
         assert_eq!(opportunity.gross_return_bps, 100);
+        assert_eq!(opportunity.gross_return_ppm, 10_000);
         assert_eq!(opportunity.oldest_slot, 100);
         assert_eq!(opportunity.newest_slot, 103);
+    }
+
+    #[test]
+    fn ppm_preserves_sub_basis_point_sign() {
+        let first = quote(Dex::Raydium, "a", "SOL", "TOKEN", 10_000_000, 20_000_000, 1);
+        let second = quote(Dex::Orca, "b", "TOKEN", "SOL", 20_000_000, 9_999_880, 1);
+
+        let opportunity = evaluate_round_trip(&first, &second).unwrap();
+        assert_eq!(opportunity.gross_profit_raw, -120);
+        assert_eq!(opportunity.gross_return_bps, 0);
+        assert_eq!(opportunity.gross_return_ppm, -12);
     }
 
     #[test]
@@ -198,8 +240,35 @@ mod tests {
         let opportunity = evaluate_round_trip(&first, &second).unwrap();
         assert_eq!(opportunity.gross_profit_raw, -10);
         assert_eq!(opportunity.gross_return_bps, -100);
+        assert_eq!(opportunity.gross_return_ppm, -10_000);
         assert_eq!(opportunity.oldest_slot, 9);
         assert_eq!(opportunity.newest_slot, 10);
+    }
+
+    #[test]
+    fn evaluates_curve_and_rejects_empty_or_mismatched_batches() {
+        let first = vec![
+            quote(Dex::Raydium, "a", "SOL", "TOKEN", 100, 200, 1),
+            quote(Dex::Raydium, "a", "SOL", "TOKEN", 200, 390, 1),
+        ];
+        let second = vec![
+            quote(Dex::Orca, "b", "TOKEN", "SOL", 200, 101, 2),
+            quote(Dex::Orca, "b", "TOKEN", "SOL", 390, 198, 2),
+        ];
+
+        let curve = evaluate_round_trip_curve(&first, &second).unwrap();
+        assert_eq!(curve.len(), 2);
+        assert_eq!(curve[0].gross_profit_raw, 1);
+        assert_eq!(curve[1].gross_profit_raw, -2);
+        assert!(evaluate_round_trip_curve(&[], &[]).is_err());
+        assert!(evaluate_round_trip_curve(&first, &second[..1]).is_err());
+    }
+
+    #[test]
+    fn curve_still_rejects_a_broken_point() {
+        let first = vec![quote(Dex::Raydium, "a", "SOL", "TOKEN", 100, 200, 1)];
+        let second = vec![quote(Dex::Orca, "b", "TOKEN", "SOL", 199, 101, 2)];
+        assert!(evaluate_round_trip_curve(&first, &second).is_err());
     }
 
     #[test]
