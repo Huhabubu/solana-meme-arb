@@ -7,6 +7,7 @@ use crate::model::{Dex, PoolInfo};
 use crate::serde_utils::number_from_value;
 
 const BASE_URL: &str = "https://api.orca.so/v2/solana/pools";
+const WHIRLPOOL_PROGRAM_ID: &str = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc";
 
 #[derive(Debug, Deserialize)]
 struct Response {
@@ -57,7 +58,7 @@ fn parse_response(body: &str, mint_x: &str, mint_y: &str) -> Result<Vec<PoolInfo
                 dex: Dex::Orca,
                 address: pool.address,
                 pool_type: pool.pool_type,
-                program_id: None,
+                program_id: Some(WHIRLPOOL_PROGRAM_ID.into()),
                 mint_a: pool.token_mint_a,
                 mint_b: pool.token_mint_b,
                 tvl_usd: number_from_value(&pool.tvl_usdc)?,
@@ -80,7 +81,7 @@ mod tests {
     const B: &str = "MintB";
 
     #[test]
-    fn parses_string_tvl_and_exact_pair() {
+    fn parses_string_tvl_exact_pair_and_program_id() {
         let body = r#"{
             "data": [
                 {"address":"pool-1","tokenMintA":"MintB","tokenMintB":"MintA","tvlUsdc":"5000.25","poolType":"whirlpool"},
@@ -93,6 +94,7 @@ mod tests {
         assert_eq!(pools[0].address, "pool-1");
         assert_eq!(pools[0].tvl_usd, 5000.25);
         assert_eq!(pools[0].dex, Dex::Orca);
+        assert_eq!(pools[0].program_id.as_deref(), Some(WHIRLPOOL_PROGRAM_ID));
     }
 
     #[test]
