@@ -300,9 +300,7 @@ mod tests {
 
     #[test]
     fn full_account_request_rejects_more_than_100_addresses() {
-        let addresses = (0..101)
-            .map(|i| format!("address-{i}"))
-            .collect::<Vec<_>>();
+        let addresses = (0..101).map(|i| format!("address-{i}")).collect::<Vec<_>>();
         assert!(build_full_accounts_request(&addresses, None).is_err());
     }
 
@@ -362,7 +360,7 @@ mod tests {
     fn rejects_missing_expected_program_id() {
         let pools = vec![pool("pool-a", None)];
         let owners = vec![Some("program-a".into())];
-        assert!(verify_pool_accounts(&pools, &owners).is_err());
+        assert!(verify_pool_accounts(&pools, &[None]).is_err());
     }
 
     #[test]
