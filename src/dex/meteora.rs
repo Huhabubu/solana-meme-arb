@@ -8,7 +8,7 @@ use crate::serde_utils::number_from_value;
 
 const DLMM_URL: &str = "https://dlmm.datapi.meteora.ag/pools";
 const DAMM_V2_URL: &str = "https://damm-v2.datapi.meteora.ag/pools";
-const DLMM_PROGRAM_ID: &str = "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo";
+pub const DLMM_PROGRAM_ID: &str = "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo";
 const DAMM_V2_PROGRAM_ID: &str = "cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG";
 
 #[derive(Debug, Deserialize)]
