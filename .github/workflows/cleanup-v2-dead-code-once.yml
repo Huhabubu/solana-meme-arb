@@ -15,67 +15,32 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Remove confirmed unused production code
+      - name: Remove stale tests for deleted production helpers
         run: |
           python - <<'PY'
           from pathlib import Path
 
-          app = Path('src/app.rs')
-          text = app.read_text()
-          old = '    collections::{HashMap, HashSet},'
-          if text.count(old) != 1:
-              raise SystemExit(f'app HashMap import count={text.count(old)}')
-          app.write_text(text.replace(old, '    collections::HashSet,', 1))
-
-          state = Path('src/state.rs')
-          text = state.read_text()
-
-          impl_block = '''impl DependencyKind {
-              pub fn is_dynamic_quote_trigger(self) -> bool {
-                  matches!(
-                      self,
-                      Self::PoolState
-                          | Self::TokenVault
-                          | Self::TickArray
-                          | Self::Oracle
-                          | Self::BinArray
-                          | Self::BitmapExtension
-                          | Self::TokenMint
-                  )
-              }
-          }
-
-          '''
-          if text.count(impl_block) != 1:
-              raise SystemExit(f'DependencyKind impl count={text.count(impl_block)}')
-          text = text.replace(impl_block, '', 1)
+          path = Path('src/state.rs')
+          text = path.read_text()
 
           trigger_test = '''    #[test]
-              fn dependency_kind_is_marked_as_quote_trigger() {
-                  assert!(DependencyKind::TokenVault.is_dynamic_quote_trigger());
-                  assert!(DependencyKind::BinArray.is_dynamic_quote_trigger());
-              }
+          fn dependency_kind_is_marked_as_quote_trigger() {
+              assert!(DependencyKind::TokenVault.is_dynamic_quote_trigger());
+              assert!(DependencyKind::BinArray.is_dynamic_quote_trigger());
+          }
 
           '''
           if text.count(trigger_test) != 1:
               raise SystemExit(f'trigger test count={text.count(trigger_test)}')
           text = text.replace(trigger_test, '', 1)
 
-          account_method = '''    pub fn account(&self, address: &str) -> Option<&VersionedAccountData> {
-                  self.account_data.get(address)
-              }
+          old = 'state.account("vault").unwrap().data'
+          count = text.count(old)
+          if count != 2:
+              raise SystemExit(f'account assertion count={count}')
+          text = text.replace(old, 'state.account_data.get("vault").unwrap().data')
 
-          '''
-          if text.count(account_method) != 1:
-              raise SystemExit(f'account method count={text.count(account_method)}')
-          account_test_only = '''    #[cfg(test)]
-              fn account(&self, address: &str) -> Option<&VersionedAccountData> {
-                  self.account_data.get(address)
-              }
-
-          '''
-          text = text.replace(account_method, account_test_only, 1)
-          state.write_text(text)
+          path.write_text(text)
           PY
           cargo fmt --all
 
@@ -83,7 +48,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add src/app.rs src/state.rs
+          git add src/state.rs
           git diff --cached --quiet && { echo "No changes to commit"; exit 1; }
-          git commit -m "fix: remove unused V2 production code"
+          git commit -m "test: align V2 state tests with production API"
           git push
