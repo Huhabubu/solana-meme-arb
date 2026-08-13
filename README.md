@@ -12,7 +12,7 @@
 |---|---|---|
 | Stage 0 | 仓库、Rust 工程骨架、GitHub Actions CI | ✅ 已完成并验证 |
 | V0 | BONK / WIF 跨 DEX 池发现与链上账户核验 | ✅ 已完成并验证 |
-| V1 | Helius RPC/WSS 实时池账户订阅 | 🔄 当前进行 |
+| V1 | Helius RPC/WSS 实时池账户订阅 | 🔄 代码层已验证，真实 Helius 连接待 Secret 注入 |
 | V2 | DEX Pool State 解析与本地 Swap Quote | ⏳ 未开始 |
 | V3 | 跨池套利机会计算、记录与统计 | ⏳ 未开始 |
 | V4 | 原子交易构造与 `simulateTransaction` | ⏳ 未开始 |
@@ -56,6 +56,23 @@ GitHub Actions 已在真实 runner 上完成：
 - BONK：117 个精确交易对池被发现，筛选 9 个监控候选池。
 - WIF：98 个精确交易对池被发现，筛选 9 个监控候选池。
 - 18 个候选 Pool Account：**18/18 链上存在，18/18 owner 与预期 DEX Program 一致**。
+
+### V1 — 当前已验证部分
+
+当前代码层验证 CI：Run `31674224014`，结果 `success`。
+
+- `cargo fmt` ✅
+- `cargo check` ✅
+- `cargo clippy --all-targets -- -D warnings` ✅
+- 单元测试：**34 passed / 0 failed** ✅
+- V0 真实 DEX Pool Discovery 回归测试 ✅
+- V0 Solana Mainnet Pool Account owner 回归核验 ✅
+- `tokio-tungstenite 0.30.0` 已在实际 GitHub Runner / Rust `1.97.1` 上编译通过。
+- Helius 配置读取、HTTP `getVersion` 响应解析、`accountSubscribe` 请求构造、订阅确认解析、`accountNotification` 解析、`subscription id ↔ PoolInfo` 映射均有单元测试覆盖。
+- WSS 逻辑要求：全部候选池收到订阅确认，并且至少收到一个真实账户更新，才允许端到端函数返回成功。
+- 当前 **尚未完成真实 Helius HTTP/WSS 验证**。本次 CI 日志明确输出：`HELIUS_API_KEY secret is not configured; V1 live verification skipped.`
+
+因此当前 CI 总体为绿色，只能说明已执行的代码/测试通过，**不能据此宣称 V1 已完成或 Helius 实时订阅已经验证成功**。
 
 ### V0 监控候选筛选规则
 
@@ -126,24 +143,30 @@ GitHub Actions 已在真实 runner 上完成：
 
 最终 18 个候选池全部通过。
 
+### V1 `clippy` 阻止不必要的 `expect`
+
+V1 首次完整编译后，`clippy -D warnings` 拒绝了“先 `is_some()` 再 `expect()`”的取值方式。没有屏蔽 lint，而是改成 `if let Some(update)` 模式匹配。修复后 `clippy` 与全部测试通过。
+
 ## 当前问题 / 阻塞 / 风险
 
 - 当前开发主要依赖 GitHub Actions 进行 Rust 编译和真实联网测试，因为本次 ChatGPT 执行环境没有可直接使用的 Rust toolchain。
+- **V1 当前唯一硬阻塞：GitHub Actions 还没有配置名为 `HELIUS_API_KEY` 的 Repository Secret。** GitHub 连接器没有创建 Actions Secret 的能力，因此不能由当前自动化接口安全代填。
 - `actions/checkout@v4` 当前在 GitHub runner 上有 Node.js 20 弃用警告；GitHub 当前强制使用 Node 24，本项目 CI 仍成功。后续单独处理，不与套利业务逻辑混改。
-- 用户提供的临时 Helius API Key **尚未写入仓库，也尚未提交到 Git 历史**。V1 需要安全注入后才使用。
+- 用户提供的临时 Helius API Key **尚未写入仓库，也尚未提交到 Git 历史，也尚未被真实 Helius 测试使用**。
 - DEX REST API 的 TVL 属于动态外部数据，不能视为链上实时成交价格。
-- 当前只证明“池发现与账户身份核验链路有效”，**没有任何证据证明套利策略可盈利**。
+- 当前只证明“V0 完整链路 + V1 协议/代码逻辑”有效，**没有任何证据证明套利策略可盈利**。
 
 ## 下一步
 
-正在推进 V1：
+V1 剩余步骤：
 
-1. 建立 Helius 配置读取层，只允许从环境变量读取 Key / RPC / WSS 地址。
-2. 先测试 Helius HTTP RPC 连通性。
-3. 建立 WSS 连接和 `accountSubscribe` 请求模型。
-4. 订阅 V0 候选池，并记录 `subscription id ↔ PoolInfo` 映射。
-5. 真实等待 Pool Account 更新，确认能够识别更新属于哪个池。
-6. 加入最小必要的连接错误、JSON 错误和订阅响应测试。
+1. 将临时 Key 安全配置为 GitHub Actions Repository Secret：`HELIUS_API_KEY`。
+2. 触发 `cargo run -- helius-check`。
+3. 真实验证 Helius HTTP `getVersion`。
+4. 真实建立 Helius WSS 连接并订阅当前候选池。
+5. 要求全部订阅得到确认，并至少收到一个真实 `accountNotification`。
+6. 核对通知能够通过 `subscription id` 映射回正确 Pool Account / DEX。
+7. 端到端测试通过后才把 V1 标记为完成，然后进入 V2。
 
 ## 开发与记录约定
 
@@ -176,4 +199,7 @@ GitHub Actions 已在真实 runner 上完成：
 - BONK/WIF 共 18 个监控候选 Pool Account 完成链上存在性与 owner 核验。
 - 修复 Raydium v3 `mintA / mintB` 字段兼容问题。
 - 增加灰尘池筛选和链上账户核验。
-- 开始 V1 Helius RPC/WSS 实时订阅。
+- V1 Helius 配置、HTTP/WSS 协议层与订阅映射逻辑已实现。
+- V1 当前单元测试提升至 **34 passed / 0 failed**。
+- 修复 V1 `clippy` 的不必要 `expect` 问题。
+- V1 真实 Helius 测试因 `HELIUS_API_KEY` Repository Secret 尚未配置而明确跳过，阶段保持进行中。
