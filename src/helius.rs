@@ -228,8 +228,10 @@ pub async fn subscribe_and_wait_for_update(
         let mut first_update: Option<AccountUpdate> = None;
 
         loop {
-            if tracker.all_acknowledged() && first_update.is_some() {
-                return Ok(first_update.expect("checked above"));
+            if tracker.all_acknowledged() {
+                if let Some(update) = first_update.take() {
+                    return Ok(update);
+                }
             }
 
             let message = socket
