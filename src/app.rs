@@ -852,7 +852,7 @@ async fn preload_state_accounts(
     if batch.accounts.len() != addresses.len() {
         bail!("dependency snapshot account count mismatch");
     }
-    for (address, account) in addresses.iter().zip(batch.accounts.into_iter()) {
+    for (address, account) in addresses.iter().zip(batch.accounts) {
         let account = account.with_context(|| {
             format!("registered quote dependency account is missing: {address}")
         })?;
@@ -898,7 +898,7 @@ async fn refresh_pool_dependencies(
         Some(min_context_slot),
     )
     .await?;
-    for (address, account) in missing.iter().zip(batch.accounts.into_iter()) {
+    for (address, account) in missing.iter().zip(batch.accounts) {
         let account = account
             .with_context(|| format!("new quote dependency account is missing: {address}"))?;
         state.apply_account_update(
