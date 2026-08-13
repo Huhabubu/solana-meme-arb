@@ -36,8 +36,8 @@
 | 统一 `SwapQuote` 与两腿闭环计算 | ✅ 已完成并验证 | Mint / 金额连续性、同池拒绝、signed profit、slot 范围均有单元测试 |
 | Raydium Standard 双方向 Quote | ✅ 已接入 V3 实际路径 | `WSOL → Token` 与 `Token → WSOL` 均由真实 Pool State + vault 计算 |
 | Orca Whirlpool 双方向 Quote | ✅ 已接入 V3 实际路径 | 两个方向均使用真实 Whirlpool/TickArray/Mint 状态和官方 core Quote |
-| Raydium ↔ Orca 两腿闭环 | ✅ 已真实验证 | BONK/WIF 双方向共 4 条真实主网闭环 |
-| Meteora 参与跨池路径 | ⏳ 未完成 | V2 单池 Quote 已完成，但尚未接入 V3 通用闭环枚举 |
+| Meteora DLMM 双方向 Quote | ✅ 已接入 V3 实际路径 | 任意输入 Mint / amount，按方向重新推导 BinArray 并调用官方 Quote |
+| 三 DEX 全部有向两池组合 | ✅ 已真实验证 | 每 Token 3 个池 → 6 条路径；BONK/WIF 共 12 条主网闭环 |
 | 多输入金额利润曲线 | ⏳ 未完成 | 当前闭环验收输入固定为 0.01 WSOL |
 | 执行成本 / 净利润模型 | ⏳ 未完成 | Priority Fee / Jito Tip 等尚未扣除 |
 | 实时 Opportunity Engine / 记录统计 | ⏳ 未完成 | 尚未进入连续监控 |
@@ -255,6 +255,39 @@ Run `31691663172` 的 0.01 WSOL 真实主网闭环快照：
 
 同一 CI 最后一关继续真实收到 Orca TickArray 更新并触发 V2 Quote 重算，说明 V3 改动没有破坏实时状态链路。
 
+### V3.2 — 三 DEX 全路径闭环
+
+正式 CI Run `31692193766` 已完成 V3 第二组闭环扩展，并读取完整 Job 日志核对实际执行内容。
+
+- Meteora DLMM 已改为任意输入 Mint / amount 的双方向统一 Quote。
+- 新增 `directed_route_indices`，对 N 个不同池生成 `N × (N - 1)` 条有向两池路径；3 个池严格得到 6 条路径。
+- 新增路径枚举单元测试，测试总数增加到 **83 passed / 0 failed**。
+- BONK 与 WIF 均使用 Raydium Standard、Orca Whirlpool、Meteora DLMM 三个真实池。
+- 每个 Token 真实执行 6 条两腿闭环，共 **12 条主网路径**。
+
+0.01 WSOL 当次真实快照：
+
+| Token | 路径 | Token 输出 | 最终 WSOL | gross profit | gross return bps |
+|---|---|---:|---:|---:|---:|
+| BONK | Raydium → Orca | 326,904.27740 | 0.009999855 | -0.000000145 SOL | 0* |
+| BONK | Raydium → Meteora DLMM | 326,904.27740 | 0.009981909 | -0.000018091 SOL | -18 |
+| BONK | Orca → Raydium | 326,578.43265 | 0.009937858 | -0.000062142 SOL | -62 |
+| BONK | Orca → Meteora DLMM | 326,578.43265 | 0.009971960 | -0.000028040 SOL | -28 |
+| BONK | Meteora DLMM → Raydium | 326,905.09647 | 0.009947797 | -0.000052203 SOL | -52 |
+| BONK | Meteora DLMM → Orca | 326,905.09647 | 0.009999880 | -0.000000120 SOL | 0* |
+| WIF | Raydium → Orca | 5.445709 | 0.009985515 | -0.000014485 SOL | -14 |
+| WIF | Raydium → Meteora DLMM | 5.445709 | 0.009868024 | -0.000131976 SOL | -131 |
+| WIF | Orca → Raydium | 5.449169 | 0.009956375 | -0.000043625 SOL | -43 |
+| WIF | Orca → Meteora DLMM | 5.449169 | 0.009874293 | -0.000125707 SOL | -125 |
+| WIF | Meteora DLMM → Raydium | 5.447106 | 0.009952605 | -0.000047395 SOL | -47 |
+| WIF | Meteora DLMM → Orca | 5.447106 | 0.009988077 | -0.000011923 SOL | -11 |
+
+`*` 当前 `gross_return_bps` 使用整数除法，绝对收益不足 1 bps 时会向 0 截断。因此上表两个 `0 bps` 路径仍然是确定的负收益；**判断盈亏以 `gross_profit_raw` 为准**，不能只看整数 bps。
+
+> **12 条真实路径当次全部为负收益。** 最接近盈亏平衡的是 BONK `Meteora DLMM → Orca`（-120 lamports）和 `Raydium → Orca`（-145 lamports），但它们尚未扣 Priority Fee / Jito Tip 等执行成本，因此不能视为可执行机会。
+
+同一 Run 的最后依赖 WSS 回归仍然通过：真实收到 Orca TickArray `6JepAn8RrWxRLvZb4sCp2vjuGPxQtVrbSpf1LGq6evcd` 更新，正确映射到 BONK Orca Pool 并重算 Quote。V3.2 没有破坏 V2 实时状态链。
+
 ### V0 监控候选筛选规则
 
 当前研究期默认：
@@ -384,20 +417,20 @@ Run `31691663172` 的 0.01 WSOL 真实主网闭环快照：
 - DEX REST API 的 TVL 属于动态外部数据，不能视为链上实时成交价格。
 - 当前可报价池只有 6 个：每个 Token 的 Raydium Standard / Orca Whirlpool / Meteora DLMM 各 1 个。Raydium CLMM、Meteora DAMM v2 尚未进入 Quote 引擎。
 - Orca 当前真实可报价池均为经典 SPL Token 且非 Adaptive Fee；Token-2022 transfer fee 和 Adaptive Fee Oracle 尚无当前实池验证证据。
-- **目前只完成了 Raydium ↔ Orca、固定 0.01 WSOL 的首批闭环快照；4 条路径当次均为负收益。尚无正收益套利证据，也尚未扣 Priority Fee / Jito Tip 等执行成本。**
+- **当前三个 DEX 的 12 条固定 0.01 WSOL 闭环已经全部跑通，但当次 12/12 均为负收益，尚无正收益套利证据。** 其中两个 BONK 路径只亏 120–145 lamports，但还未计 Priority Fee / Jito Tip，因此不能视为可执行机会。
+- 当前整数 `gross_return_bps` 会把绝对收益不足 1 bps 的结果截断为 0；`gross_profit_raw` 仍然精确，后续统计前需要补更高精度收益率字段，防止只看 bps 时误判符号。
 - 当前 GitHub App 无权读取个人 Billing Usage API，因此 README 不记录猜测的 Actions 剩余额度；需要从 GitHub `Settings → Billing & Licensing` 查看真实账户用量。
 
 ## 下一步
 
 V3 当前计划：
 
-1. 将 Meteora DLMM 接入统一双方向 `SwapQuote`，让三个已支持 DEX 都进入同一闭环接口。
-2. 从手工 Raydium ↔ Orca 两条方向扩展为三个 DEX 的全部不同 Pool 有向组合，自动枚举路径。
-3. 为每条路径测试多个输入金额，得到真实毛利润曲线，并选择候选最优输入规模。
-4. 增加独立执行成本模型：Priority Fee、Jito Tip、其他交易固定成本；避免重复扣已经包含在 Quote 中的 DEX fee。
-5. 把实时依赖账户更新接到 Opportunity Engine，只重算受影响池和相关 Token 的路径。
-6. 记录真实机会的 slot、路径、金额、收益和持续情况；这一阶段仍然不接钱包、不下单。
-7. 需要连续 24–72 小时采样时停止使用 GitHub Actions 当长期运行环境，转到常驻 Linux VPS。
+1. 为 12 条路径测试多个输入金额，得到真实毛利润曲线，并比较不同资金规模下的 Price Impact。
+2. 在进入连续统计前补高精度收益率展示，同时保持 raw amount / raw profit 作为权威计算值。
+3. 增加独立执行成本模型：Priority Fee、Jito Tip、其他交易固定成本；避免重复扣已经包含在 Quote 中的 DEX fee。
+4. 把实时依赖账户更新接到 Opportunity Engine，只重算受影响池和相关 Token 的路径。
+5. 记录真实机会的 slot、路径、金额、收益和持续情况；这一阶段仍然不接钱包、不下单。
+6. 需要连续 24–72 小时采样时停止使用 GitHub Actions 当长期运行环境，转到常驻 Linux VPS。
 
 ## 开发与记录约定
 
@@ -440,4 +473,6 @@ V3 当前计划：
 - V3.1 新增统一 `SwapQuote` / `RoundTripOpportunity` 与闭环校验；新增 4 组单元测试。
 - V3.1 将 Raydium Standard / Orca Whirlpool 改为可接受任意输入 Mint / amount 的双方向 Quote，并新增正式 `round-trip-check`。
 - V3.1 最终 CI Run `31691663172`：**82 passed / 0 failed**；BONK/WIF 的 Raydium ↔ Orca 共 4 条真实两腿闭环全部计算成功。
-- 当次 4 条闭环均为负收益，当前仍无可盈利证据；V3 保持进行中。
+- V3.2 将 Meteora DLMM 接入统一双方向 Quote，并新增三池全部有向路径枚举测试。
+- V3.2 最终 CI Run `31692193766`：**83 passed / 0 failed**；BONK/WIF × Raydium/Orca/Meteora 共 **12 条真实两腿闭环**全部运行成功。
+- V3.2 当次 12 条路径全部为负收益，当前仍无可盈利证据；V3 保持进行中。
