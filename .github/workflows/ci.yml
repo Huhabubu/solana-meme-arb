@@ -29,8 +29,14 @@ jobs:
       - name: Tests
         run: cargo test --all-targets
 
-      # V0 阶段的端到端冒烟测试：真实请求 DEX 公共 API，不使用钱包或密钥。
+      # V0 端到端冒烟测试：真实请求 DEX 公共 API，不使用钱包或密钥。
       - name: Live pool discovery
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         timeout-minutes: 2
         run: cargo run -- discover
+
+      # 再从 Solana Mainnet 读取候选 Pool Account，核验账户存在且 owner 等于预期 DEX Program。
+      - name: Live on-chain verification
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        timeout-minutes: 2
+        run: cargo run -- verify
