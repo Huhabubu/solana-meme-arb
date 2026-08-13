@@ -67,6 +67,20 @@ pub struct RoundTripOpportunity {
     pub newest_slot: u64,
 }
 
+/// 为 N 个不同池生成全部有向两池路径索引；每个池都可以作为第一腿或第二腿，
+/// 但同一池不会和自己组成套利闭环。
+pub fn directed_route_indices(pool_count: usize) -> Vec<(usize, usize)> {
+    let mut routes = Vec::with_capacity(pool_count.saturating_mul(pool_count.saturating_sub(1)));
+    for first in 0..pool_count {
+        for second in 0..pool_count {
+            if first != second {
+                routes.push((first, second));
+            }
+        }
+    }
+    routes
+}
+
 /// 评估两腿 exact-input 闭环。DEX swap fee 已经包含在各腿 Quote 输出中；
 /// 这里的 gross profit 只是不再扣 Priority Fee / Jito Tip 等执行成本。
 pub fn evaluate_round_trip(
@@ -139,6 +153,16 @@ mod tests {
         assert!(SwapQuote::new(Dex::Raydium, "pool", "A", "A", 1, 1, 1).is_err());
         assert!(SwapQuote::new(Dex::Raydium, "pool", "A", "B", 0, 1, 1).is_err());
         assert!(SwapQuote::new(Dex::Raydium, "pool", "A", "B", 1, 0, 1).is_err());
+    }
+
+    #[test]
+    fn directed_routes_cover_all_ordered_distinct_pairs() {
+        assert!(directed_route_indices(0).is_empty());
+        assert!(directed_route_indices(1).is_empty());
+        assert_eq!(
+            directed_route_indices(3),
+            vec![(0, 1), (0, 2), (1, 0), (1, 2), (2, 0), (2, 1)]
+        );
     }
 
     #[test]
