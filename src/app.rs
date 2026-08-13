@@ -35,7 +35,7 @@ use crate::{
     },
     helius::{check_http, subscribe_accounts_and_wait_for_update, subscribe_and_wait_for_update},
     model::{Dex, PoolInfo},
-    opportunity::{evaluate_round_trip, SwapQuote},
+    opportunity::{directed_route_indices, evaluate_round_trip, SwapQuote},
     rpc::{fetch_account_owners, fetch_accounts, verify_pool_accounts, PUBLIC_MAINNET_RPC},
     state::{DependencyKind, PoolDependencies, QuoteState, VersionedAccountData},
     token_account::{decode_spl_token_account, decode_spl_token_mint, SPL_TOKEN_PROGRAM_ID},
@@ -585,6 +585,35 @@ async fn quote_orca_pool_amount(
     })
 }
 
+async fn quote_supported_pool_amount(
+    client: &Client,
+    config: &HeliusConfig,
+    pool: &PoolInfo,
+    input_mint: &str,
+    amount_in: u64,
+) -> Result<SwapQuote> {
+    match pool.dex {
+        Dex::Raydium => Ok(
+            quote_raydium_pool_amount(client, config, pool, input_mint, amount_in)
+                .await?
+                .swap,
+        ),
+        Dex::Orca => Ok(
+            quote_orca_pool_amount(client, config, pool, input_mint, amount_in)
+                .await?
+                .swap,
+        ),
+        Dex::MeteoraDlmm => Ok(quote_meteora_pool_amount(
+            client, config, pool, input_mint, amount_in,
+        )
+        .await?
+        .swap),
+        Dex::MeteoraDammV2 => {
+            bail!("Meteora DAMM v2 is not part of the V3 quoteable universe")
+        }
+    }
+}
+
 async fn run_round_trip_check(client: &Client) -> Result<()> {
     let config = HeliusConfig::from_env()?;
     let mut verified_routes = 0usize;
@@ -592,79 +621,69 @@ async fn run_round_trip_check(client: &Client) -> Result<()> {
     for token in tracked_tokens() {
         let (_, candidates) = discover_candidates(client, token).await?;
         let pools = supported_quote_pools(&candidates);
-        let raydium = pools
-            .iter()
-            .find(|pool| pool.dex == Dex::Raydium)
-            .with_context(|| {
-                format!(
-                    "{}/WSOL has no supported Raydium Standard pool",
-                    token.symbol
-                )
-            })?;
-        let orca = pools
-            .iter()
-            .find(|pool| pool.dex == Dex::Orca)
-            .with_context(|| format!("{}/WSOL has no supported Orca Whirlpool", token.symbol))?;
-
-        let first = quote_raydium_pool_amount(
-            client,
-            &config,
-            raydium,
-            WSOL,
-            ROUND_TRIP_TEST_INPUT_LAMPORTS,
-        )
-        .await?;
-        let second =
-            quote_orca_pool_amount(client, &config, orca, token.mint, first.swap.amount_out)
-                .await?;
-        let raydium_to_orca = evaluate_round_trip(&first.swap, &second.swap)?;
-        if raydium_to_orca.base_mint != WSOL || raydium_to_orca.intermediate_mint != token.mint {
-            bail!("Raydium->Orca round trip produced unexpected mints");
+        if pools.len() != 3 {
+            bail!(
+                "{}/WSOL expected exactly 3 V3 quoteable pools, got {}",
+                token.symbol,
+                pools.len()
+            );
         }
-        println!(
-            "{}/WSOL V3 round trip verified: Raydium->Orca input={} token_out={} final={} gross_profit_raw={} gross_return_bps={} slots={}..{}",
-            token.symbol,
-            raydium_to_orca.input_amount,
-            raydium_to_orca.intermediate_amount,
-            raydium_to_orca.final_amount,
-            raydium_to_orca.gross_profit_raw,
-            raydium_to_orca.gross_return_bps,
-            raydium_to_orca.oldest_slot,
-            raydium_to_orca.newest_slot
-        );
-        verified_routes += 1;
-
-        let first =
-            quote_orca_pool_amount(client, &config, orca, WSOL, ROUND_TRIP_TEST_INPUT_LAMPORTS)
-                .await?;
-        let second =
-            quote_raydium_pool_amount(client, &config, raydium, token.mint, first.swap.amount_out)
-                .await?;
-        let orca_to_raydium = evaluate_round_trip(&first.swap, &second.swap)?;
-        if orca_to_raydium.base_mint != WSOL || orca_to_raydium.intermediate_mint != token.mint {
-            bail!("Orca->Raydium round trip produced unexpected mints");
+        let routes = directed_route_indices(pools.len());
+        if routes.len() != 6 {
+            bail!(
+                "{}/WSOL expected 6 directed two-pool routes, got {}",
+                token.symbol,
+                routes.len()
+            );
         }
-        println!(
-            "{}/WSOL V3 round trip verified: Orca->Raydium input={} token_out={} final={} gross_profit_raw={} gross_return_bps={} slots={}..{}",
-            token.symbol,
-            orca_to_raydium.input_amount,
-            orca_to_raydium.intermediate_amount,
-            orca_to_raydium.final_amount,
-            orca_to_raydium.gross_profit_raw,
-            orca_to_raydium.gross_return_bps,
-            orca_to_raydium.oldest_slot,
-            orca_to_raydium.newest_slot
-        );
-        verified_routes += 1;
+
+        for (first_index, second_index) in routes {
+            let first_pool = &pools[first_index];
+            let second_pool = &pools[second_index];
+            let first = quote_supported_pool_amount(
+                client,
+                &config,
+                first_pool,
+                WSOL,
+                ROUND_TRIP_TEST_INPUT_LAMPORTS,
+            )
+            .await?;
+            let second = quote_supported_pool_amount(
+                client,
+                &config,
+                second_pool,
+                token.mint,
+                first.amount_out,
+            )
+            .await?;
+            let opportunity = evaluate_round_trip(&first, &second)?;
+            if opportunity.base_mint != WSOL || opportunity.intermediate_mint != token.mint {
+                bail!("V3 round trip produced unexpected mints");
+            }
+            println!(
+                "{}/WSOL V3 round trip verified: {}->{} input={} token_out={} final={} gross_profit_raw={} gross_return_bps={} slots={}..{}",
+                token.symbol,
+                first_pool.dex,
+                second_pool.dex,
+                opportunity.input_amount,
+                opportunity.intermediate_amount,
+                opportunity.final_amount,
+                opportunity.gross_profit_raw,
+                opportunity.gross_return_bps,
+                opportunity.oldest_slot,
+                opportunity.newest_slot
+            );
+            verified_routes += 1;
+        }
     }
 
-    let expected_routes = tracked_tokens().len() * 2;
+    let expected_routes = tracked_tokens().len() * 6;
     if verified_routes != expected_routes {
         bail!(
             "V3 round-trip verification count mismatch: expected {expected_routes}, got {verified_routes}"
         );
     }
-    println!("V3 Raydium/Orca two-leg round-trip verification passed for {verified_routes} routes");
+    println!("V3 all-DEX two-leg round-trip verification passed for {verified_routes} routes");
     Ok(())
 }
 
@@ -688,7 +707,67 @@ async fn run_meteora_quote_check(client: &Client) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug)]
+struct MeteoraLiveQuote {
+    swap: SwapQuote,
+    active_id: i32,
+    bin_array_count: usize,
+    swap_for_y: bool,
+    fee: u64,
+    protocol_fee: u64,
+    output_decimals: Option<u8>,
+}
+
 async fn quote_meteora_pool(client: &Client, config: &HeliusConfig, pool: &PoolInfo) -> Result<()> {
+    let live = quote_meteora_pool_amount(
+        client,
+        config,
+        pool,
+        WSOL,
+        METEORA_QUOTE_TEST_INPUT_LAMPORTS,
+    )
+    .await?;
+    if let Some(decimals) = live.output_decimals {
+        let output_ui = live.swap.amount_out as f64 / 10_f64.powi(i32::from(decimals));
+        println!(
+            "{}/WSOL Meteora DLMM verified: pool={} snapshot_slot={} active_id={} bin_arrays={} direction={} input=0.01 WSOL output_mint={} output_raw={} output_ui={:.8} fee={} protocol_fee={}",
+            token_symbol_for_pool(pool)?,
+            pool.address,
+            live.swap.snapshot_slot,
+            live.active_id,
+            live.bin_array_count,
+            if live.swap_for_y { "X->Y" } else { "Y->X" },
+            live.swap.output_mint,
+            live.swap.amount_out,
+            output_ui,
+            live.fee,
+            live.protocol_fee
+        );
+    } else {
+        println!(
+            "{}/WSOL Meteora DLMM verified: pool={} snapshot_slot={} active_id={} bin_arrays={} direction={} input=0.01 WSOL output_mint={} output_raw={} output_ui=n/a(non-classic mint) fee={} protocol_fee={}",
+            token_symbol_for_pool(pool)?,
+            pool.address,
+            live.swap.snapshot_slot,
+            live.active_id,
+            live.bin_array_count,
+            if live.swap_for_y { "X->Y" } else { "Y->X" },
+            live.swap.output_mint,
+            live.swap.amount_out,
+            live.fee,
+            live.protocol_fee
+        );
+    }
+    Ok(())
+}
+
+async fn quote_meteora_pool_amount(
+    client: &Client,
+    config: &HeliusConfig,
+    pool: &PoolInfo,
+    input_mint: &str,
+    amount_in: u64,
+) -> Result<MeteoraLiveQuote> {
     let bitmap_address = bitmap_extension_address(&pool.address)?;
     let initial_addresses = vec![pool.address.clone(), bitmap_address.clone()];
     let initial =
@@ -717,7 +796,7 @@ async fn quote_meteora_pool(client: &Client, config: &HeliusConfig, pool: &PoolI
             decode_bitmap_extension(&account.data)
         })
         .transpose()?;
-    let swap_for_y = swap_for_y_for_input(&initial_lb_pair, WSOL)?;
+    let swap_for_y = swap_for_y_for_input(&initial_lb_pair, input_mint)?;
     let initial_bin_addresses = bin_array_addresses_for_swap(
         &pool.address,
         &initial_lb_pair,
@@ -768,7 +847,7 @@ async fn quote_meteora_pool(client: &Client, config: &HeliusConfig, pool: &PoolI
             decode_bitmap_extension(&account.data)
         })
         .transpose()?;
-    let snapshot_swap_for_y = swap_for_y_for_input(&lb_pair, WSOL)?;
+    let snapshot_swap_for_y = swap_for_y_for_input(&lb_pair, input_mint)?;
     let snapshot_bin_addresses = bin_array_addresses_for_swap(
         &pool.address,
         &lb_pair,
@@ -810,7 +889,7 @@ async fn quote_meteora_pool(client: &Client, config: &HeliusConfig, pool: &PoolI
     let quote = quote_meteora_exact_in(
         &pool.address,
         &lb_pair,
-        METEORA_QUOTE_TEST_INPUT_LAMPORTS,
+        amount_in,
         snapshot_swap_for_y,
         build_bin_array_map(bin_entries)?,
         bitmap.as_ref(),
@@ -822,53 +901,35 @@ async fn quote_meteora_pool(client: &Client, config: &HeliusConfig, pool: &PoolI
         bail!("Meteora official quote returned zero output");
     }
 
-    let output_mint = if snapshot_swap_for_y {
-        &mint_y
+    let (output_mint, output_account) = if snapshot_swap_for_y {
+        (mint_y, mint_y_account)
     } else {
-        &mint_x
+        (mint_x, mint_x_account)
     };
-    let output_account = if snapshot_swap_for_y {
-        mint_y_account
-    } else {
-        mint_x_account
-    };
-    let output_ui = if output_account.owner == SPL_TOKEN_PROGRAM_ID {
-        let output_state = decode_spl_token_mint(&output_account.data)?;
-        Some(quote.amount_out as f64 / 10_f64.powi(i32::from(output_state.decimals)))
+    let output_decimals = if output_account.owner == SPL_TOKEN_PROGRAM_ID {
+        Some(decode_spl_token_mint(&output_account.data)?.decimals)
     } else {
         None
     };
-    if let Some(output_ui) = output_ui {
-        println!(
-            "{}/WSOL Meteora DLMM verified: pool={} snapshot_slot={} active_id={} bin_arrays={} direction={} input=0.01 WSOL output_mint={} output_raw={} output_ui={:.8} fee={} protocol_fee={}",
-            token_symbol_for_pool(pool)?,
-            pool.address,
-            snapshot.slot,
-            lb_pair.active_id,
-            snapshot_bin_addresses.len(),
-            if snapshot_swap_for_y { "X->Y" } else { "Y->X" },
-            output_mint,
-            quote.amount_out,
-            output_ui,
-            quote.fee,
-            quote.protocol_fee
-        );
-    } else {
-        println!(
-            "{}/WSOL Meteora DLMM verified: pool={} snapshot_slot={} active_id={} bin_arrays={} direction={} input=0.01 WSOL output_mint={} output_raw={} output_ui=n/a(non-classic mint) fee={} protocol_fee={}",
-            token_symbol_for_pool(pool)?,
-            pool.address,
-            snapshot.slot,
-            lb_pair.active_id,
-            snapshot_bin_addresses.len(),
-            if snapshot_swap_for_y { "X->Y" } else { "Y->X" },
-            output_mint,
-            quote.amount_out,
-            quote.fee,
-            quote.protocol_fee
-        );
-    }
-    Ok(())
+    let swap = SwapQuote::new(
+        pool.dex,
+        pool.address.clone(),
+        input_mint,
+        output_mint,
+        amount_in,
+        quote.amount_out,
+        snapshot.slot,
+    )?;
+
+    Ok(MeteoraLiveQuote {
+        swap,
+        active_id: lb_pair.active_id,
+        bin_array_count: snapshot_bin_addresses.len(),
+        swap_for_y: snapshot_swap_for_y,
+        fee: quote.fee,
+        protocol_fee: quote.protocol_fee,
+        output_decimals,
+    })
 }
 
 async fn build_pool_dependencies(
