@@ -599,8 +599,8 @@ async fn quote_orca_pool_amounts(
     for &amount_in in amounts_in {
         let quote = quote_orca_exact_in(
             &whirlpool,
-            tick_arrays.clone(),
-            oracle.clone(),
+            tick_arrays,
+            oracle,
             input_mint,
             amount_in,
             timestamp,
