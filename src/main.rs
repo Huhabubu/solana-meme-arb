@@ -5,6 +5,7 @@ mod dex;
 mod discovery;
 mod helius;
 mod model;
+mod opportunity;
 mod rpc;
 mod serde_utils;
 mod state;
