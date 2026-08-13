@@ -29,8 +29,10 @@ struct RawPool {
     pool_type: String,
     #[serde(rename = "programId")]
     program_id: String,
-    mint1: RawMint,
-    mint2: RawMint,
+    #[serde(rename = "mintA")]
+    mint_a: RawMint,
+    #[serde(rename = "mintB")]
+    mint_b: RawMint,
     tvl: Value,
 }
 
@@ -78,8 +80,8 @@ fn parse_response(body: &str, mint_x: &str, mint_y: &str) -> Result<Vec<PoolInfo
                 address: pool.id,
                 pool_type: pool.pool_type,
                 program_id: Some(pool.program_id),
-                mint_a: pool.mint1.address,
-                mint_b: pool.mint2.address,
+                mint_a: pool.mint_a.address,
+                mint_b: pool.mint_b.address,
                 tvl_usd: number_from_value(&pool.tvl)?,
             };
             Ok(info)
@@ -101,12 +103,12 @@ mod tests {
     const B: &str = "MintB";
 
     #[test]
-    fn parses_valid_pool_and_filters_other_pairs() {
+    fn parses_current_v3_pool_shape_and_filters_other_pairs() {
         let body = r#"{
             "success": true,
             "data": {"data": [
-                {"id":"pool-1","type":"Concentrated","programId":"program-1","mint1":{"address":"MintA"},"mint2":{"address":"MintB"},"tvl":1234.5},
-                {"id":"pool-2","type":"Standard","programId":"program-2","mint1":{"address":"MintA"},"mint2":{"address":"Other"},"tvl":10}
+                {"id":"pool-1","type":"Concentrated","programId":"program-1","mintA":{"address":"MintA"},"mintB":{"address":"MintB"},"tvl":1234.5},
+                {"id":"pool-2","type":"Standard","programId":"program-2","mintA":{"address":"MintA"},"mintB":{"address":"Other"},"tvl":10}
             ]}
         }"#;
 
@@ -115,6 +117,18 @@ mod tests {
         assert_eq!(pools[0].address, "pool-1");
         assert_eq!(pools[0].program_id.as_deref(), Some("program-1"));
         assert_eq!(pools[0].tvl_usd, 1234.5);
+    }
+
+    #[test]
+    fn rejects_obsolete_mint1_mint2_pool_shape() {
+        let body = r#"{
+            "success": true,
+            "data": {"data": [
+                {"id":"pool-1","type":"Concentrated","programId":"program-1","mint1":{"address":"MintA"},"mint2":{"address":"MintB"},"tvl":1234.5}
+            ]}
+        }"#;
+
+        assert!(parse_response(body, A, B).is_err());
     }
 
     #[test]
