@@ -76,10 +76,9 @@ impl SubscriptionTracker {
     }
 
     fn acknowledge(&mut self, request_id: u64, subscription_id: u64) -> Result<()> {
-        let pool = self
-            .pending
-            .remove(&request_id)
-            .with_context(|| format!("unknown or duplicate subscription request id {request_id}"))?;
+        let pool = self.pending.remove(&request_id).with_context(|| {
+            format!("unknown or duplicate subscription request id {request_id}")
+        })?;
         if self.active.insert(subscription_id, pool).is_some() {
             bail!("duplicate subscription id {subscription_id}");
         }
@@ -171,7 +170,9 @@ fn parse_server_event(text: &str) -> Result<ServerEvent> {
     }
 
     if value.get("method").and_then(Value::as_str) == Some("accountNotification") {
-        let params = value.get("params").context("accountNotification missing params")?;
+        let params = value
+            .get("params")
+            .context("accountNotification missing params")?;
         return Ok(ServerEvent::AccountNotification {
             subscription_id: params
                 .get("subscription")
@@ -259,9 +260,7 @@ pub async fn subscribe_and_wait_for_update(
                         code,
                         message,
                     } => {
-                        bail!(
-                            "Helius WSS RPC error request={request_id:?} code={code}: {message}"
-                        );
+                        bail!("Helius WSS RPC error request={request_id:?} code={code}: {message}");
                     }
                     ServerEvent::Other => {}
                 },
