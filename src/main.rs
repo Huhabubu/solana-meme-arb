@@ -21,6 +21,13 @@ use solana_pubkey::Pubkey;
 
 use config::HeliusConfig;
 use dex::{
+    meteora::DLMM_PROGRAM_ID,
+    meteora_dlmm::{
+        bin_array_addresses_for_swap, bitmap_extension_address, build_bin_array_map,
+        clock_sysvar_address, decode_bin_array, decode_bitmap_extension, decode_clock,
+        decode_lb_pair, quote_exact_in as quote_meteora_exact_in, quote_mint_account,
+        swap_for_y_for_input,
+    },
     orca_whirlpool::{
         decode_oracle, decode_tick_array_or_default, decode_whirlpool, needs_oracle,
         quote_exact_in as quote_orca_exact_in, tick_array_start_indexes, ORCA_WHIRLPOOL_PROGRAM_ID,
@@ -39,6 +46,8 @@ use tokens::{tracked_tokens, Token, WSOL};
 const APP_NAME: &str = "solana-meme-arb";
 const RAYDIUM_QUOTE_TEST_INPUT_LAMPORTS: u64 = 10_000_000; // 0.01 WSOL
 const ORCA_QUOTE_TEST_INPUT_LAMPORTS: u64 = 10_000_000; // 0.01 WSOL
+const METEORA_QUOTE_TEST_INPUT_LAMPORTS: u64 = 10_000_000; // 0.01 WSOL
+const METEORA_BIN_ARRAY_TAKE_COUNT: u8 = 3;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -51,9 +60,10 @@ async fn main() -> Result<()> {
         "helius-check" => run_helius_check(&client).await,
         "raydium-quote-check" => run_raydium_quote_check(&client).await,
         "orca-quote-check" => run_orca_quote_check(&client).await,
+        "meteora-quote-check" => run_meteora_quote_check(&client).await,
         _ => {
             println!(
-                "Usage: {APP_NAME} <discover|verify|helius-check|raydium-quote-check|orca-quote-check>"
+                "Usage: {APP_NAME} <discover|verify|helius-check|raydium-quote-check|orca-quote-check|meteora-quote-check>"
             );
             Ok(())
         }
@@ -462,6 +472,223 @@ async fn run_orca_quote_check(client: &Client) -> Result<()> {
     Ok(())
 }
 
+/// 真实读取 Meteora DLMM 的 LbPair、bitmap extension、Clock、Mint 和当前方向 BinArray，
+/// 再调用 Meteora 官方 Rust `commons::quote_exact_in` 计算 0.01 WSOL 报价。
+async fn run_meteora_quote_check(client: &Client) -> Result<()> {
+    let config = HeliusConfig::from_env()?;
+    let mut verified = 0usize;
+
+    for token in tracked_tokens() {
+        let (_, candidates) = discover_candidates(client, token).await?;
+        let pool = candidates.iter().find(|pool| {
+            pool.dex == Dex::MeteoraDlmm
+                && pool.program_id.as_deref() == Some(DLMM_PROGRAM_ID)
+        });
+        let Some(pool) = pool else {
+            println!("{}/WSOL: no selected Meteora DLMM pool", token.symbol);
+            continue;
+        };
+
+        let bitmap_address = bitmap_extension_address(&pool.address)?;
+        let initial_addresses = vec![pool.address.clone(), bitmap_address.clone()];
+        let initial = fetch_accounts(
+            client,
+            config.http_url().as_str(),
+            &initial_addresses,
+            None,
+        )
+        .await?;
+        if initial.accounts.len() != 2 {
+            bail!("Meteora initial snapshot returned unexpected account count");
+        }
+
+        let initial_pool_account = initial.accounts[0]
+            .as_ref()
+            .with_context(|| format!("Meteora LbPair account missing: {}", pool.address))?;
+        if initial_pool_account.owner != DLMM_PROGRAM_ID {
+            bail!("Meteora LbPair owner mismatch for {}", pool.address);
+        }
+        let initial_lb_pair = decode_lb_pair(&initial_pool_account.data)?;
+        let initial_mint_x = initial_lb_pair.token_x_mint.to_string();
+        let initial_mint_y = initial_lb_pair.token_y_mint.to_string();
+        if !pool.matches_pair(&initial_mint_x, &initial_mint_y) {
+            bail!(
+                "Meteora decoded mints do not match discovery metadata for {}",
+                pool.address
+            );
+        }
+
+        let initial_bitmap = initial.accounts[1]
+            .as_ref()
+            .map(|account| {
+                if account.owner != DLMM_PROGRAM_ID {
+                    bail!("Meteora bitmap extension owner mismatch");
+                }
+                decode_bitmap_extension(&account.data)
+            })
+            .transpose()?;
+        let initial_swap_for_y = swap_for_y_for_input(&initial_lb_pair, WSOL)?;
+        let initial_bin_addresses = bin_array_addresses_for_swap(
+            &pool.address,
+            &initial_lb_pair,
+            initial_bitmap.as_ref(),
+            initial_swap_for_y,
+            METEORA_BIN_ARRAY_TAKE_COUNT,
+        )?;
+        if initial_bin_addresses.is_empty() {
+            bail!("Meteora official helper returned no BinArray for active swap direction");
+        }
+
+        // 第二次请求把所有报价依赖账户放在同一个 getMultipleAccounts 快照中。
+        let mut snapshot_addresses = Vec::with_capacity(5 + initial_bin_addresses.len());
+        snapshot_addresses.push(pool.address.clone());
+        snapshot_addresses.push(clock_sysvar_address());
+        snapshot_addresses.push(initial_mint_x.clone());
+        snapshot_addresses.push(initial_mint_y.clone());
+        snapshot_addresses.push(bitmap_address.clone());
+        snapshot_addresses.extend(initial_bin_addresses.iter().cloned());
+
+        let snapshot = fetch_accounts(
+            client,
+            config.http_url().as_str(),
+            &snapshot_addresses,
+            Some(initial.slot),
+        )
+        .await?;
+        if snapshot.accounts.len() != snapshot_addresses.len() {
+            bail!(
+                "Meteora snapshot account count mismatch: expected {}, got {}",
+                snapshot_addresses.len(),
+                snapshot.accounts.len()
+            );
+        }
+
+        let lb_pair_account = snapshot.accounts[0]
+            .as_ref()
+            .context("Meteora snapshot LbPair account missing")?;
+        if lb_pair_account.owner != DLMM_PROGRAM_ID {
+            bail!("Meteora snapshot LbPair owner mismatch");
+        }
+        let lb_pair = decode_lb_pair(&lb_pair_account.data)?;
+        let mint_x = lb_pair.token_x_mint.to_string();
+        let mint_y = lb_pair.token_y_mint.to_string();
+        if !pool.matches_pair(&mint_x, &mint_y) {
+            bail!("Meteora snapshot mints no longer match selected pair");
+        }
+
+        let bitmap = snapshot.accounts[4]
+            .as_ref()
+            .map(|account| {
+                if account.owner != DLMM_PROGRAM_ID {
+                    bail!("Meteora snapshot bitmap extension owner mismatch");
+                }
+                decode_bitmap_extension(&account.data)
+            })
+            .transpose()?;
+        let swap_for_y = swap_for_y_for_input(&lb_pair, WSOL)?;
+        let snapshot_bin_addresses = bin_array_addresses_for_swap(
+            &pool.address,
+            &lb_pair,
+            bitmap.as_ref(),
+            swap_for_y,
+            METEORA_BIN_ARRAY_TAKE_COUNT,
+        )?;
+        if swap_for_y != initial_swap_for_y || snapshot_bin_addresses != initial_bin_addresses {
+            bail!("Meteora BinArray dependency changed while building coherent snapshot; retry required");
+        }
+
+        let clock_account = snapshot.accounts[1]
+            .as_ref()
+            .context("Solana Clock sysvar account missing")?;
+        let clock = decode_clock(&clock_account.data)?;
+        let mint_x_account = snapshot.accounts[2]
+            .as_ref()
+            .context("Meteora token X mint account missing")?;
+        let mint_y_account = snapshot.accounts[3]
+            .as_ref()
+            .context("Meteora token Y mint account missing")?;
+        let quote_mint_x = quote_mint_account(&mint_x_account.owner, &mint_x_account.data)?;
+        let quote_mint_y = quote_mint_account(&mint_y_account.owner, &mint_y_account.data)?;
+
+        let mut bin_entries = Vec::with_capacity(snapshot_bin_addresses.len());
+        for (index, address) in snapshot_bin_addresses.iter().enumerate() {
+            let account = snapshot.accounts[index + 5]
+                .as_ref()
+                .with_context(|| format!("Meteora BinArray account missing: {address}"))?;
+            if account.owner != DLMM_PROGRAM_ID {
+                bail!("Meteora BinArray owner mismatch: {address}");
+            }
+            bin_entries.push((address.clone(), decode_bin_array(&account.data)?));
+        }
+        let bin_arrays = build_bin_array_map(bin_entries)?;
+
+        let quote = quote_meteora_exact_in(
+            &pool.address,
+            &lb_pair,
+            METEORA_QUOTE_TEST_INPUT_LAMPORTS,
+            swap_for_y,
+            bin_arrays,
+            bitmap.as_ref(),
+            &clock,
+            &quote_mint_x,
+            &quote_mint_y,
+        )?;
+        if quote.amount_out == 0 {
+            bail!("Meteora official quote returned zero output");
+        }
+
+        let output_mint = if swap_for_y { &mint_y } else { &mint_x };
+        let output_account = if swap_for_y {
+            mint_y_account
+        } else {
+            mint_x_account
+        };
+        let output_ui = if output_account.owner == SPL_TOKEN_PROGRAM_ID {
+            let output_state = decode_spl_token_mint(&output_account.data)?;
+            Some(quote.amount_out as f64 / 10_f64.powi(i32::from(output_state.decimals)))
+        } else {
+            None
+        };
+
+        match output_ui {
+            Some(output_ui) => println!(
+                "{}/WSOL Meteora DLMM verified: pool={} snapshot_slot={} active_id={} bin_arrays={} direction={} input=0.01 WSOL output_mint={} output_raw={} output_ui={:.8} fee={} protocol_fee={}",
+                token.symbol,
+                pool.address,
+                snapshot.slot,
+                lb_pair.active_id,
+                snapshot_bin_addresses.len(),
+                if swap_for_y { "X->Y" } else { "Y->X" },
+                output_mint,
+                quote.amount_out,
+                output_ui,
+                quote.fee,
+                quote.protocol_fee
+            ),
+            None => println!(
+                "{}/WSOL Meteora DLMM verified: pool={} snapshot_slot={} active_id={} bin_arrays={} direction={} input=0.01 WSOL output_mint={} output_raw={} output_ui=n/a(non-classic mint) fee={} protocol_fee={}",
+                token.symbol,
+                pool.address,
+                snapshot.slot,
+                lb_pair.active_id,
+                snapshot_bin_addresses.len(),
+                if swap_for_y { "X->Y" } else { "Y->X" },
+                output_mint,
+                quote.amount_out,
+                quote.fee,
+                quote.protocol_fee
+            ),
+        }
+        verified += 1;
+    }
+
+    if verified == 0 {
+        bail!("no Meteora DLMM pool was available for live quote verification");
+    }
+    println!("Meteora DLMM local quote verification passed for {verified} tracked pair(s)");
+    Ok(())
+}
+
 fn unix_timestamp() -> Result<u64> {
     Ok(SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -482,5 +709,7 @@ mod tests {
     fn live_quote_probes_use_point_zero_one_sol() {
         assert_eq!(RAYDIUM_QUOTE_TEST_INPUT_LAMPORTS, 10_000_000);
         assert_eq!(ORCA_QUOTE_TEST_INPUT_LAMPORTS, 10_000_000);
+        assert_eq!(METEORA_QUOTE_TEST_INPUT_LAMPORTS, 10_000_000);
+        assert_eq!(METEORA_BIN_ARRAY_TAKE_COUNT, 3);
     }
 }
