@@ -306,8 +306,8 @@ pub async fn subscribe_accounts_and_wait_for_update(
                         data,
                     } => {
                         let address = tracker.resolve(subscription_id)?.to_owned();
-                        let accepted = accepted_addresses.is_empty()
-                            || accepted_addresses.contains(&address);
+                        let accepted =
+                            accepted_addresses.is_empty() || accepted_addresses.contains(&address);
                         if accepted {
                             first_accepted_update.get_or_insert(RawAccountUpdate {
                                 address,
@@ -323,7 +323,9 @@ pub async fn subscribe_accounts_and_wait_for_update(
                         code,
                         message,
                     } => {
-                        bail!("Helius WSS RPC error request={request_id:?} code={code}: {message}");
+                        bail!(
+                            "Helius WSS RPC error request={request_id:?} code={code}: {message}"
+                        );
                     }
                     ServerEvent::Other => {}
                 },
