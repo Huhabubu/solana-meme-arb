@@ -7,7 +7,9 @@ mod tokens;
 use anyhow::{bail, Result};
 use reqwest::Client;
 
-use discovery::discover_pair;
+use discovery::{
+    discover_pair, select_monitoring_candidates, MAX_POOLS_PER_DEX, MIN_MONITOR_TVL_USD,
+};
 use tokens::{tracked_tokens, WSOL};
 
 const APP_NAME: &str = "solana-meme-arb";
@@ -23,13 +25,30 @@ async fn main() -> Result<()> {
     let client = Client::builder().user_agent(APP_NAME).build()?;
 
     for token in tracked_tokens() {
-        let pools = discover_pair(&client, token.mint, WSOL).await?;
-        if pools.is_empty() {
+        let discovered = discover_pair(&client, token.mint, WSOL).await?;
+        if discovered.is_empty() {
             bail!("{} / WSOL: no exact pools found", token.symbol);
         }
 
-        println!("\n========== {}/WSOL ==========", token.symbol);
-        for pool in pools {
+        let candidates = select_monitoring_candidates(
+            &discovered,
+            MIN_MONITOR_TVL_USD,
+            MAX_POOLS_PER_DEX,
+        );
+        if candidates.is_empty() {
+            bail!(
+                "{} / WSOL: pools exist but none meet monitoring threshold",
+                token.symbol
+            );
+        }
+
+        println!(
+            "\n========== {}/WSOL: {} discovered, {} selected ==========",
+            token.symbol,
+            discovered.len(),
+            candidates.len()
+        );
+        for pool in candidates {
             println!(
                 "{:<16} {:<44} TVL ${:>12.2}  {}",
                 pool.dex, pool.address, pool.tvl_usd, pool.pool_type
