@@ -96,3 +96,16 @@ jobs:
             exit 0
           fi
           cargo run -- orca-quote-check
+
+      # V2 Meteora 子模块：真实读取 LbPair、Clock、Mint、bitmap extension 和当前方向 BinArray，调用官方 Rust quote。
+      - name: Live Meteora DLMM local quote verification
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        timeout-minutes: 2
+        env:
+          HELIUS_API_KEY: ${{ secrets.HELIUS_API_KEY }}
+        run: |
+          if [ -z "$HELIUS_API_KEY" ]; then
+            echo "HELIUS_API_KEY secret is not configured; V2 Meteora live verification skipped."
+            exit 0
+          fi
+          cargo run -- meteora-quote-check
