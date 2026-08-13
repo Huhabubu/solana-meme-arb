@@ -48,24 +48,49 @@ const METEORA_QUOTE_TEST_INPUT_LAMPORTS: u64 = 10_000_000;
 const METEORA_BIN_ARRAY_TAKE_COUNT: u8 = 3;
 const DEPENDENCY_WSS_WAIT_SECONDS: u64 = 45;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AppCommand {
+    Discover,
+    Verify,
+    HeliusCheck,
+    RaydiumQuoteCheck,
+    OrcaQuoteCheck,
+    MeteoraQuoteCheck,
+    DependencyWssCheck,
+}
+
+fn parse_command(value: Option<&str>) -> Result<Option<AppCommand>> {
+    match value {
+        None | Some("help") | Some("--help") | Some("-h") => Ok(None),
+        Some("discover") => Ok(Some(AppCommand::Discover)),
+        Some("verify") => Ok(Some(AppCommand::Verify)),
+        Some("helius-check") => Ok(Some(AppCommand::HeliusCheck)),
+        Some("raydium-quote-check") => Ok(Some(AppCommand::RaydiumQuoteCheck)),
+        Some("orca-quote-check") => Ok(Some(AppCommand::OrcaQuoteCheck)),
+        Some("meteora-quote-check") => Ok(Some(AppCommand::MeteoraQuoteCheck)),
+        Some("dependency-wss-check") => Ok(Some(AppCommand::DependencyWssCheck)),
+        Some(other) => bail!("unknown command: {other}"),
+    }
+}
+
 pub async fn run() -> Result<()> {
-    let command = std::env::args().nth(1).unwrap_or_else(|| "help".into());
+    let argument = std::env::args().nth(1);
+    let Some(command) = parse_command(argument.as_deref())? else {
+        println!(
+            "Usage: {APP_NAME} <discover|verify|helius-check|raydium-quote-check|orca-quote-check|meteora-quote-check|dependency-wss-check>"
+        );
+        return Ok(());
+    };
     let client = Client::builder().user_agent(APP_NAME).build()?;
 
-    match command.as_str() {
-        "discover" => run_discover(&client).await,
-        "verify" => run_verify(&client).await,
-        "helius-check" => run_helius_check(&client).await,
-        "raydium-quote-check" => run_raydium_quote_check(&client).await,
-        "orca-quote-check" => run_orca_quote_check(&client).await,
-        "meteora-quote-check" => run_meteora_quote_check(&client).await,
-        "dependency-wss-check" => run_dependency_wss_check(&client).await,
-        _ => {
-            println!(
-                "Usage: {APP_NAME} <discover|verify|helius-check|raydium-quote-check|orca-quote-check|meteora-quote-check|dependency-wss-check>"
-            );
-            Ok(())
-        }
+    match command {
+        AppCommand::Discover => run_discover(&client).await,
+        AppCommand::Verify => run_verify(&client).await,
+        AppCommand::HeliusCheck => run_helius_check(&client).await,
+        AppCommand::RaydiumQuoteCheck => run_raydium_quote_check(&client).await,
+        AppCommand::OrcaQuoteCheck => run_orca_quote_check(&client).await,
+        AppCommand::MeteoraQuoteCheck => run_meteora_quote_check(&client).await,
+        AppCommand::DependencyWssCheck => run_dependency_wss_check(&client).await,
     }
 }
 
@@ -1033,6 +1058,16 @@ mod tests {
             mint_b: "B".into(),
             tvl_usd: 1_000.0,
         }
+    }
+
+    #[test]
+    fn command_parser_accepts_dependency_wss_and_rejects_unknown_command() {
+        assert_eq!(
+            parse_command(Some("dependency-wss-check")).unwrap(),
+            Some(AppCommand::DependencyWssCheck)
+        );
+        assert_eq!(parse_command(None).unwrap(), None);
+        assert!(parse_command(Some("definitely-unknown")).is_err());
     }
 
     #[test]
