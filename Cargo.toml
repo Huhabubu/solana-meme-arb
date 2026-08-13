@@ -9,9 +9,12 @@ anyhow = "1"
 base64 = "0.22"
 bs58 = "0.5"
 futures-util = "0.3"
+orca_whirlpools_client = "8.0.0"
+orca_whirlpools_core = "2.1.1"
 reqwest = { version = "0.12", features = ["json"] }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+solana-pubkey = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
