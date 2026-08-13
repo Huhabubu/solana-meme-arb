@@ -2,445 +2,318 @@
 
 一个使用 Rust 开发的 Solana 成熟 Meme 跨 DEX 套利研究项目。
 
-当前阶段以 **真实监控、真实验证** 为主。只有当监控数据证明机会具备可执行价值后，才会进入钱包、交易构造和实盘执行。
+当前原则：**真实监控、真实验证、先研究后交易**。只有当监控数据证明机会具备可执行价值后，才进入钱包、交易构造和实盘执行。
 
 ## 当前进度
 
-**当前阶段：V3 — 跨池套利机会计算、记录与统计**
+**当前阶段：V3 — 跨池套利机会计算、成本建模、记录与统计**
 
 | 阶段 | 内容 | 状态 |
 |---|---|---|
 | Stage 0 | 仓库、Rust 工程骨架、GitHub Actions CI | ✅ 已完成并验证 |
 | V0 | BONK / WIF 跨 DEX 池发现与链上账户核验 | ✅ 已完成并验证 |
-| V1 | Helius RPC/WSS 实时池账户订阅 | ✅ 已完成并验证 |
-| V2 | DEX Pool State 解析、本地 Swap Quote、依赖账户实时触发 | ✅ 已完成并验证 |
-| V3 | 跨池套利机会计算、记录与统计 | 🔄 当前进行 |
+| V1 | Helius RPC/WSS 实时账户订阅 | ✅ 已完成并验证 |
+| V2 | DEX Pool State、本地 Swap Quote、依赖账户实时触发 | ✅ 已完成并验证 |
+| V3 | 跨池闭环、多金额利润曲线、成本、实时机会统计 | 🔄 当前进行 |
 | V4 | 原子交易构造与 `simulateTransaction` | ⏳ 未开始 |
 | V5 | 小额实盘执行与 Jito 集成 | ⏳ 未开始 |
 
-### V2 最终子模块状态
+## V3 当前子模块
 
-| 子模块 | 状态 | 最终证据 |
+| 子模块 | 状态 | 证据 |
 |---|---|---|
-| Raydium Standard AMM v4 | ✅ 已完成并真实验证 | Pool State + 两个 vault + 本地 exact-input Quote |
-| Orca Whirlpool | ✅ 已完成并真实验证 | Whirlpool + TickArray + Mint + 可选 Oracle + 官方 core Quote |
-| Meteora DLMM | ✅ 已完成并真实验证 | LbPair + BinArray + Mint + 可选 bitmap extension + 官方 Rust Quote |
-| 实时报价依赖账户状态管理 | ✅ 已完成并真实验证 | 31 个依赖账户订阅；真实 TickArray 更新映射到正确池并触发 Quote 重算 |
+| 统一 `SwapQuote` / 两腿闭环 | ✅ | Mint/金额连续性、同池拒绝、signed profit、slot 范围均有测试 |
+| Raydium Standard 双方向 Quote | ✅ | `WSOL ↔ Token` 真实主网验证 |
+| Orca Whirlpool 双方向 Quote | ✅ | `WSOL ↔ Token` + 官方 core Quote 真实验证 |
+| Meteora DLMM 双方向 Quote | ✅ | `WSOL ↔ Token` + 官方 Rust Quote 真实验证 |
+| 三 DEX 全部有向两池组合 | ✅ | 每 Token 3 池 → 6 路；BONK/WIF 共 12 路 |
+| 多输入金额利润曲线 | ✅ | 0.01 / 0.05 / 0.1 SOL，同一腿快照批量本地 Quote |
+| 高精度收益率 | ✅ | `gross_return_ppm` 保留小于 1 bps 的符号和量级 |
+| 不足流动性点 | ✅ | 明确标记 `insufficient_liquidity`，不伪装成亏损或程序成功报价 |
+| 执行成本 / 净利润模型 | 🔄 下一模块 | Priority Fee / Jito Tip / 固定执行成本尚未加入 |
+| 实时 Opportunity Engine | ⏳ | 尚未把 WSS 更新直接接到全路径利润重算 |
+| 机会持久化与统计 | ⏳ | 尚未进入 24–72h 连续采样 |
 
-> 当前“可报价池集合”是每个跟踪 Token 各选 1 个 Raydium Standard、1 个 Orca Whirlpool、1 个 Meteora DLMM，共 **6 个池**。V0 的 18 个候选池仍用于发现/核验，但 Raydium CLMM 和 Meteora DAMM v2 尚未进入本地 Quote 引擎，因此 V2 没有声称“18 个池全部可报价”。
+> 当前 V3 仍然是**研究阶段**。没有钱包、没有私钥、没有下单逻辑，也没有证据证明策略已经可盈利。
 
-### V3 当前子模块状态
+## 当前可报价研究池
 
-| 子模块 | 状态 | 当前证据 |
+目前每个 Token 先固定一个已完整支持的 Pool 类型，共 6 个池：
+
+| Token | DEX | Pool |
 |---|---|---|
-| 统一 `SwapQuote` 与两腿闭环计算 | ✅ 已完成并验证 | Mint / 金额连续性、同池拒绝、signed profit、slot 范围均有单元测试 |
-| Raydium Standard 双方向 Quote | ✅ 已接入 V3 实际路径 | `WSOL → Token` 与 `Token → WSOL` 均由真实 Pool State + vault 计算 |
-| Orca Whirlpool 双方向 Quote | ✅ 已接入 V3 实际路径 | 两个方向均使用真实 Whirlpool/TickArray/Mint 状态和官方 core Quote |
-| Meteora DLMM 双方向 Quote | ✅ 已接入 V3 实际路径 | 任意输入 Mint / amount，按方向重新推导 BinArray 并调用官方 Quote |
-| 三 DEX 全部有向两池组合 | ✅ 已真实验证 | 每 Token 3 个池 → 6 条路径；BONK/WIF 共 12 条主网闭环 |
-| 多输入金额利润曲线 | ⏳ 未完成 | 当前闭环验收输入固定为 0.01 WSOL |
-| 执行成本 / 净利润模型 | ⏳ 未完成 | Priority Fee / Jito Tip 等尚未扣除 |
-| 实时 Opportunity Engine / 记录统计 | ⏳ 未完成 | 尚未进入连续监控 |
+| BONK | Raydium Standard | `HVNwzt7Pxfu76KHCMQPTLuTCLTm6WnQ1esLv4eizseSv` |
+| BONK | Orca Whirlpool | `5zpyutJu9ee6jFymDGoK7F6S5Kczqtc9FomP3ueKuyA9` |
+| BONK | Meteora DLMM | `6oFWm7KPLfxnwMb3z5xwBoXNSPP3JJyirAPqPSiVcnsp` |
+| WIF | Raydium Standard | `EP2ib6dYdEeqD8MfE2ezHCxX3kP3K2eLKkirfPm5eyMx` |
+| WIF | Orca Whirlpool | `D6NdKrKNQPmRZCCnG1GqXtF7MMoHB7qR6GU5TkG59Qz1` |
+| WIF | Meteora DLMM | `8Ve9KtGNtLRxCQNAVfkHEP5GRZHjdj6BjB1RQFZewG6V` |
 
-## 当前阶段成功标准
+V0 仍保留更大的候选池集合用于发现/核验。Raydium CLMM 与 Meteora DAMM v2 尚未进入本地 Quote 引擎，因此不会把它们假装成已支持路径。
 
-V3 只有满足以下条件才会标记完成：
+## V3 成功标准
 
-1. 对同一 Token 的不同可报价池，以同一输入资产和输入金额计算可比较的真实本地 Quote。
-2. 建立两腿闭环，例如 `WSOL → BONK → WSOL`，不能只比较表面价格。
-3. 明确区分毛利润和净利润；两腿 DEX fee 已体现在各腿 Quote 输出中，净利润还需进一步扣除 Priority Fee / Jito Tip / 其他执行成本。
-4. 对多个输入金额计算闭环结果，避免把某一个固定金额的价差误当成可执行机会。
-5. 实时依赖账户变化后，只重算受影响池，并更新对应 Token 的跨池机会。
-6. 机会记录至少包含时间、slot、Token、买入池、卖出池、输入金额、两腿输出、毛利润/收益率和可解释的成本字段。
-7. 每个新增计算函数有单元测试；真实联网层用 Helius + 主网池做端到端验证。
-8. 连续监控数据真实证明系统能够稳定发现/记录机会后，才讨论 V4 交易构造。
+V3 只有满足以下条件才标记完成：
+
+1. 同 Token 的不同可报价池可以用统一接口计算真实本地 Quote。
+2. 建立 `WSOL → Token → WSOL` 两腿闭环，而不是只比较表面价格。
+3. 多个输入规模在可解释的一致快照上评估 Price Impact。
+4. 明确区分 DEX fee 后的闭环毛利润与 Priority Fee / Jito Tip 等执行成本后的净利润。
+5. 流动性不足必须成为显式状态，不能当成普通亏损，也不能让整个监控器崩溃。
+6. WSS 依赖账户变化后，只重算受影响池与相关 Token 路径。
+7. 机会记录至少包含时间/slot、Token、路径、金额、两腿输出、毛/净利润、成本和流动性状态。
+8. 每个新增计算函数有单元测试；关键链路继续用真实主网做端到端验证。
+9. 连续监控数据证明系统能够稳定发现、记录并解释机会后，才讨论 V4。
 
 ## 已验证结果
 
 ### Stage 0
 
-GitHub Actions 已在真实 runner 上完成：
-
-- `cargo fmt --all -- --check` ✅
-- `cargo check --all-targets` ✅
-- `cargo clippy --all-targets -- -D warnings` ✅
-- `cargo test --all-targets` ✅
-- CI 总结果：`success`
-- 首次验证时实际 Rust 版本：`rustc 1.97.1`
+首次完整 CI 已在真实 GitHub-hosted Ubuntu runner 上通过：`fmt / check / clippy / test`。首次真实 runner Rust 为 `rustc 1.97.1`。
 
 ### V0 — Pool Discovery
 
-最终验收 CI：Run `31673566193`，结果 `success`。
+最终验收 Run `31673566193`：
 
-- `cargo fmt` ✅
-- `cargo check` ✅
-- `cargo clippy -D warnings` ✅
-- 单元测试：**23 passed / 0 failed** ✅
-- 真实 DEX Pool Discovery ✅
-- Solana Mainnet `getMultipleAccounts` 链上核验 ✅
-- BONK：117 个精确交易对池被发现，筛选 9 个监控候选池。
-- WIF：98 个精确交易对池被发现，筛选 9 个监控候选池。
-- 18 个候选 Pool Account：**18/18 链上存在，18/18 owner 与预期 DEX Program 一致**。
+- **23 passed / 0 failed**。
+- BONK/WSOL 发现 117 个精确交易对池；WIF/WSOL 发现 98 个。
+- 当前研究筛选规则：`MIN_MONITOR_TVL_USD = 1,000`、`MAX_POOLS_PER_DEX = 3`。
+- BONK/WIF 共 18 个候选 Pool Account：**18/18 链上存在，18/18 owner 与预期 DEX Program 一致**。
 
-### V1 — Helius 实时订阅
+### V1 — Helius HTTP/WSS
 
-最终验收 CI：Run `31675468153`，结果 `success`。
+最终验收 Run `31675468153`：
 
-- `cargo fmt` ✅
-- `cargo check` ✅
-- `cargo clippy --all-targets -- -D warnings` ✅
-- 单元测试：**34 passed / 0 failed** ✅
-- V0 真实 DEX Pool Discovery 回归测试 ✅
-- V0 Solana Mainnet Pool Account owner 回归核验 ✅
-- GitHub Actions Secret `HELIUS_API_KEY` 已确认可被工作流安全读取，日志中仅显示 `***`。
-- Helius HTTP `getVersion` 真实通过：当次返回 `Solana core 4.2.0-rc.1`。
-- Helius WSS 真实建立连接并对 **18 个候选池**发送 `accountSubscribe`。
-- 18 个候选池的订阅确认全部完成后，真实收到 Pool Account 更新。
-- 首次验收更新：`slot=438970104`，DEX=`Meteora DLMM`，Pool=`6oFWm7KPLfxnwMb3z5xwBoXNSPP3JJyirAPqPSiVcnsp`，`subscription=6580461`。
-- 该通知已通过 `subscription id ↔ PoolInfo` 映射回正确 DEX 和 Pool Account。
+- **34 passed / 0 failed**。
+- Helius HTTP `getVersion` 真实通过。
+- 18 个候选 Pool Account 的 WSS `accountSubscribe` 全部确认。
+- 收到真实 Pool Account 更新，并通过 `subscription id ↔ PoolInfo` 映射回正确 DEX/Pool。
+- `HELIUS_API_KEY` 仅由 GitHub Actions Secret 注入，日志中显示为 `***`。
 
-因此 V1 的 HTTP、WSS、真实 Pool 订阅和通知映射链路均已有实际运行证据。
+### V2 — 三个本地 Quote 引擎
 
-### V2 — Raydium Standard AMM v4
+最终有效验收 Run `31687579494`：
 
-Raydium 子模块已通过真实链上验收。
+- **78 passed / 0 failed**。
+- Raydium Standard AMM v4：解析 752 字节 Pool State、两个 vault、`need_take_pnl`、整数 fee/constant-product Quote。
+- Orca Whirlpool：使用官方 `orca_whirlpools_client 8.0.0` 与 `orca_whirlpools_core 2.1.1`，读取 Whirlpool/TickArray/Mint/可选 Oracle。
+- Meteora DLMM：使用官方 Rust `commons` SDK（固定 revision `fb02e51ae677bbd18e76543f702dae40632426db`），读取 LbPair/BinArray/Mint/bitmap 并调用官方 `quote_exact_in`。
+- 构建 6 个可报价池的依赖集合，去重后订阅 **31 个报价依赖账户**，其中 22 个是非 Pool 触发账户。
+- 真实 Orca TickArray 更新成功映射到正确池并触发 Quote 重算。
 
-实现与验证内容：
+### V3.1 — 统一闭环
 
-- 依据 Raydium 当前 AMM v4 `AmmInfo` packed 布局解析 **752 字节 Pool State**。
-- 真实读取 `coin_vault`、`pc_vault` 两个经典 SPL Token Account，并校验 owner / mint。
-- 有效储备量先扣除 `need_take_pnl`。
-- Swap fee 使用与程序一致的向上取整规则。
-- exact-input 输出按恒定乘积整数公式向下取整。
-- Pool State 与 vault 读取使用 `minContextSlot` 防止明显倒退到更旧状态。
-- BONK / WIF 两个已选 Raydium Standard 池均真实报价成功。
+最终验收 Run `31691663172`：
 
-V2 最终验收 Run `31687579494` 的真实快照：
-
-| Pair | Pool | 输入 | 本地输出 | Fee |
-|---|---|---:|---:|---:|
-| BONK/WSOL | `HVNwzt7Pxfu76KHCMQPTLuTCLTm6WnQ1esLv4eizseSv` | 0.01 WSOL | 332,459.25755 BONK | 25 / 10,000 |
-| WIF/WSOL | `EP2ib6dYdEeqD8MfE2ezHCxX3kP3K2eLKkirfPm5eyMx` | 0.01 WSOL | 5.472466 WIF | 25 / 10,000 |
-
-### V2 — Orca Whirlpool
-
-Orca 子模块已通过真实链上验收。
-
-实现与验证内容：
-
-- 使用 Orca 官方 `orca_whirlpools_client 8.0.0` 解码 Whirlpool / TickArray / Oracle。
-- 使用 Orca 官方 `orca_whirlpools_core 2.1.1` 的 Quote 引擎计算 exact-input Quote，没有自行重写 CLMM 数学。
-- 根据当前 tick 与 tick spacing 推导报价依赖 TickArray。
-- 使用同一 RPC `context.slot` 构造 Whirlpool + TickArray + Mint + 可选 Oracle 的报价快照。
-- 若读取过程中依赖集合发生变化，则拒绝拼接状态并要求重试。
-- 未初始化 TickArray 按 Orca 官方 SDK 的空数组语义处理。
-- BONK / WIF 当前选中的 Whirlpool 均为普通费率池，`adaptive_fee=false`。
-
-V2 最终验收 Run `31687579494` 的真实快照：
-
-| Pair | Pool | 输入 | 本地输出 | tick spacing | fee rate |
-|---|---|---:|---:|---:|---:|
-| BONK/WSOL | `5zpyutJu9ee6jFymDGoK7F6S5Kczqtc9FomP3ueKuyA9` | 0.01 WSOL | 332,306.41516 BONK | 8 | 500 |
-| WIF/WSOL | `D6NdKrKNQPmRZCCnG1GqXtF7MMoHB7qR6GU5TkG59Qz1` | 0.01 WSOL | 5.472831 WIF | 4 | 400 |
-
-> Adaptive Fee 的 Oracle 分支已有布局/逻辑单元测试，但当前 BONK/WIF 真实可报价池没有触发该分支，因此仍不声称“Adaptive Fee 已完成真实链上实池验证”。
-
-### V2 — Meteora DLMM
-
-Meteora DLMM 子模块已在最终验收 Run `31687579494` 中真实通过。
-
-实现与验证内容：
-
-- 使用 Meteora 官方 Rust `commons` SDK，固定到 git revision `fb02e51ae677bbd18e76543f702dae40632426db`。
-- 校验 Anchor discriminator 后解析 `LbPair`、`BinArrayBitmapExtension`、`BinArray`。
-- 根据输入 Mint 判断 `X→Y / Y→X` 方向。
-- 通过官方 helper 推导当前方向真正需要的 BinArray。
-- Clock sysvar 不加入 WSS 依赖订阅；Clock 每个 slot 都变化，若订阅会让所有 DLMM 池无意义地每 slot 触发。真正的 DLMM 依赖变化后再刷新 Clock。
-- 最终 Quote 调用 Meteora 官方 `quote_exact_in`，没有自行重写 DLMM 数学。
-
-最终真实快照：
-
-| Pair | Pool | 输入 | 本地输出 | active_id | BinArray | fee / protocol fee |
-|---|---|---:|---:|---:|---:|---:|
-| BONK/WSOL | `6oFWm7KPLfxnwMb3z5xwBoXNSPP3JJyirAPqPSiVcnsp` | 0.01 WSOL | 332,438.23480 BONK | -10142 | 3 | 5173 / 517 |
-| WIF/WSOL | `8Ve9KtGNtLRxCQNAVfkHEP5GRZHjdj6BjB1RQFZewG6V` | 0.01 WSOL | 5.474133 WIF | 119 | 3 | 40253 / 4024 |
-
-### V2 — 报价依赖账户实时触发
-
-V2 最后一关已经真实执行，不再只订阅 Pool Account。
-
-最终验收 Run `31687579494`：
-
-- 构建 **6 个可报价池**。
-- 去重后订阅 **31 个报价依赖账户**。
-- 其中 **22 个非 Pool 依赖账户**被作为关键触发目标，包括 vault、TickArray、Oracle、BinArray、bitmap extension 等。
-- 真实收到 Orca TickArray 更新：
-  - address=`2qJr7TWGCw3qdHXSfez1YftQcyqyfDVdVGbvvJNQZkPz`
-  - slot=`438994790`
-  - subscription=`6868142`
-  - affected pool=`5zpyutJu9ee6jFymDGoK7F6S5Kczqtc9FomP3ueKuyA9`
-- `subscription/address → dependency → affected pool` 映射正确识别为 Orca `TickArray`。
-- 收到更新后真实重新计算 BONK/WSOL Orca Quote：0.01 WSOL → **332,306.43634 BONK**。
-- 重算后刷新动态依赖集合，并验证该池没有缺失依赖账户。
-
-最终程序日志明确输出：`V2 dependency-triggered quote recompute verified; refreshed dependency set is complete`。
-
-### V2 最终完整回归
-
-CI Run `31687579494`，已读取完整 Job 日志核对，不仅依赖 GitHub 的绿色状态：
-
-- `cargo fmt` ✅
-- `cargo check` ✅
-- `cargo clippy --all-targets -- -D warnings` ✅
-- 单元测试：**78 passed / 0 failed** ✅
-- V0 Pool Discovery ✅
-- V0 链上 owner 校验 ✅
-- V1 Helius HTTP/WSS ✅
-- Raydium Standard 本地 Quote ✅
-- Orca Whirlpool 本地 Quote ✅
-- Meteora DLMM 本地 Quote ✅
-- 非 Pool 报价依赖账户真实 WSS 更新 ✅
-- 更新映射到正确池并触发 Quote 重算 ✅
-- 动态依赖刷新后完整性检查 ✅
-
-因此 V2 已满足原定成功标准，正式进入 V3。
-
-### CI — Cargo 缓存与依赖锁定
-
-V3 开始前完成了一次独立基础设施优化，并保持业务代码不变。
-
-- `Cargo.lock` 已生成并提交，Rust 依赖版本现在有可重复的锁定文件。
-- CI 使用 `actions/cache@v5` 缓存 `~/.cargo/registry`、`~/.cargo/git` 和 `target`。
-- 缓存主 key 同时绑定 runner OS、`rustc` 版本、`Cargo.toml` 与 `Cargo.lock`；Rust 版本或依赖配置变化时会生成新 key。
-- 同一分支快速连续提交时，CI 通过 `concurrency` 取消旧的进行中任务，只保留最新提交，减少 Actions 时间浪费。
-- 首次填充 Run `31688820193`：缓存 miss，完整回归成功并保存约 **958 MB** 缓存；冷启动 `cargo check` 约 **2 分 35 秒**，`cargo test` 约 **2 分 51 秒**。
-- 验证 Run `31689455003` Attempt 2：命中完全相同的主 key；缓存恢复后 `cargo check` **4.20 秒**、`cargo clippy` **3.50 秒**、`cargo test` **4.55 秒**，单元测试仍为 **78 passed / 0 failed**。
-- 该缓存约 **958 MB**，当次恢复和解压约 27 秒；虽然仍有固定恢复成本，但相比重复编译数分钟明显更低。
-- 缓存命中后再次完成真实 Pool Discovery、主网 owner、Helius HTTP/WSS、Raydium、Orca、Meteora 和依赖账户 WSS 全链路回归。
-- 临时生成 `Cargo.lock` 的 one-shot workflow 已删除，仓库只保留正式 CI。
-
-### V3.1 — 统一 Quote 与 Raydium ↔ Orca 两腿闭环
-
-第一组 V3 业务逻辑已在正式 CI Run `31691663172` 中完成真实验证。
-
-实现内容：
-
-- 新增统一 `SwapQuote`：记录 DEX、Pool、输入/输出 Mint、输入/输出 raw amount 与快照 slot。
-- 新增 `evaluate_round_trip`：严格要求两腿 Mint 连续、第二腿输入金额等于第一腿真实输出、最终回到原始资产，并拒绝同一 Pool 自循环。
+- **82 passed / 0 failed**。
+- 新增 `SwapQuote`、`RoundTripOpportunity`、`evaluate_round_trip`。
+- 严格校验两腿 Mint 连续、金额连续、最终回到原始资产、不同 Pool。
 - 利润使用 signed `i128`，亏损不会发生无符号下溢。
-- `gross_profit_raw = final_amount - input_amount`；Raydium/Orca 的 DEX swap fee 已经体现在各腿 Quote 输出中，因此这里尚未再扣 Priority Fee、Jito Tip 等链上执行成本。
-- 记录 `oldest_slot / newest_slot`，为后续机会新鲜度约束保留依据。
-- Raydium Standard 与 Orca Whirlpool 的外层报价均已从固定 `0.01 WSOL` 拆成可接收任意输入 Mint / amount 的双方向 Quote 接口。
-- 正式命令 `round-trip-check` 被主程序路由和 CI 真实调用，不是仅测试代码。
+- Raydium ↔ Orca 的 BONK/WIF 双方向共 4 条真实主网闭环全部执行成功。
+- 当次 4 条均为负收益。
 
-单元测试由 78 增加到 **82 passed / 0 failed**，新增测试覆盖：
+### V3.2 — 三 DEX 全路径
 
-1. `SwapQuote` 空 Pool / 空 Mint / 同 Mint / 零金额拒绝。
-2. 盈利闭环与 slot 范围计算。
-3. 亏损使用 signed profit，不发生 underflow。
-4. 同池、Mint 断链、两腿金额不连续全部拒绝。
+最终验收 Run `31692193766`：
 
-Run `31691663172` 的 0.01 WSOL 真实主网闭环快照：
+- **83 passed / 0 failed**。
+- 新增 `directed_route_indices`；3 个池严格生成 `3 × 2 = 6` 条有向路径。
+- Meteora DLMM 接入统一双方向 Quote。
+- BONK/WIF × Raydium/Orca/Meteora 共 **12 条真实闭环**全部运行成功。
+- 当次 12/12 均为负收益；最接近平衡的两个 BONK 点仍然是确定的负数，未计执行成本。
 
-| Token | 路径 | 初始输入 | 第一腿 Token 输出 | 最终 WSOL | gross profit | gross return |
-|---|---|---:|---:|---:|---:|---:|
-| BONK | Raydium → Orca | 0.01 WSOL | 326,904.27740 BONK | 0.009971942 WSOL | -0.000028058 SOL | -28 bps（整数截断） |
-| BONK | Orca → Raydium | 0.01 WSOL | 327,492.55156 BONK | 0.009965672 WSOL | -0.000034328 SOL | -34 bps（整数截断） |
-| WIF | Raydium → Orca | 0.01 WSOL | 5.449899 WIF | 0.009983824 WSOL | -0.000016176 SOL | -16 bps（整数截断） |
-| WIF | Orca → Raydium | 0.01 WSOL | 5.454291 WIF | 0.009958072 WSOL | -0.000041928 SOL | -41 bps（整数截断） |
+### V3.3 — 一致快照多金额利润曲线
 
-四条路径的两腿在当次检查中分别使用同一 slot：BONK=`439001952`，WIF=`439001953`。
+最终验收 Run `31694234098`，已读取完整 Job 日志，不只依据绿色状态：
 
-> **这次真实快照没有出现可盈利机会。** 四条闭环都为负收益，而且这里还没有扣 Priority Fee / Jito Tip 等执行成本。该结果只证明闭环计算链已经工作，不证明策略可盈利，也不说明未来不会出现正机会。
+- `cargo fmt` ✅
+- `cargo check` ✅
+- `cargo clippy --all-targets -- -D warnings` ✅
+- **89 passed / 0 failed** ✅
+- V0 Pool Discovery / 主网 owner 回归 ✅
+- V1 Helius HTTP/WSS 回归 ✅
+- Raydium / Orca / Meteora 单池真实 Quote 回归 ✅
+- V3 all-DEX multi-size round trip ✅
+- V2 dependency WSS routing 回归 ✅
 
-同一 CI 最后一关继续真实收到 Orca TickArray 更新并触发 V2 Quote 重算，说明 V3 改动没有破坏实时状态链路。
+#### 多金额设计
 
-### V3.2 — 三 DEX 全路径闭环
+当前 probe：
 
-正式 CI Run `31692193766` 已完成 V3 第二组闭环扩展，并读取完整 Job 日志核对实际执行内容。
+- 0.01 SOL = `10,000,000` lamports
+- 0.05 SOL = `50,000,000` lamports
+- 0.10 SOL = `100,000,000` lamports
 
-- Meteora DLMM 已改为任意输入 Mint / amount 的双方向统一 Quote。
-- 新增 `directed_route_indices`，对 N 个不同池生成 `N × (N - 1)` 条有向两池路径；3 个池严格得到 6 条路径。
-- 新增路径枚举单元测试，测试总数增加到 **83 passed / 0 failed**。
-- BONK 与 WIF 均使用 Raydium Standard、Orca Whirlpool、Meteora DLMM 三个真实池。
-- 每个 Token 真实执行 6 条两腿闭环，共 **12 条主网路径**。
+每一腿先抓取一份一致的链上状态快照，再在本地用**同一快照**计算多个金额，避免把几秒内的市场变化误当成 Price Impact。
 
-0.01 WSOL 当次真实快照：
+`RoundTripOpportunity` 同时保存：
 
-| Token | 路径 | Token 输出 | 最终 WSOL | gross profit | gross return bps |
-|---|---|---:|---:|---:|---:|
-| BONK | Raydium → Orca | 326,904.27740 | 0.009999855 | -0.000000145 SOL | 0* |
-| BONK | Raydium → Meteora DLMM | 326,904.27740 | 0.009981909 | -0.000018091 SOL | -18 |
-| BONK | Orca → Raydium | 326,578.43265 | 0.009937858 | -0.000062142 SOL | -62 |
-| BONK | Orca → Meteora DLMM | 326,578.43265 | 0.009971960 | -0.000028040 SOL | -28 |
-| BONK | Meteora DLMM → Raydium | 326,905.09647 | 0.009947797 | -0.000052203 SOL | -52 |
-| BONK | Meteora DLMM → Orca | 326,905.09647 | 0.009999880 | -0.000000120 SOL | 0* |
-| WIF | Raydium → Orca | 5.445709 | 0.009985515 | -0.000014485 SOL | -14 |
-| WIF | Raydium → Meteora DLMM | 5.445709 | 0.009868024 | -0.000131976 SOL | -131 |
-| WIF | Orca → Raydium | 5.449169 | 0.009956375 | -0.000043625 SOL | -43 |
-| WIF | Orca → Meteora DLMM | 5.449169 | 0.009874293 | -0.000125707 SOL | -125 |
-| WIF | Meteora DLMM → Raydium | 5.447106 | 0.009952605 | -0.000047395 SOL | -47 |
-| WIF | Meteora DLMM → Orca | 5.447106 | 0.009988077 | -0.000011923 SOL | -11 |
+- `gross_profit_raw`：权威 raw 盈亏值；
+- `gross_return_bps`：基点级展示；
+- `gross_return_ppm`：百万分比展示，可保留小于 1 bps 的符号与量级；
+- `oldest_slot / newest_slot`：两腿快照范围。
 
-`*` 当前 `gross_return_bps` 使用整数除法，绝对收益不足 1 bps 时会向 0 截断。因此上表两个 `0 bps` 路径仍然是确定的负收益；**判断盈亏以 `gross_profit_raw` 为准**，不能只看整数 bps。
+#### 36 个 probe 点最终结果
 
-> **12 条真实路径当次全部为负收益。** 最接近盈亏平衡的是 BONK `Meteora DLMM → Orca`（-120 lamports）和 `Raydium → Orca`（-145 lamports），但它们尚未扣 Priority Fee / Jito Tip 等执行成本，因此不能视为可执行机会。
+12 条路径 × 3 个金额 = **36 个点全部被明确结算**：
 
-同一 Run 的最后依赖 WSS 回归仍然通过：真实收到 Orca TickArray `6JepAn8RrWxRLvZb4sCp2vjuGPxQtVrbSpf1LGq6evcd` 更新，正确映射到 BONK Orca Pool 并重算 Quote。V3.2 没有破坏 V2 实时状态链。
+- **34 个点完整报价并计算闭环利润**；
+- **2 个点明确标记 `insufficient_liquidity`**；
+- **0 个正收益点**。
 
-### V0 监控候选筛选规则
+两个不可完整成交点均为 WIF、0.1 SOL，且 Meteora DLMM 位于第二腿：
 
-当前研究期默认：
+- Raydium → Meteora DLMM：0.1 SOL 第二腿流动性不足；
+- Orca → Meteora DLMM：0.1 SOL 第二腿流动性不足。
 
-- `MIN_MONITOR_TVL_USD = 1,000`
-- `MAX_POOLS_PER_DEX = 3`
+对应路径的 0.01 / 0.05 SOL 仍然可以完整 Quote，因此程序不会因为单个大金额不可成交而丢弃整条路径。
 
-目的只是避免把免费 RPC/WSS 配额浪费在大量灰尘池上。**这两个值不是最终套利执行阈值，也不代表 TVL 低于 1,000 美元的池永远没有机会。**
+#### 当次利润曲线示例
 
-### V0 真实候选池快照
+BONK `Meteora DLMM → Orca`：
 
-以下 TVL 是 2026-08-13 验收时 API 返回的动态快照，只用于记录当时的筛选依据，后续会变化。
+| 输入 | gross profit | gross return ppm |
+|---:|---:|---:|
+| 0.01 SOL | -2,168 lamports | -216 ppm |
+| 0.05 SOL | -11,982 lamports | -239 ppm |
+| 0.10 SOL | -65,671 lamports | -656 ppm |
 
-#### BONK / WSOL
+WIF `Raydium → Orca`：
 
-| DEX | Pool Account | 类型 | TVL 快照 |
-|---|---|---|---:|
-| Orca | `5zpyutJu9ee6jFymDGoK7F6S5Kczqtc9FomP3ueKuyA9` | Whirlpool | $120,951 |
-| Orca | `BqnpCdDLPV2pFdAaLnVidmn3G93RP2p5oRdGEY2sJGez` | Whirlpool | $93,341 |
-| Orca | `3ne4mWqdYuNiYrYZC9TrA3FcfuFdErghH97vNPbjicr1` | Whirlpool | $57,238 |
-| Raydium | `GtKKKs3yaPdHbQd2aZS4SfWhy8zQ988BJGnKNndLxYsN` | Concentrated | $17,818 |
-| Raydium | `HVNwzt7Pxfu76KHCMQPTLuTCLTm6WnQ1esLv4eizseSv` | Standard | $13,018 |
-| Meteora DLMM | `6oFWm7KPLfxnwMb3z5xwBoXNSPP3JJyirAPqPSiVcnsp` | DLMM | $6,691 |
-| Meteora DLMM | `7eexH14UjhNxJe6zTT3f1Vb1E8iACsBMVaWheDEmxdT2` | DLMM | $5,442 |
-| Meteora DLMM | `3L4JX6RrssAHCxuzxosPBKuh6cHt6rXXbQU5hkeEpxku` | DLMM | $5,206 |
-| Raydium | `ALYy1HRt3fsn1S9McLWsXCoq6Ke7bwMiwZ6QYr6HvsYS` | Concentrated | $3,399 |
+| 输入 | gross profit | gross return ppm |
+|---:|---:|---:|
+| 0.01 SOL | -5,381 lamports | -538 ppm |
+| 0.05 SOL | -28,412 lamports | -568 ppm |
+| 0.10 SOL | -60,633 lamports | -606 ppm |
 
-#### WIF / WSOL
+这两个例子都显示输入变大后收益率进一步恶化，符合 Price Impact 增大的预期；但这是单次真实快照，不作为长期统计结论。
 
-| DEX | Pool Account | 类型 | TVL 快照 |
-|---|---|---|---:|
-| Raydium | `EP2ib6dYdEeqD8MfE2ezHCxX3kP3K2eLKkirfPm5eyMx` | Standard | $4,015,822 |
-| Orca | `D6NdKrKNQPmRZCCnG1GqXtF7MMoHB7qR6GU5TkG59Qz1` | Whirlpool | $99,539 |
-| Orca | `6qgyDW4fHvpTAmfNZvPAuETEbVwRKFVAuuHfNzvEmPkY` | Whirlpool | $13,970 |
-| Raydium | `4mMDQ5kG9fFrBSQeedErsUoTBhY5KKnsKWGvenXRTwSy` | Concentrated | $4,797 |
-| Meteora DLMM | `8Ve9KtGNtLRxCQNAVfkHEP5GRZHjdj6BjB1RQFZewG6V` | DLMM | $4,686 |
-| Meteora DLMM | `DdqTmjucPjt2HXdzM24xp7HnGTorjpym1WnAJLSmLyhK` | DLMM | $3,883 |
-| Orca | `A6cVoMU1Z7oRi9R774QarVxHUmHPQkxQfYVFGNQuAx2b` | Whirlpool | $2,911 |
-| Raydium | `BuavWdfsNTfmEQbnPt2PLc51B7pifRNhqNiDUtGLeNNn` | Concentrated | $1,490 |
-| Meteora DLMM | `39deGQ4Ucue7tGXRDRHvRLz8zZQ6tu7QFkKq5UYiDQ9N` | DLMM | $1,254 |
+> **截至 V3.3 仍没有观察到正毛利润点。** 而且当前还没有扣 Priority Fee / Jito Tip 等执行成本，因此更不能声称存在可执行套利机会。
 
-本次筛选中 Meteora DAMM v2 没有 BONK/WSOL 或 WIF/WSOL 池达到当前 `$1,000` TVL 门槛，因此没有强行加入监控列表。
+#### V3.3 最后实时回归
+
+同一 Run 最后一关真实执行：
+
+- WSS 订阅 31 个依赖账户；
+- 收到 Orca TickArray `8rEM7SiZRaSZLHU6ouo4NULBj7ZRcRYTvib2B16TqNFG` 更新；
+- `slot=439007033`；
+- 正确映射到 BONK Orca Pool `5zpyutJu9ee6jFymDGoK7F6S5Kczqtc9FomP3ueKuyA9`；
+- 更新后真实重算 Quote；
+- 最终输出 `V2 dependency-triggered quote recompute verified; refreshed dependency set is complete`。
+
+## CI / 开发基础设施
+
+### Cargo 缓存
+
+- `Cargo.lock` 已提交并锁定依赖解析结果。
+- CI 使用 `actions/cache@v5` 缓存 `~/.cargo/registry`、`~/.cargo/git`、`target`。
+- cache key 绑定 runner OS、Rust 版本、`Cargo.toml`、`Cargo.lock`。
+- 当前缓存约 **958 MB**；恢复/解压通常二十多秒，但相比约 792 个 package 的冷编译仍明显节省 Actions 时间。
+- 同一分支快速连续提交时，`concurrency` 会取消旧的进行中 CI。
+- README 纯文档更新不触发完整 Rust CI。
 
 ## 已遇到并解决的问题
 
-### Raydium API 字段与旧样本不一致
+### Raydium API 字段变化
 
-第一次真实联网测试失败：解析器期待 `mint1 / mint2`，但当前 Raydium v3 Pool 响应实际使用 `mintA / mintB`。
-
-处理方式：保留真实 CI 错误，核对当前结构，修改解析器，并增加回归测试确保旧结构不会被静默接受。
+真实 API 使用 `mintA / mintB`，旧测试样本最初写成 `mint1 / mint2`。修复解析器后增加回归测试，旧结构不会被静默接受。
 
 ### 大量灰尘池
 
-真实 discovery 会返回大量 TVL 极低的池。直接全部进入 WSS 订阅会浪费配额，也降低后续状态管理质量。
+Discovery 会返回很多 TVL 极低的池。当前用 TVL 下限和每 DEX 数量上限控制研究期 WSS/RPC 成本；该阈值不是最终交易阈值。
 
-处理方式：增加可单独测试的 `select_monitoring_candidates`，当前按 TVL 下限和每 DEX 数量上限筛选。
+### API 地址不等于链上已验证
 
-### API 返回地址与链上真实性之间的边界
+V0 后续增加 `getMultipleAccounts`：Pool 必须真实存在且 owner 与预期 Program 一致，才进入候选集合。
 
-最初只能确认“DEX API 返回了这个地址”。V0 后续新增 Solana `getMultipleAccounts` 校验：候选账户必须存在，并且账户 `owner` 必须等于预期 DEX Program，否则测试失败。最终 18 个候选池全部通过。
+### V1 Rustls CryptoProvider panic
 
-### V1 Helius WSS 首次真实连接触发 Rustls CryptoProvider panic
+第一次真实 Helius WSS 在 TLS 初始化时 panic。显式启用 Rustls `ring` CryptoProvider；没有关闭 TLS 校验或忽略 panic。
 
-第一次注入真实 Helius Secret 后，HTTP 已成功，但 WSS 在 TLS 初始化时 panic。根因是当前依赖组合没有提供唯一的 Rustls 加密后端。
+### V2 只订阅 Pool Account 会漏 Quote 变化
 
-处理方式：显式启用 `rustls` 的 `ring` CryptoProvider，不绕过 panic、不关闭 TLS 校验。修复后完整回归成功，并真实收到 Pool Account 更新。
+Swap Quote 依赖 vault、TickArray、BinArray 等账户。V2 建立 `Pool → dependency accounts → reverse index → QuoteState`，并用真实 TickArray 更新验证。
 
-### V2 只订阅 Pool Account 会漏掉报价变化
+### V2 曾出现“CI 绿色但测试其实没跑”的假阳性
 
-进入真实状态解析后确认：Swap 的关键报价状态可能存在于 vault、TickArray、BinArray 等依赖账户中，Pool Account 本身不保证每次都提供足够的实时触发信号。
+旧入口不认识 `dependency-wss-check`，只打印 Usage 后退出码 0。后来：
 
-因此 V2 建立了 `Pool → dependency accounts → reverse index → QuoteState`，最终通过真实 Orca TickArray 更新验证了非 Pool 依赖账户触发 Quote 重算。
+- 主入口统一走 `app::run()`；
+- `AppCommand` 明确路由命令；
+- 未知命令返回错误；
+- 增加命令解析回归测试；
+- 关键 live step 必须人工核对日志是否真的执行目标逻辑。
 
-### V2 出现过一次“CI 绿色但实际测试没跑”的假阳性
+因此 Run `31687579494` 才是 V2 的最终有效验收。
 
-这是 V2 最重要的测试纪律问题，保留完整记录。
+### `minContextSlot` 节点落后
 
-当时 CI 步骤执行 `cargo run -- dependency-wss-check` 后显示 `success`，但完整日志实际只打印了旧 `src/main.rs` 的 `Usage`。原因是：
+真实 CI 多次遇到 Solana RPC `-32016: Minimum context slot has not been reached`。
 
-1. 新 V2 命令逻辑已经写在 `src/app.rs`，但真正的主二进制仍由旧 `src/main.rs` 驱动。
-2. 旧入口不认识 `dependency-wss-check`。
-3. 未知命令仅打印 Usage 并返回退出码 0，导致 GitHub Actions 把“什么都没测试”标为成功。
+当前处理：
 
-处理方式：
+- **不降低 `minContextSlot`**；
+- 不回退读取旧状态；
+- `fetch_accounts` 只对 `-32016 + 已设置 minContextSlot` 做最多 3 次有限重试；
+- 第 1/2 次等待 200ms / 400ms；
+- 其他 RPC / HTTP / JSON 错误立即失败。
 
-- 将 `src/main.rs` 改为真正调用 `app::run()` 的薄入口。
-- 新增 `AppCommand` + `parse_command`，明确路由所有命令。
-- 未知命令现在返回错误，不允许再以退出码 0 假成功。
-- 新增回归测试 `command_parser_accepts_dependency_wss_and_rejects_unknown_command`。
-- 清理入口切换后 Clippy 暴露的无用生产代码，不使用 `allow` 掩盖。
-- 重新执行完整 CI，并人工读取最终 Job 日志确认 `dependency-wss-check` 真实订阅了 31 个依赖账户、收到了真实 TickArray 更新并重算 Quote。
+重试边界和错误码提取均有独立测试。
 
-**因此 Run `31687579494` 才是 V2 的最终有效验收；之前的绿色状态不作为 V2 完成证据。**
+### V3 小于 1 bps 被整数 bps 截断
 
-### V2 测试本身也必须验证“测对了东西”
+保留 `gross_profit_raw` 作为权威值，并新增 `gross_return_ppm`。例如 -120 lamports / 0.01 SOL 对应 bps 会显示 0，但 ppm 能保留为负数，不再产生视觉误判。
 
-一次测试输入曾让“预期 program id 缺失”测试因为另一种错误而失败。虽然结果仍是 `is_err()`，失败机制已经偏离测试目标。该问题被主动发现并修复。
+### V3 Meteora 大金额 `Pool out of liquidity`
 
-这条规则继续保留：**测试通过/失败本身不够，还要确认断言覆盖的是目标机制。**
+多金额测试真实暴露 WIF 某些 0.1 SOL 路径无法在 Meteora 第二腿完整成交。
 
-### Cargo 缓存验证时出现一次 `minContextSlot` 短暂失败
+当前只把 Meteora 官方错误链中精确的 `Pool out of liquidity` 分类成 `insufficient_liquidity`；其他 Quote 错误继续失败。这样：
 
-缓存命中的首次完整回归 Run `31689455003` Attempt 1 在 Raydium 真实 Quote 阶段收到 Solana RPC `-32016: Minimum context slot has not been reached`。
+- 不把“无法完整成交”伪装成普通亏损；
+- 不因为一个大金额不可成交而让整个 Opportunity Engine 崩溃；
+- 也不会吞掉真正的解析/RPC/数学错误。
 
-该错误表示 RPC 节点当时尚未同步到程序要求的最小 slot。这里没有降低 `minContextSlot`、没有回退读取旧状态，也没有为让 CI 变绿而修改业务代码；直接重跑同一 Job 后 Attempt 2 全链路成功。
+该分类有单元测试。
 
-这说明 `minContextSlot` 的一致性保护按预期拒绝了落后节点，同时也说明真实联网 CI 存在外部节点短暂滞后的非确定性，后续若频率增加再单独设计有限重试策略。
+### V3 开发中的 Clippy / one-shot workflow 问题
 
-### V3 新模型首次提交被 Clippy 判为 dead code
+- 新模型曾因只被测试使用而触发 dead code；没有 `allow(dead_code)`，而是接入真实生产验收路径。
+- 一次性 runner 无权修改正式 workflow；没有扩大 Token 权限，业务代码与正式 CI 分开提交。
+- `clone_on_copy`、冗余 `.into_iter()` 等 lint 均按 Clippy 提示实修，没有屏蔽警告。
+- 所有一次性 workflow 验证后均删除，不保留临时基础设施。
 
-`SwapQuote` / `RoundTripOpportunity` / `evaluate_round_trip` 第一版只有单元测试调用，生产路径尚未使用，因此 Clippy 在 `-D warnings` 下拒绝通过。
+## 当前问题 / 风险
 
-处理方式：没有加入 `allow(dead_code)`。将 Raydium / Orca 报价外层重构为真正支持任意输入方向，并新增生产命令 `round-trip-check`，让统一 Quote 与闭环计算真正进入实时主网验收路径。随后 Clippy 真实通过。
-
-### V3 一次性重构 workflow 无权修改正式 workflow
-
-用于生成较大 `app.rs` 重构的一次性 runner 能修改普通仓库内容，但 GitHub 拒绝其同时 push `.github/workflows/ci.yml`，报错为缺少 workflow 更新权限。
-
-处理方式：没有放宽 Token 权限。runner 只提交业务 `app.rs`，正式 `ci.yml` 由已授权 GitHub 连接器单独更新；所有 one-shot workflow 随后删除。最终正式 CI Run `31691663172` 完整通过。
-
-## 当前问题 / 阻塞 / 风险
-
-- 当前开发主要依赖 GitHub Actions 进行 Rust 编译和真实联网测试，因为本次 ChatGPT 执行环境没有可直接使用的 Rust toolchain。
-- Cargo 缓存已经启用并真实命中；当前缓存归档约 **958 MB**，恢复/解压仍需二十多秒，但相比数分钟冷编译明显更低。缓存 key 已绑定 Rust 版本和依赖锁文件，避免跨不兼容工具链静默复用。
-- `actions/checkout@v4` 当前有 Node.js 20 弃用警告；GitHub 强制使用 Node 24，本项目 CI 仍成功。该警告目前不影响业务验证。
-- `HELIUS_API_KEY` 没有写入仓库或 Git 历史，仅由 GitHub Actions Secret 在运行时注入。
-- DEX REST API 的 TVL 属于动态外部数据，不能视为链上实时成交价格。
-- 当前可报价池只有 6 个：每个 Token 的 Raydium Standard / Orca Whirlpool / Meteora DLMM 各 1 个。Raydium CLMM、Meteora DAMM v2 尚未进入 Quote 引擎。
-- Orca 当前真实可报价池均为经典 SPL Token 且非 Adaptive Fee；Token-2022 transfer fee 和 Adaptive Fee Oracle 尚无当前实池验证证据。
-- **当前三个 DEX 的 12 条固定 0.01 WSOL 闭环已经全部跑通，但当次 12/12 均为负收益，尚无正收益套利证据。** 其中两个 BONK 路径只亏 120–145 lamports，但还未计 Priority Fee / Jito Tip，因此不能视为可执行机会。
-- 当前整数 `gross_return_bps` 会把绝对收益不足 1 bps 的结果截断为 0；`gross_profit_raw` 仍然精确，后续统计前需要补更高精度收益率字段，防止只看 bps 时误判符号。
-- 当前 GitHub App 无权读取个人 Billing Usage API，因此 README 不记录猜测的 Actions 剩余额度；需要从 GitHub `Settings → Billing & Licensing` 查看真实账户用量。
+- 当前开发主要依赖 GitHub Actions，因为本次 ChatGPT 执行环境没有可直接使用的 Rust toolchain。
+- `actions/checkout@v4` 仍有 Node.js 20 弃用警告；runner 当前强制 Node 24，未影响本项目验证。
+- `HELIUS_API_KEY` 没有写入仓库或 Git 历史，仅通过 GitHub Actions Secret 注入。
+- DEX REST API 的 TVL 是动态外部数据，不是链上实时成交价格。
+- 当前完整 Quote Engine 只覆盖 Raydium Standard / Orca Whirlpool / Meteora DLMM；Raydium CLMM、Meteora DAMM v2 尚未支持。
+- Orca 当前实池均为 classic SPL Token 且非 Adaptive Fee；Token-2022 transfer fee 与 Adaptive Fee Oracle 尚无当前实池验证证据。
+- Meteora 0.1 SOL WIF 第二腿已经出现实际流动性上限；后续金额优化必须把“可完整成交”作为硬约束。
+- **当前仍无正毛利润证据，更无扣除执行成本后的净利润证据。**
+- 当前 GitHub App 无权读取个人 Billing Usage API；Actions 剩余额度需要从 GitHub `Settings → Billing & Licensing` 查看。
 
 ## 下一步
 
-V3 当前计划：
+V3 下一小模块：**执行成本 / 净利润模型**。
 
-1. 为 12 条路径测试多个输入金额，得到真实毛利润曲线，并比较不同资金规模下的 Price Impact。
-2. 在进入连续统计前补高精度收益率展示，同时保持 raw amount / raw profit 作为权威计算值。
-3. 增加独立执行成本模型：Priority Fee、Jito Tip、其他交易固定成本；避免重复扣已经包含在 Quote 中的 DEX fee。
-4. 把实时依赖账户更新接到 Opportunity Engine，只重算受影响池和相关 Token 的路径。
-5. 记录真实机会的 slot、路径、金额、收益和持续情况；这一阶段仍然不接钱包、不下单。
-6. 需要连续 24–72 小时采样时停止使用 GitHub Actions 当长期运行环境，转到常驻 Linux VPS。
+1. 定义独立 `ExecutionCost`，至少包含 Priority Fee、Jito Tip、其他固定 lamports 成本。
+2. DEX swap fee 已经包含在每腿 Quote 输出中，成本模型不得重复扣 DEX fee。
+3. 新增 `net_profit_raw = gross_profit_raw - execution_cost_lamports`，保持 signed `i128`。
+4. 成本模型每个函数配单元测试：零成本、正常成本、成本大于毛利润、非法/溢出边界。
+5. 将成本模型接入 12 条路径 × 多金额真实检查，但在 V4 之前不假装已经知道“真实最优 Jito Tip”；先把成本来源和假设字段分开。
+6. 随后把 WSS dependency update 接到 Opportunity Engine，只重算受影响池/Token。
+7. 再做机会持久化与 24–72h 连续采样；需要长跑时转 Linux VPS，不把 GitHub Actions 当长期服务器。
 
 ## 开发与记录约定
 
-- README、项目说明和代码注释可以使用中文。
-- Rust 的变量名、函数名、结构体名、模块名保持英文。
-- 注释重点解释“为什么这样做”“链上字段代表什么”“风险在哪里”，避免给显而易见的代码逐行加注释。
-- 每个有实际逻辑的函数都设计对应测试；依赖真实外部服务的函数再增加端到端真实测试。
-- 每完成一个阶段，README 更新阶段状态、验证结果和下一步。
-- 遇到会影响推进的真实问题时，立即写入“当前问题 / 阻塞 / 风险”，解决后保留必要的解决记录。
-- **绿色 CI 只是信号；关键端到端步骤还要检查日志是否真的执行了目标逻辑。**
+- README、项目说明和代码注释使用中文；Rust 变量/函数/结构体/模块名保持英文。
+- 注释重点解释“为什么”“链上字段语义”“风险与假设”，不逐行翻译显而易见代码。
+- **每个有实际逻辑的函数设计对应测试；依赖真实外部服务的函数增加端到端真实测试。**
+- 每完成一个阶段或有真实 blocker，立即更新 README。
+- 绿色 CI 只是信号；关键端到端步骤必须核对日志是否真的执行目标逻辑。
 - 只有实际运行、实际编译、实际链上数据或官方资料能够支持的结论才标记为已验证。
 
 ## 安全规则
@@ -452,27 +325,16 @@ V3 当前计划：
 - 助记词
 - 任何其他交易签名密钥
 
-本地 `.env` 文件必须保持在 `.gitignore` 中；仓库只保留不含真实密钥的 `.env.example`。
+本地 `.env` 必须保留在 `.gitignore`；仓库只保留不含真实密钥的 `.env.example`。
 
 ## 最近更新
 
 **2026-08-13**
 
-- Stage 0 完成并验证。
-- V0 Pool Discovery 完成并验证；BONK/WIF 共 18 个候选 Pool Account 完成链上存在性与 owner 核验。
-- V1 Helius HTTP/WSS 与 18 个 Pool Account 实时订阅完成并验证。
-- V2 Raydium Standard AMM v4 本地 Quote 完成并真实验证。
-- V2 Orca Whirlpool 官方 Core Quote 完成并真实验证。
-- V2 Meteora DLMM 官方 Rust Quote 完成并真实验证。
-- 修复 `dependency-wss-check` 旧入口导致的 CI 假阳性，并增加未知命令失败回归测试。
-- V2 最终 CI Run `31687579494`：**78 passed / 0 failed**；31 个依赖账户实时订阅；真实 Orca TickArray 更新成功映射并触发 Quote 重算。
-- **V2 正式完成，项目进入 V3。**
-- 提交 `Cargo.lock`，固定当前 Rust 依赖解析结果。
-- CI 加入 Cargo registry/git/target 缓存和同分支并发取消策略；首次缓存约 **958 MB**。
-- Run `31689455003` Attempt 2 真实 cache hit：`cargo check` 4.20 秒、`cargo test` 4.55 秒，78 个测试和全部真实联网回归通过。
-- V3.1 新增统一 `SwapQuote` / `RoundTripOpportunity` 与闭环校验；新增 4 组单元测试。
-- V3.1 将 Raydium Standard / Orca Whirlpool 改为可接受任意输入 Mint / amount 的双方向 Quote，并新增正式 `round-trip-check`。
-- V3.1 最终 CI Run `31691663172`：**82 passed / 0 failed**；BONK/WIF 的 Raydium ↔ Orca 共 4 条真实两腿闭环全部计算成功。
-- V3.2 将 Meteora DLMM 接入统一双方向 Quote，并新增三池全部有向路径枚举测试。
-- V3.2 最终 CI Run `31692193766`：**83 passed / 0 failed**；BONK/WIF × Raydium/Orca/Meteora 共 **12 条真实两腿闭环**全部运行成功。
-- V3.2 当次 12 条路径全部为负收益，当前仍无可盈利证据；V3 保持进行中。
+- Stage 0 / V0 / V1 / V2 已完成并真实验证。
+- V3.1：统一 Quote 与 Raydium↔Orca 闭环，Run `31691663172`，82 tests。
+- V3.2：三 DEX 12 条有向闭环，Run `31692193766`，83 tests。
+- V3.3：同一腿快照多金额曲线、高精度 ppm、有限 `-32016` 重试、流动性不足点建模。
+- V3.3 最终 Run `31694234098`：**89 passed / 0 failed；12 routes；36 points accounted = 34 evaluated + 2 insufficient-liquidity；0 positive gross-profit points**。
+- 最后依赖 WSS 回归真实收到 Orca TickArray 更新并重算 Quote。
+- **V3 继续进行，下一模块为执行成本 / 净利润模型。**
