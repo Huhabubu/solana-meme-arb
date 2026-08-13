@@ -35,6 +35,7 @@ use crate::{
     },
     helius::{check_http, subscribe_accounts_and_wait_for_update, subscribe_and_wait_for_update},
     model::{Dex, PoolInfo},
+    opportunity::{evaluate_round_trip, SwapQuote},
     rpc::{fetch_account_owners, fetch_accounts, verify_pool_accounts, PUBLIC_MAINNET_RPC},
     state::{DependencyKind, PoolDependencies, QuoteState, VersionedAccountData},
     token_account::{decode_spl_token_account, decode_spl_token_mint, SPL_TOKEN_PROGRAM_ID},
@@ -47,6 +48,7 @@ const ORCA_QUOTE_TEST_INPUT_LAMPORTS: u64 = 10_000_000;
 const METEORA_QUOTE_TEST_INPUT_LAMPORTS: u64 = 10_000_000;
 const METEORA_BIN_ARRAY_TAKE_COUNT: u8 = 3;
 const DEPENDENCY_WSS_WAIT_SECONDS: u64 = 45;
+const ROUND_TRIP_TEST_INPUT_LAMPORTS: u64 = 10_000_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AppCommand {
@@ -57,6 +59,7 @@ enum AppCommand {
     OrcaQuoteCheck,
     MeteoraQuoteCheck,
     DependencyWssCheck,
+    RoundTripCheck,
 }
 
 fn parse_command(value: Option<&str>) -> Result<Option<AppCommand>> {
@@ -69,6 +72,7 @@ fn parse_command(value: Option<&str>) -> Result<Option<AppCommand>> {
         Some("orca-quote-check") => Ok(Some(AppCommand::OrcaQuoteCheck)),
         Some("meteora-quote-check") => Ok(Some(AppCommand::MeteoraQuoteCheck)),
         Some("dependency-wss-check") => Ok(Some(AppCommand::DependencyWssCheck)),
+        Some("round-trip-check") => Ok(Some(AppCommand::RoundTripCheck)),
         Some(other) => bail!("unknown command: {other}"),
     }
 }
@@ -77,7 +81,7 @@ pub async fn run() -> Result<()> {
     let argument = std::env::args().nth(1);
     let Some(command) = parse_command(argument.as_deref())? else {
         println!(
-            "Usage: {APP_NAME} <discover|verify|helius-check|raydium-quote-check|orca-quote-check|meteora-quote-check|dependency-wss-check>"
+            "Usage: {APP_NAME} <discover|verify|helius-check|raydium-quote-check|orca-quote-check|meteora-quote-check|dependency-wss-check|round-trip-check>"
         );
         return Ok(());
     };
@@ -91,6 +95,7 @@ pub async fn run() -> Result<()> {
         AppCommand::OrcaQuoteCheck => run_orca_quote_check(&client).await,
         AppCommand::MeteoraQuoteCheck => run_meteora_quote_check(&client).await,
         AppCommand::DependencyWssCheck => run_dependency_wss_check(&client).await,
+        AppCommand::RoundTripCheck => run_round_trip_check(&client).await,
     }
 }
 
@@ -232,7 +237,47 @@ async fn run_raydium_quote_check(client: &Client) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug)]
+struct RaydiumLiveQuote {
+    swap: SwapQuote,
+    pool_slot: u64,
+    vault_slot: u64,
+    swap_fee_numerator: u64,
+    swap_fee_denominator: u64,
+    output_decimals: u64,
+}
+
 async fn quote_raydium_pool(client: &Client, config: &HeliusConfig, pool: &PoolInfo) -> Result<()> {
+    let live = quote_raydium_pool_amount(
+        client,
+        config,
+        pool,
+        WSOL,
+        RAYDIUM_QUOTE_TEST_INPUT_LAMPORTS,
+    )
+    .await?;
+    let output_ui = live.swap.amount_out as f64 / 10_f64.powi(live.output_decimals as i32);
+    println!(
+        "{}/WSOL Raydium Standard verified: pool={} pool_slot={} vault_slot={} fee={}/{} input=0.01 WSOL output_raw={} output_ui={:.8}",
+        token_symbol_for_pool(pool)?,
+        pool.address,
+        live.pool_slot,
+        live.vault_slot,
+        live.swap_fee_numerator,
+        live.swap_fee_denominator,
+        live.swap.amount_out,
+        output_ui
+    );
+    Ok(())
+}
+
+async fn quote_raydium_pool_amount(
+    client: &Client,
+    config: &HeliusConfig,
+    pool: &PoolInfo,
+    input_mint: &str,
+    amount_in: u64,
+) -> Result<RaydiumLiveQuote> {
     let pool_batch = fetch_accounts(
         client,
         config.http_url().as_str(),
@@ -273,7 +318,8 @@ async fn quote_raydium_pool(client: &Client, config: &HeliusConfig, pool: &PoolI
     let pc_vault_data = vault_batch.accounts[1]
         .as_ref()
         .context("Raydium pc vault missing")?;
-    if coin_vault_data.owner != SPL_TOKEN_PROGRAM_ID || pc_vault_data.owner != SPL_TOKEN_PROGRAM_ID
+    if coin_vault_data.owner != SPL_TOKEN_PROGRAM_ID
+        || pc_vault_data.owner != SPL_TOKEN_PROGRAM_ID
     {
         bail!("Raydium AMM v4 vault is not owned by the classic SPL Token program");
     }
@@ -287,8 +333,8 @@ async fn quote_raydium_pool(client: &Client, config: &HeliusConfig, pool: &PoolI
         &state,
         coin_vault.amount,
         pc_vault.amount,
-        WSOL,
-        RAYDIUM_QUOTE_TEST_INPUT_LAMPORTS,
+        input_mint,
+        amount_in,
         unix_timestamp()?,
     )?;
     let output_decimals = if quote.output_mint == state.coin_mint {
@@ -296,19 +342,24 @@ async fn quote_raydium_pool(client: &Client, config: &HeliusConfig, pool: &PoolI
     } else {
         state.pc_decimals
     };
-    let output_ui = quote.amount_out as f64 / 10_f64.powi(output_decimals as i32);
-    println!(
-        "{}/WSOL Raydium Standard verified: pool={} pool_slot={} vault_slot={} fee={}/{} input=0.01 WSOL output_raw={} output_ui={:.8}",
-        token_symbol_for_pool(pool)?,
-        pool.address,
-        pool_batch.slot,
-        vault_batch.slot,
-        state.swap_fee_numerator,
-        state.swap_fee_denominator,
+    let swap = SwapQuote::new(
+        pool.dex,
+        pool.address.clone(),
+        quote.input_mint,
+        quote.output_mint,
+        quote.amount_in,
         quote.amount_out,
-        output_ui
-    );
-    Ok(())
+        pool_batch.slot,
+    )?;
+
+    Ok(RaydiumLiveQuote {
+        swap,
+        pool_slot: pool_batch.slot,
+        vault_slot: vault_batch.slot,
+        swap_fee_numerator: state.swap_fee_numerator,
+        swap_fee_denominator: state.swap_fee_denominator,
+        output_decimals,
+    })
 }
 
 async fn run_orca_quote_check(client: &Client) -> Result<()> {
@@ -331,9 +382,49 @@ async fn run_orca_quote_check(client: &Client) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug)]
+struct OrcaLiveQuote {
+    swap: SwapQuote,
+    tick_spacing: String,
+    fee_rate: String,
+    adaptive_fee: bool,
+    output_decimals: u8,
+}
+
 async fn quote_orca_pool(client: &Client, config: &HeliusConfig, pool: &PoolInfo) -> Result<()> {
-    let program_id =
-        Pubkey::from_str(ORCA_WHIRLPOOL_PROGRAM_ID).context("invalid Orca Whirlpool program id")?;
+    let live = quote_orca_pool_amount(
+        client,
+        config,
+        pool,
+        WSOL,
+        ORCA_QUOTE_TEST_INPUT_LAMPORTS,
+    )
+    .await?;
+    let output_ui =
+        live.swap.amount_out as f64 / 10_f64.powi(i32::from(live.output_decimals));
+    println!(
+        "{}/WSOL Orca Whirlpool verified: pool={} snapshot_slot={} tick_spacing={} fee_rate={} adaptive_fee={} input=0.01 WSOL output_raw={} output_ui={:.8}",
+        token_symbol_for_pool(pool)?,
+        pool.address,
+        live.swap.snapshot_slot,
+        live.tick_spacing,
+        live.fee_rate,
+        live.adaptive_fee,
+        live.swap.amount_out,
+        output_ui
+    );
+    Ok(())
+}
+
+async fn quote_orca_pool_amount(
+    client: &Client,
+    config: &HeliusConfig,
+    pool: &PoolInfo,
+    input_mint: &str,
+    amount_in: u64,
+) -> Result<OrcaLiveQuote> {
+    let program_id = Pubkey::from_str(ORCA_WHIRLPOOL_PROGRAM_ID)
+        .context("invalid Orca Whirlpool program id")?;
     let initial_batch = fetch_accounts(
         client,
         config.http_url().as_str(),
@@ -442,7 +533,8 @@ async fn quote_orca_pool(client: &Client, config: &HeliusConfig, pool: &PoolInfo
 
     let mint_a_account = accounts[6].as_ref().context("Orca token mint A missing")?;
     let mint_b_account = accounts[7].as_ref().context("Orca token mint B missing")?;
-    if mint_a_account.owner != SPL_TOKEN_PROGRAM_ID || mint_b_account.owner != SPL_TOKEN_PROGRAM_ID
+    if mint_a_account.owner != SPL_TOKEN_PROGRAM_ID
+        || mint_b_account.owner != SPL_TOKEN_PROGRAM_ID
     {
         bail!("Orca live quote currently requires classic SPL Token mints");
     }
@@ -472,29 +564,130 @@ async fn quote_orca_pool(client: &Client, config: &HeliusConfig, pool: &PoolInfo
         &whirlpool,
         tick_arrays,
         oracle,
-        WSOL,
-        ORCA_QUOTE_TEST_INPUT_LAMPORTS,
+        input_mint,
+        amount_in,
         unix_timestamp()?,
     )?;
-    let output_decimals = if mint_a == WSOL {
-        mint_b_state.decimals
-    } else if mint_b == WSOL {
-        mint_a_state.decimals
+    let (output_mint, output_decimals) = if input_mint == mint_a {
+        (mint_b, mint_b_state.decimals)
+    } else if input_mint == mint_b {
+        (mint_a, mint_a_state.decimals)
     } else {
-        bail!("selected Orca pool does not contain WSOL after decoding");
+        bail!("Orca input mint is not part of the decoded pool");
     };
-    let output_ui = quote.token_est_out as f64 / 10_f64.powi(i32::from(output_decimals));
-    println!(
-        "{}/WSOL Orca Whirlpool verified: pool={} snapshot_slot={} tick_spacing={} fee_rate={} adaptive_fee={} input=0.01 WSOL output_raw={} output_ui={:.8}",
-        token_symbol_for_pool(pool)?,
-        pool.address,
-        snapshot.slot,
-        whirlpool.tick_spacing,
-        whirlpool.fee_rate,
-        adaptive_fee,
+    let swap = SwapQuote::new(
+        pool.dex,
+        pool.address.clone(),
+        input_mint,
+        output_mint,
+        amount_in,
         quote.token_est_out,
-        output_ui
-    );
+        snapshot.slot,
+    )?;
+
+    Ok(OrcaLiveQuote {
+        swap,
+        tick_spacing: whirlpool.tick_spacing.to_string(),
+        fee_rate: whirlpool.fee_rate.to_string(),
+        adaptive_fee,
+        output_decimals,
+    })
+}
+
+async fn run_round_trip_check(client: &Client) -> Result<()> {
+    let config = HeliusConfig::from_env()?;
+    let mut verified_routes = 0usize;
+
+    for token in tracked_tokens() {
+        let (_, candidates) = discover_candidates(client, token).await?;
+        let pools = supported_quote_pools(&candidates);
+        let raydium = pools
+            .iter()
+            .find(|pool| pool.dex == Dex::Raydium)
+            .with_context(|| format!("{}/WSOL has no supported Raydium Standard pool", token.symbol))?;
+        let orca = pools
+            .iter()
+            .find(|pool| pool.dex == Dex::Orca)
+            .with_context(|| format!("{}/WSOL has no supported Orca Whirlpool", token.symbol))?;
+
+        let first = quote_raydium_pool_amount(
+            client,
+            &config,
+            raydium,
+            WSOL,
+            ROUND_TRIP_TEST_INPUT_LAMPORTS,
+        )
+        .await?;
+        let second = quote_orca_pool_amount(
+            client,
+            &config,
+            orca,
+            token.mint,
+            first.swap.amount_out,
+        )
+        .await?;
+        let raydium_to_orca = evaluate_round_trip(&first.swap, &second.swap)?;
+        if raydium_to_orca.base_mint != WSOL
+            || raydium_to_orca.intermediate_mint != token.mint
+        {
+            bail!("Raydium->Orca round trip produced unexpected mints");
+        }
+        println!(
+            "{}/WSOL V3 round trip verified: Raydium->Orca input={} token_out={} final={} gross_profit_raw={} gross_return_bps={} slots={}..{}",
+            token.symbol,
+            raydium_to_orca.input_amount,
+            raydium_to_orca.intermediate_amount,
+            raydium_to_orca.final_amount,
+            raydium_to_orca.gross_profit_raw,
+            raydium_to_orca.gross_return_bps,
+            raydium_to_orca.oldest_slot,
+            raydium_to_orca.newest_slot
+        );
+        verified_routes += 1;
+
+        let first = quote_orca_pool_amount(
+            client,
+            &config,
+            orca,
+            WSOL,
+            ROUND_TRIP_TEST_INPUT_LAMPORTS,
+        )
+        .await?;
+        let second = quote_raydium_pool_amount(
+            client,
+            &config,
+            raydium,
+            token.mint,
+            first.swap.amount_out,
+        )
+        .await?;
+        let orca_to_raydium = evaluate_round_trip(&first.swap, &second.swap)?;
+        if orca_to_raydium.base_mint != WSOL
+            || orca_to_raydium.intermediate_mint != token.mint
+        {
+            bail!("Orca->Raydium round trip produced unexpected mints");
+        }
+        println!(
+            "{}/WSOL V3 round trip verified: Orca->Raydium input={} token_out={} final={} gross_profit_raw={} gross_return_bps={} slots={}..{}",
+            token.symbol,
+            orca_to_raydium.input_amount,
+            orca_to_raydium.intermediate_amount,
+            orca_to_raydium.final_amount,
+            orca_to_raydium.gross_profit_raw,
+            orca_to_raydium.gross_return_bps,
+            orca_to_raydium.oldest_slot,
+            orca_to_raydium.newest_slot
+        );
+        verified_routes += 1;
+    }
+
+    let expected_routes = tracked_tokens().len() * 2;
+    if verified_routes != expected_routes {
+        bail!(
+            "V3 round-trip verification count mismatch: expected {expected_routes}, got {verified_routes}"
+        );
+    }
+    println!("V3 Raydium/Orca two-leg round-trip verification passed for {verified_routes} routes");
     Ok(())
 }
 
@@ -1066,6 +1259,10 @@ mod tests {
             parse_command(Some("dependency-wss-check")).unwrap(),
             Some(AppCommand::DependencyWssCheck)
         );
+        assert_eq!(
+            parse_command(Some("round-trip-check")).unwrap(),
+            Some(AppCommand::RoundTripCheck)
+        );
         assert_eq!(parse_command(None).unwrap(), None);
         assert!(parse_command(Some("definitely-unknown")).is_err());
     }
@@ -1097,5 +1294,6 @@ mod tests {
         assert_eq!(ORCA_QUOTE_TEST_INPUT_LAMPORTS, 10_000_000);
         assert_eq!(METEORA_QUOTE_TEST_INPUT_LAMPORTS, 10_000_000);
         assert_eq!(METEORA_BIN_ARRAY_TAKE_COUNT, 3);
+        assert_eq!(ROUND_TRIP_TEST_INPUT_LAMPORTS, 10_000_000);
     }
 }
