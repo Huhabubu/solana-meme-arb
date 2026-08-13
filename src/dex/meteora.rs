@@ -8,6 +8,8 @@ use crate::serde_utils::number_from_value;
 
 const DLMM_URL: &str = "https://dlmm.datapi.meteora.ag/pools";
 const DAMM_V2_URL: &str = "https://damm-v2.datapi.meteora.ag/pools";
+const DLMM_PROGRAM_ID: &str = "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo";
+const DAMM_V2_PROGRAM_ID: &str = "cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG";
 
 #[derive(Debug, Deserialize)]
 struct Response {
@@ -81,6 +83,14 @@ async fn fetch_pools(
     parse_response(&body, dex, pool_type, mint_x, mint_y)
 }
 
+fn program_id_for(dex: Dex) -> &'static str {
+    match dex {
+        Dex::MeteoraDlmm => DLMM_PROGRAM_ID,
+        Dex::MeteoraDammV2 => DAMM_V2_PROGRAM_ID,
+        Dex::Raydium | Dex::Orca => unreachable!("Meteora parser received non-Meteora DEX"),
+    }
+}
+
 fn parse_response(
     body: &str,
     dex: Dex,
@@ -89,6 +99,7 @@ fn parse_response(
     mint_y: &str,
 ) -> Result<Vec<PoolInfo>> {
     let response: Response = serde_json::from_str(body).context("invalid Meteora JSON")?;
+    let program_id = program_id_for(dex);
 
     response
         .data
@@ -99,7 +110,7 @@ fn parse_response(
                 dex,
                 address: pool.address,
                 pool_type: format!("{pool_type}: {}", pool.name),
-                program_id: None,
+                program_id: Some(program_id.into()),
                 mint_a: pool.token_x.address,
                 mint_b: pool.token_y.address,
                 tvl_usd: number_from_value(&pool.tvl)?,
@@ -122,7 +133,7 @@ mod tests {
     const B: &str = "MintB";
 
     #[test]
-    fn parses_exact_pair_and_excludes_blacklisted_pool() {
+    fn parses_exact_pair_excludes_blacklisted_and_sets_dlmm_program() {
         let body = r#"{
             "data": [
                 {"address":"pool-1","name":"A-B","is_blacklisted":false,"token_x":{"address":"MintA"},"token_y":{"address":"MintB"},"tvl":9000},
@@ -136,12 +147,14 @@ mod tests {
         assert_eq!(pools[0].address, "pool-1");
         assert_eq!(pools[0].tvl_usd, 9000.0);
         assert!(pools[0].pool_type.starts_with("DLMM:"));
+        assert_eq!(pools[0].program_id.as_deref(), Some(DLMM_PROGRAM_ID));
     }
 
     #[test]
-    fn accepts_numeric_string_tvl() {
+    fn accepts_numeric_string_tvl_and_sets_damm_v2_program() {
         let body = r#"{"data":[{"address":"pool","name":"A-B","token_x":{"address":"MintB"},"token_y":{"address":"MintA"},"tvl":"42.5"}]}"#;
         let pools = parse_response(body, Dex::MeteoraDammV2, "DAMM v2", A, B).unwrap();
         assert_eq!(pools[0].tvl_usd, 42.5);
+        assert_eq!(pools[0].program_id.as_deref(), Some(DAMM_V2_PROGRAM_ID));
     }
 }
