@@ -8,7 +8,10 @@ mod serde_utils;
 mod token_account;
 mod tokens;
 
-use std::{str::FromStr, time::{Duration, SystemTime, UNIX_EPOCH}};
+use std::{
+    str::FromStr,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use anyhow::{bail, Context, Result};
 use orca_whirlpools_client::{get_oracle_address, get_tick_array_address};
@@ -30,9 +33,7 @@ use discovery::{
 use helius::{check_http, subscribe_and_wait_for_update};
 use model::{Dex, PoolInfo};
 use rpc::{fetch_account_owners, fetch_accounts, verify_pool_accounts, PUBLIC_MAINNET_RPC};
-use token_account::{
-    decode_spl_token_account, decode_spl_token_mint, SPL_TOKEN_PROGRAM_ID,
-};
+use token_account::{decode_spl_token_account, decode_spl_token_mint, SPL_TOKEN_PROGRAM_ID};
 use tokens::{tracked_tokens, Token, WSOL};
 
 const APP_NAME: &str = "solana-meme-arb";
@@ -265,16 +266,15 @@ async fn run_raydium_quote_check(client: &Client) -> Result<()> {
 /// 用 Orca 官方 Rust 解码器和 `orca_whirlpools_core` 报价引擎，真实验证 0.01 WSOL 的 Whirlpool 报价。
 async fn run_orca_quote_check(client: &Client) -> Result<()> {
     let config = HeliusConfig::from_env()?;
-    let program_id = Pubkey::from_str(ORCA_WHIRLPOOL_PROGRAM_ID)
-        .context("invalid Orca Whirlpool program id")?;
+    let program_id =
+        Pubkey::from_str(ORCA_WHIRLPOOL_PROGRAM_ID).context("invalid Orca Whirlpool program id")?;
     let now = unix_timestamp()?;
     let mut verified = 0usize;
 
     for token in tracked_tokens() {
         let (_, candidates) = discover_candidates(client, token).await?;
         let pool = candidates.iter().find(|pool| {
-            pool.dex == Dex::Orca
-                && pool.program_id.as_deref() == Some(ORCA_WHIRLPOOL_PROGRAM_ID)
+            pool.dex == Dex::Orca && pool.program_id.as_deref() == Some(ORCA_WHIRLPOOL_PROGRAM_ID)
         });
         let Some(pool) = pool else {
             println!("{}/WSOL: no selected Orca Whirlpool", token.symbol);
@@ -308,7 +308,9 @@ async fn run_orca_quote_check(client: &Client) -> Result<()> {
             .map(|index| {
                 get_tick_array_address(&pool_pubkey, *index, Some(program_id))
                     .map(|(address, _)| address.to_string())
-                    .map_err(|error| anyhow::anyhow!("failed to derive Orca TickArray PDA: {error}"))
+                    .map_err(|error| {
+                        anyhow::anyhow!("failed to derive Orca TickArray PDA: {error}")
+                    })
             })
             .collect::<Result<Vec<_>>>()?;
         let adaptive_fee = needs_oracle(&initial_whirlpool);
@@ -359,7 +361,10 @@ async fn run_orca_quote_check(client: &Client) -> Result<()> {
         let mint_a = whirlpool.token_mint_a.to_string();
         let mint_b = whirlpool.token_mint_b.to_string();
         if !pool.matches_pair(&mint_a, &mint_b) {
-            bail!("Orca decoded mints do not match discovery metadata for {}", pool.address);
+            bail!(
+                "Orca decoded mints do not match discovery metadata for {}",
+                pool.address
+            );
         }
         let snapshot_tick_indexes =
             tick_array_start_indexes(whirlpool.tick_current_index, whirlpool.tick_spacing);
@@ -378,17 +383,21 @@ async fn run_orca_quote_check(client: &Client) -> Result<()> {
                 }
             }
             tick_facades.push(decode_tick_array_or_default(
-                accounts[index + 1].as_ref().map(|account| account.data.as_slice()),
+                accounts[index + 1]
+                    .as_ref()
+                    .map(|account| account.data.as_slice()),
                 snapshot_tick_indexes[index],
             )?);
         }
-        let tick_arrays: [TickArrayFacade; 5] = tick_facades
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("Orca snapshot did not produce exactly five TickArrays"))?;
+        let tick_arrays: [TickArrayFacade; 5] = tick_facades.try_into().map_err(|_| {
+            anyhow::anyhow!("Orca snapshot did not produce exactly five TickArrays")
+        })?;
 
         let mint_a_account = accounts[6].as_ref().context("Orca token mint A missing")?;
         let mint_b_account = accounts[7].as_ref().context("Orca token mint B missing")?;
-        if mint_a_account.owner != SPL_TOKEN_PROGRAM_ID || mint_b_account.owner != SPL_TOKEN_PROGRAM_ID {
+        if mint_a_account.owner != SPL_TOKEN_PROGRAM_ID
+            || mint_b_account.owner != SPL_TOKEN_PROGRAM_ID
+        {
             bail!(
                 "Orca live quote currently requires classic SPL Token mints; Token-2022 transfer fees are not yet implemented"
             );
@@ -400,7 +409,9 @@ async fn run_orca_quote_check(client: &Client) -> Result<()> {
         }
 
         let oracle = if adaptive_fee {
-            let oracle_account = accounts[8].as_ref().context("Orca adaptive-fee Oracle missing")?;
+            let oracle_account = accounts[8]
+                .as_ref()
+                .context("Orca adaptive-fee Oracle missing")?;
             if oracle_account.owner != ORCA_WHIRLPOOL_PROGRAM_ID {
                 bail!("Orca Oracle owner mismatch");
             }
