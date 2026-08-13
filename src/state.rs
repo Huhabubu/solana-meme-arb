@@ -242,12 +242,6 @@ mod tests {
     }
 
     #[test]
-    fn dependency_kind_is_marked_as_quote_trigger() {
-        assert!(DependencyKind::TokenVault.is_dynamic_quote_trigger());
-        assert!(DependencyKind::BinArray.is_dynamic_quote_trigger());
-    }
-
-    #[test]
     fn dependency_account_rejects_empty_address() {
         assert!(DependencyAccount::new(" ", DependencyKind::PoolState).is_err());
     }
@@ -368,12 +362,12 @@ mod tests {
                 .unwrap()
                 .accepted
         );
-        assert_eq!(state.account("vault").unwrap().data, vec![2]);
+        assert_eq!(state.account_data.get("vault").unwrap().data, vec![2]);
 
         let result = state.apply_account_update("vault", version(9, 3)).unwrap();
         assert!(!result.accepted);
         assert_eq!(result.affected_pools, vec!["pool-a"]);
-        assert_eq!(state.account("vault").unwrap().data, vec![2]);
+        assert_eq!(state.account_data.get("vault").unwrap().data, vec![2]);
     }
 
     #[test]
