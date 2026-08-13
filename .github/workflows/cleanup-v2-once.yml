@@ -1,0 +1,48 @@
+name: cleanup-v2-once
+
+on:
+  push:
+    paths:
+      - '.github/workflows/cleanup-v2-once.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Remove confirmed unused V2 code
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          app = Path('src/app.rs')
+          text = app.read_text()
+          old = '    collections::{HashMap, HashSet},\n'
+          if text.count(old) != 1:
+              raise SystemExit('unexpected HashMap import shape')
+          app.write_text(text.replace(old, '    collections::HashSet,\n'))
+
+          state = Path('src/state.rs')
+          text = state.read_text()
+          impl_block = '''impl DependencyKind {\n    pub fn is_dynamic_quote_trigger(self) -> bool {\n        matches!(\n            self,\n            Self::PoolState\n                | Self::TokenVault\n                | Self::TickArray\n                | Self::Oracle\n                | Self::BinArray\n                | Self::BitmapExtension\n                | Self::TokenMint\n        )\n    }\n}\n\n'''
+          account_method = '''    pub fn account(&self, address: &str) -> Option<&VersionedAccountData> {\n        self.account_data.get(address)\n    }\n\n'''
+          if text.count(impl_block) != 1 or text.count(account_method) != 1:
+              raise SystemExit('unexpected state.rs dead-code shape')
+          text = text.replace(impl_block, '').replace(account_method, '')
+          state.write_text(text)
+          PY
+          cargo fmt --all
+
+      - name: Commit cleanup
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/app.rs src/state.rs
+          git diff --cached --quiet && { echo "No changes to commit"; exit 1; }
+          git commit -m "cleanup: remove unused V2 state helpers"
+          git push
