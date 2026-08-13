@@ -1,4 +1,5 @@
 pub mod meteora;
+pub mod meteora_dlmm;
 pub mod orca;
 pub mod orca_whirlpool;
 pub mod raydium;
