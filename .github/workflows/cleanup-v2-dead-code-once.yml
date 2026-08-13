@@ -19,20 +19,15 @@ jobs:
         run: |
           python - <<'PY'
           from pathlib import Path
+          import re
 
           path = Path('src/state.rs')
           text = path.read_text()
 
-          trigger_test = '''    #[test]
-          fn dependency_kind_is_marked_as_quote_trigger() {
-              assert!(DependencyKind::TokenVault.is_dynamic_quote_trigger());
-              assert!(DependencyKind::BinArray.is_dynamic_quote_trigger());
-          }
-
-          '''
-          if text.count(trigger_test) != 1:
-              raise SystemExit(f'trigger test count={text.count(trigger_test)}')
-          text = text.replace(trigger_test, '', 1)
+          pattern = r'\n    #\[test\]\n    fn dependency_kind_is_marked_as_quote_trigger\(\) \{\n(?:        .*\n)+?    \}\n'
+          text, count = re.subn(pattern, '\n', text, count=1)
+          if count != 1:
+              raise SystemExit(f'trigger test removal count={count}')
 
           old = 'state.account("vault").unwrap().data'
           count = text.count(old)
