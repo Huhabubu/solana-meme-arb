@@ -192,6 +192,20 @@ CI Run `31687579494`，已读取完整 Job 日志核对，不仅依赖 GitHub �
 
 因此 V2 已满足原定成功标准，正式进入 V3。
 
+### CI — Cargo 缓存与依赖锁定
+
+V3 开始前完成了一次独立基础设施优化，并保持业务代码不变。
+
+- `Cargo.lock` 已生成并提交，Rust 依赖版本现在有可重复的锁定文件。
+- CI 使用 `actions/cache@v5` 缓存 `~/.cargo/registry`、`~/.cargo/git` 和 `target`。
+- 缓存主 key 同时绑定 runner OS、`rustc` 版本、`Cargo.toml` 与 `Cargo.lock`；Rust 版本或依赖配置变化时会生成新 key。
+- 同一分支快速连续提交时，CI 通过 `concurrency` 取消旧的进行中任务，只保留最新提交，减少 Actions 时间浪费。
+- 首次填充 Run `31688820193`：缓存 miss，完整回归成功并保存约 **958 MB** 缓存；冷启动 `cargo check` 约 **2 分 35 秒**，`cargo test` 约 **2 分 51 秒**。
+- 验证 Run `31689455003` Attempt 2：命中完全相同的主 key；缓存恢复后 `cargo check` **4.20 秒**、`cargo clippy` **3.50 秒**、`cargo test` **4.55 秒**，单元测试仍为 **78 passed / 0 failed**。
+- 该缓存约 **958 MB**，当次恢复和解压约 27 秒；虽然仍有固定恢复成本，但相比重复编译数分钟明显更低。
+- 缓存命中后再次完成真实 Pool Discovery、主网 owner、Helius HTTP/WSS、Raydium、Orca、Meteora 和依赖账户 WSS 全链路回归。
+- 临时生成 `Cargo.lock` 的 one-shot workflow 已删除，仓库只保留正式 CI。
+
 ### V0 监控候选筛选规则
 
 当前研究期默认：
@@ -292,10 +306,18 @@ CI Run `31687579494`，已读取完整 Job 日志核对，不仅依赖 GitHub �
 
 这条规则继续保留：**测试通过/失败本身不够，还要确认断言覆盖的是目标机制。**
 
+### Cargo 缓存验证时出现一次 `minContextSlot` 短暂失败
+
+缓存命中的首次完整回归 Run `31689455003` Attempt 1 在 Raydium 真实 Quote 阶段收到 Solana RPC `-32016: Minimum context slot has not been reached`。
+
+该错误表示 RPC 节点当时尚未同步到程序要求的最小 slot。这里没有降低 `minContextSlot`、没有回退读取旧状态，也没有为让 CI 变绿而修改业务代码；直接重跑同一 Job 后 Attempt 2 全链路成功。
+
+这说明 `minContextSlot` 的一致性保护按预期拒绝了落后节点，同时也说明真实联网 CI 存在外部节点短暂滞后的非确定性，后续若频率增加再单独设计有限重试策略。
+
 ## 当前问题 / 阻塞 / 风险
 
 - 当前开发主要依赖 GitHub Actions 进行 Rust 编译和真实联网测试，因为本次 ChatGPT 执行环境没有可直接使用的 Rust toolchain。
-- 加入 Meteora 官方 Rust SDK 后，依赖树约 **792 个 package**；当前 GitHub runner 没有 Cargo 缓存，最终 V2 冷启动 `cargo check` 约 2 分 22 秒，`cargo test` 另有明显重复编译成本。下一项基础设施优化是增加可靠 Cargo cache，但不能牺牲可重复性。
+- Cargo 缓存已经启用并真实命中；当前缓存归档约 **958 MB**，恢复/解压仍约需 27 秒，但相比数分钟冷编译明显更低。缓存 key 已绑定 Rust 版本和依赖锁文件，避免跨不兼容工具链静默复用。
 - `actions/checkout@v4` 当前有 Node.js 20 弃用警告；GitHub 强制使用 Node 24，本项目 CI 仍成功。该警告目前不影响业务验证。
 - `HELIUS_API_KEY` 没有写入仓库或 Git 历史，仅由 GitHub Actions Secret 在运行时注入。
 - DEX REST API 的 TVL 属于动态外部数据，不能视为链上实时成交价格。
@@ -314,8 +336,6 @@ V3 当前计划：
 4. 把实时依赖账户更新接到 Opportunity Engine，只重算受影响池和相关 Token 的路径。
 5. 记录真实机会的 slot、路径、金额、收益和持续情况；这一阶段仍然不接钱包、不下单。
 6. 需要连续 24–72 小时采样时停止使用 GitHub Actions 当长期运行环境，转到常驻 Linux VPS。
-
-在进入 V3 业务代码前，先给 CI 加 Cargo 依赖/构建缓存，减少当前 792 个 package 的重复冷编译和 Actions 分钟浪费；缓存本身也要通过一次完整 CI 验证。
 
 ## 开发与记录约定
 
@@ -352,3 +372,7 @@ V3 当前计划：
 - 修复 `dependency-wss-check` 旧入口导致的 CI 假阳性，并增加未知命令失败回归测试。
 - V2 最终 CI Run `31687579494`：**78 passed / 0 failed**；31 个依赖账户实时订阅；真实 Orca TickArray 更新成功映射并触发 Quote 重算。
 - **V2 正式完成，项目进入 V3。**
+- 提交 `Cargo.lock`，固定当前 Rust 依赖解析结果。
+- CI 加入 Cargo registry/git/target 缓存和同分支并发取消策略；首次缓存约 **958 MB**。
+- Run `31689455003` Attempt 2 真实 cache hit：`cargo check` 4.20 秒、`cargo test` 4.55 秒，78 个测试和全部真实联网回归通过。
+- 缓存命中回归期间真实收到 Meteora `BinArray` 更新并触发 Quote 重算，说明基础设施优化没有破坏 V2 实时链路。
