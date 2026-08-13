@@ -318,8 +318,7 @@ async fn quote_raydium_pool_amount(
     let pc_vault_data = vault_batch.accounts[1]
         .as_ref()
         .context("Raydium pc vault missing")?;
-    if coin_vault_data.owner != SPL_TOKEN_PROGRAM_ID
-        || pc_vault_data.owner != SPL_TOKEN_PROGRAM_ID
+    if coin_vault_data.owner != SPL_TOKEN_PROGRAM_ID || pc_vault_data.owner != SPL_TOKEN_PROGRAM_ID
     {
         bail!("Raydium AMM v4 vault is not owned by the classic SPL Token program");
     }
@@ -392,16 +391,9 @@ struct OrcaLiveQuote {
 }
 
 async fn quote_orca_pool(client: &Client, config: &HeliusConfig, pool: &PoolInfo) -> Result<()> {
-    let live = quote_orca_pool_amount(
-        client,
-        config,
-        pool,
-        WSOL,
-        ORCA_QUOTE_TEST_INPUT_LAMPORTS,
-    )
-    .await?;
-    let output_ui =
-        live.swap.amount_out as f64 / 10_f64.powi(i32::from(live.output_decimals));
+    let live =
+        quote_orca_pool_amount(client, config, pool, WSOL, ORCA_QUOTE_TEST_INPUT_LAMPORTS).await?;
+    let output_ui = live.swap.amount_out as f64 / 10_f64.powi(i32::from(live.output_decimals));
     println!(
         "{}/WSOL Orca Whirlpool verified: pool={} snapshot_slot={} tick_spacing={} fee_rate={} adaptive_fee={} input=0.01 WSOL output_raw={} output_ui={:.8}",
         token_symbol_for_pool(pool)?,
@@ -423,8 +415,8 @@ async fn quote_orca_pool_amount(
     input_mint: &str,
     amount_in: u64,
 ) -> Result<OrcaLiveQuote> {
-    let program_id = Pubkey::from_str(ORCA_WHIRLPOOL_PROGRAM_ID)
-        .context("invalid Orca Whirlpool program id")?;
+    let program_id =
+        Pubkey::from_str(ORCA_WHIRLPOOL_PROGRAM_ID).context("invalid Orca Whirlpool program id")?;
     let initial_batch = fetch_accounts(
         client,
         config.http_url().as_str(),
@@ -533,8 +525,7 @@ async fn quote_orca_pool_amount(
 
     let mint_a_account = accounts[6].as_ref().context("Orca token mint A missing")?;
     let mint_b_account = accounts[7].as_ref().context("Orca token mint B missing")?;
-    if mint_a_account.owner != SPL_TOKEN_PROGRAM_ID
-        || mint_b_account.owner != SPL_TOKEN_PROGRAM_ID
+    if mint_a_account.owner != SPL_TOKEN_PROGRAM_ID || mint_b_account.owner != SPL_TOKEN_PROGRAM_ID
     {
         bail!("Orca live quote currently requires classic SPL Token mints");
     }
@@ -604,7 +595,12 @@ async fn run_round_trip_check(client: &Client) -> Result<()> {
         let raydium = pools
             .iter()
             .find(|pool| pool.dex == Dex::Raydium)
-            .with_context(|| format!("{}/WSOL has no supported Raydium Standard pool", token.symbol))?;
+            .with_context(|| {
+                format!(
+                    "{}/WSOL has no supported Raydium Standard pool",
+                    token.symbol
+                )
+            })?;
         let orca = pools
             .iter()
             .find(|pool| pool.dex == Dex::Orca)
@@ -618,18 +614,11 @@ async fn run_round_trip_check(client: &Client) -> Result<()> {
             ROUND_TRIP_TEST_INPUT_LAMPORTS,
         )
         .await?;
-        let second = quote_orca_pool_amount(
-            client,
-            &config,
-            orca,
-            token.mint,
-            first.swap.amount_out,
-        )
-        .await?;
+        let second =
+            quote_orca_pool_amount(client, &config, orca, token.mint, first.swap.amount_out)
+                .await?;
         let raydium_to_orca = evaluate_round_trip(&first.swap, &second.swap)?;
-        if raydium_to_orca.base_mint != WSOL
-            || raydium_to_orca.intermediate_mint != token.mint
-        {
+        if raydium_to_orca.base_mint != WSOL || raydium_to_orca.intermediate_mint != token.mint {
             bail!("Raydium->Orca round trip produced unexpected mints");
         }
         println!(
@@ -645,26 +634,14 @@ async fn run_round_trip_check(client: &Client) -> Result<()> {
         );
         verified_routes += 1;
 
-        let first = quote_orca_pool_amount(
-            client,
-            &config,
-            orca,
-            WSOL,
-            ROUND_TRIP_TEST_INPUT_LAMPORTS,
-        )
-        .await?;
-        let second = quote_raydium_pool_amount(
-            client,
-            &config,
-            raydium,
-            token.mint,
-            first.swap.amount_out,
-        )
-        .await?;
+        let first =
+            quote_orca_pool_amount(client, &config, orca, WSOL, ROUND_TRIP_TEST_INPUT_LAMPORTS)
+                .await?;
+        let second =
+            quote_raydium_pool_amount(client, &config, raydium, token.mint, first.swap.amount_out)
+                .await?;
         let orca_to_raydium = evaluate_round_trip(&first.swap, &second.swap)?;
-        if orca_to_raydium.base_mint != WSOL
-            || orca_to_raydium.intermediate_mint != token.mint
-        {
+        if orca_to_raydium.base_mint != WSOL || orca_to_raydium.intermediate_mint != token.mint {
             bail!("Orca->Raydium round trip produced unexpected mints");
         }
         println!(
