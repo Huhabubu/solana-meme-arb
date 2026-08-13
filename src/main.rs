@@ -8,24 +8,36 @@ mod serde_utils;
 mod token_account;
 mod tokens;
 
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::{str::FromStr, time::{Duration, SystemTime, UNIX_EPOCH}};
 
 use anyhow::{bail, Context, Result};
+use orca_whirlpools_client::{get_oracle_address, get_tick_array_address};
+use orca_whirlpools_core::TickArrayFacade;
 use reqwest::Client;
+use solana_pubkey::Pubkey;
 
 use config::HeliusConfig;
-use dex::raydium_amm::{decode_amm_v4, quote_base_in, RAYDIUM_AMM_V4_PROGRAM_ID};
+use dex::{
+    orca_whirlpool::{
+        decode_oracle, decode_tick_array_or_default, decode_whirlpool, needs_oracle,
+        quote_exact_in as quote_orca_exact_in, tick_array_start_indexes, ORCA_WHIRLPOOL_PROGRAM_ID,
+    },
+    raydium_amm::{decode_amm_v4, quote_base_in, RAYDIUM_AMM_V4_PROGRAM_ID},
+};
 use discovery::{
     discover_pair, select_monitoring_candidates, MAX_POOLS_PER_DEX, MIN_MONITOR_TVL_USD,
 };
 use helius::{check_http, subscribe_and_wait_for_update};
 use model::{Dex, PoolInfo};
 use rpc::{fetch_account_owners, fetch_accounts, verify_pool_accounts, PUBLIC_MAINNET_RPC};
-use token_account::{decode_spl_token_account, SPL_TOKEN_PROGRAM_ID};
+use token_account::{
+    decode_spl_token_account, decode_spl_token_mint, SPL_TOKEN_PROGRAM_ID,
+};
 use tokens::{tracked_tokens, Token, WSOL};
 
 const APP_NAME: &str = "solana-meme-arb";
 const RAYDIUM_QUOTE_TEST_INPUT_LAMPORTS: u64 = 10_000_000; // 0.01 WSOL
+const ORCA_QUOTE_TEST_INPUT_LAMPORTS: u64 = 10_000_000; // 0.01 WSOL
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -37,8 +49,11 @@ async fn main() -> Result<()> {
         "verify" => run_verify(&client).await,
         "helius-check" => run_helius_check(&client).await,
         "raydium-quote-check" => run_raydium_quote_check(&client).await,
+        "orca-quote-check" => run_orca_quote_check(&client).await,
         _ => {
-            println!("Usage: {APP_NAME} <discover|verify|helius-check|raydium-quote-check>");
+            println!(
+                "Usage: {APP_NAME} <discover|verify|helius-check|raydium-quote-check|orca-quote-check>"
+            );
             Ok(())
         }
     }
@@ -132,10 +147,7 @@ async fn run_helius_check(client: &Client) -> Result<()> {
 /// 真实读取 Raydium Standard 池及两个 vault，并用链上程序相同的 SwapBaseInV2 数学计算 0.01 WSOL 报价。
 async fn run_raydium_quote_check(client: &Client) -> Result<()> {
     let config = HeliusConfig::from_env()?;
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .context("system clock is before Unix epoch")?
-        .as_secs();
+    let now = unix_timestamp()?;
     let mut verified = 0usize;
 
     for token in tracked_tokens() {
@@ -250,6 +262,202 @@ async fn run_raydium_quote_check(client: &Client) -> Result<()> {
     Ok(())
 }
 
+/// 用 Orca 官方 Rust 解码器和 `orca_whirlpools_core` 报价引擎，真实验证 0.01 WSOL 的 Whirlpool 报价。
+async fn run_orca_quote_check(client: &Client) -> Result<()> {
+    let config = HeliusConfig::from_env()?;
+    let program_id = Pubkey::from_str(ORCA_WHIRLPOOL_PROGRAM_ID)
+        .context("invalid Orca Whirlpool program id")?;
+    let now = unix_timestamp()?;
+    let mut verified = 0usize;
+
+    for token in tracked_tokens() {
+        let (_, candidates) = discover_candidates(client, token).await?;
+        let pool = candidates.iter().find(|pool| {
+            pool.dex == Dex::Orca
+                && pool.program_id.as_deref() == Some(ORCA_WHIRLPOOL_PROGRAM_ID)
+        });
+        let Some(pool) = pool else {
+            println!("{}/WSOL: no selected Orca Whirlpool", token.symbol);
+            continue;
+        };
+
+        // 第一次只读取 Whirlpool，用它确定本次报价依赖哪些 TickArray / Oracle 地址。
+        let initial_batch = fetch_accounts(
+            client,
+            config.http_url().as_str(),
+            std::slice::from_ref(&pool.address),
+            None,
+        )
+        .await?;
+        let initial_account = initial_batch
+            .accounts
+            .first()
+            .and_then(Option::as_ref)
+            .with_context(|| format!("Orca Whirlpool account missing: {}", pool.address))?;
+        if initial_account.owner != ORCA_WHIRLPOOL_PROGRAM_ID {
+            bail!("Orca Whirlpool owner mismatch for {}", pool.address);
+        }
+        let initial_whirlpool = decode_whirlpool(&initial_account.data)?;
+        let pool_pubkey = Pubkey::from_str(&pool.address).context("invalid Orca pool address")?;
+        let initial_tick_indexes = tick_array_start_indexes(
+            initial_whirlpool.tick_current_index,
+            initial_whirlpool.tick_spacing,
+        );
+        let tick_addresses = initial_tick_indexes
+            .iter()
+            .map(|index| {
+                get_tick_array_address(&pool_pubkey, *index, Some(program_id))
+                    .map(|(address, _)| address.to_string())
+                    .map_err(|error| anyhow::anyhow!("failed to derive Orca TickArray PDA: {error}"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let adaptive_fee = needs_oracle(&initial_whirlpool);
+        let oracle_address = if adaptive_fee {
+            Some(
+                get_oracle_address(&pool_pubkey, Some(program_id))
+                    .map_err(|error| anyhow::anyhow!("failed to derive Orca Oracle PDA: {error}"))?
+                    .0
+                    .to_string(),
+            )
+        } else {
+            None
+        };
+
+        // 第二次把 Whirlpool 本身和所有报价依赖账户放进同一个 getMultipleAccounts，获得同一 context slot 的快照。
+        let mut snapshot_addresses = Vec::with_capacity(9);
+        snapshot_addresses.push(pool.address.clone());
+        snapshot_addresses.extend(tick_addresses.iter().cloned());
+        snapshot_addresses.push(initial_whirlpool.token_mint_a.to_string());
+        snapshot_addresses.push(initial_whirlpool.token_mint_b.to_string());
+        if let Some(address) = &oracle_address {
+            snapshot_addresses.push(address.clone());
+        }
+        let snapshot = fetch_accounts(
+            client,
+            config.http_url().as_str(),
+            &snapshot_addresses,
+            Some(initial_batch.slot),
+        )
+        .await?;
+        let accounts = &snapshot.accounts;
+        let expected_len = if adaptive_fee { 9 } else { 8 };
+        if accounts.len() != expected_len {
+            bail!(
+                "Orca snapshot account count mismatch: expected {}, got {}",
+                expected_len,
+                accounts.len()
+            );
+        }
+
+        let pool_account = accounts[0]
+            .as_ref()
+            .context("Orca snapshot Whirlpool account missing")?;
+        if pool_account.owner != ORCA_WHIRLPOOL_PROGRAM_ID {
+            bail!("Orca snapshot Whirlpool owner mismatch");
+        }
+        let whirlpool = decode_whirlpool(&pool_account.data)?;
+        let mint_a = whirlpool.token_mint_a.to_string();
+        let mint_b = whirlpool.token_mint_b.to_string();
+        if !pool.matches_pair(&mint_a, &mint_b) {
+            bail!("Orca decoded mints do not match discovery metadata for {}", pool.address);
+        }
+        let snapshot_tick_indexes =
+            tick_array_start_indexes(whirlpool.tick_current_index, whirlpool.tick_spacing);
+        if snapshot_tick_indexes != initial_tick_indexes {
+            bail!("Orca tick array dependency changed while building coherent snapshot; retry required");
+        }
+        if needs_oracle(&whirlpool) != adaptive_fee {
+            bail!("Orca adaptive-fee configuration changed while building snapshot");
+        }
+
+        let mut tick_facades = Vec::with_capacity(5);
+        for index in 0..5 {
+            if let Some(tick_account) = accounts[index + 1].as_ref() {
+                if tick_account.owner != ORCA_WHIRLPOOL_PROGRAM_ID {
+                    bail!("Orca TickArray owner mismatch at {}", tick_addresses[index]);
+                }
+            }
+            tick_facades.push(decode_tick_array_or_default(
+                accounts[index + 1].as_ref().map(|account| account.data.as_slice()),
+                snapshot_tick_indexes[index],
+            )?);
+        }
+        let tick_arrays: [TickArrayFacade; 5] = tick_facades
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("Orca snapshot did not produce exactly five TickArrays"))?;
+
+        let mint_a_account = accounts[6].as_ref().context("Orca token mint A missing")?;
+        let mint_b_account = accounts[7].as_ref().context("Orca token mint B missing")?;
+        if mint_a_account.owner != SPL_TOKEN_PROGRAM_ID || mint_b_account.owner != SPL_TOKEN_PROGRAM_ID {
+            bail!(
+                "Orca live quote currently requires classic SPL Token mints; Token-2022 transfer fees are not yet implemented"
+            );
+        }
+        let mint_a_state = decode_spl_token_mint(&mint_a_account.data)?;
+        let mint_b_state = decode_spl_token_mint(&mint_b_account.data)?;
+        if !mint_a_state.is_initialized || !mint_b_state.is_initialized {
+            bail!("Orca pool references an uninitialized SPL Token mint");
+        }
+
+        let oracle = if adaptive_fee {
+            let oracle_account = accounts[8].as_ref().context("Orca adaptive-fee Oracle missing")?;
+            if oracle_account.owner != ORCA_WHIRLPOOL_PROGRAM_ID {
+                bail!("Orca Oracle owner mismatch");
+            }
+            let oracle = decode_oracle(&oracle_account.data)?;
+            if oracle.whirlpool != pool_pubkey {
+                bail!("Orca Oracle points to a different Whirlpool");
+            }
+            Some(oracle.into())
+        } else {
+            None
+        };
+
+        let quote = quote_orca_exact_in(
+            &whirlpool,
+            tick_arrays,
+            oracle,
+            WSOL,
+            ORCA_QUOTE_TEST_INPUT_LAMPORTS,
+            now,
+        )?;
+        let output_decimals = if mint_a == WSOL {
+            mint_b_state.decimals
+        } else if mint_b == WSOL {
+            mint_a_state.decimals
+        } else {
+            bail!("selected Orca pool does not contain WSOL after decoding");
+        };
+        let output_ui = quote.token_est_out as f64 / 10_f64.powi(i32::from(output_decimals));
+
+        println!(
+            "{}/WSOL Orca Whirlpool verified: pool={} snapshot_slot={} tick_spacing={} fee_rate={} adaptive_fee={} input=0.01 WSOL output_raw={} output_ui={:.8}",
+            token.symbol,
+            pool.address,
+            snapshot.slot,
+            whirlpool.tick_spacing,
+            whirlpool.fee_rate,
+            adaptive_fee,
+            quote.token_est_out,
+            output_ui
+        );
+        verified += 1;
+    }
+
+    if verified == 0 {
+        bail!("no Orca Whirlpool was available for live quote verification");
+    }
+    println!("Orca Whirlpool local quote verification passed for {verified} tracked pair(s)");
+    Ok(())
+}
+
+fn unix_timestamp() -> Result<u64> {
+    Ok(SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before Unix epoch")?
+        .as_secs())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -260,7 +468,8 @@ mod tests {
     }
 
     #[test]
-    fn raydium_live_quote_probe_uses_point_zero_one_sol() {
+    fn live_quote_probes_use_point_zero_one_sol() {
         assert_eq!(RAYDIUM_QUOTE_TEST_INPUT_LAMPORTS, 10_000_000);
+        assert_eq!(ORCA_QUOTE_TEST_INPUT_LAMPORTS, 10_000_000);
     }
 }
