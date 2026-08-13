@@ -481,8 +481,7 @@ async fn run_meteora_quote_check(client: &Client) -> Result<()> {
     for token in tracked_tokens() {
         let (_, candidates) = discover_candidates(client, token).await?;
         let pool = candidates.iter().find(|pool| {
-            pool.dex == Dex::MeteoraDlmm
-                && pool.program_id.as_deref() == Some(DLMM_PROGRAM_ID)
+            pool.dex == Dex::MeteoraDlmm && pool.program_id.as_deref() == Some(DLMM_PROGRAM_ID)
         });
         let Some(pool) = pool else {
             println!("{}/WSOL: no selected Meteora DLMM pool", token.symbol);
@@ -491,13 +490,8 @@ async fn run_meteora_quote_check(client: &Client) -> Result<()> {
 
         let bitmap_address = bitmap_extension_address(&pool.address)?;
         let initial_addresses = vec![pool.address.clone(), bitmap_address.clone()];
-        let initial = fetch_accounts(
-            client,
-            config.http_url().as_str(),
-            &initial_addresses,
-            None,
-        )
-        .await?;
+        let initial =
+            fetch_accounts(client, config.http_url().as_str(), &initial_addresses, None).await?;
         if initial.accounts.len() != 2 {
             bail!("Meteora initial snapshot returned unexpected account count");
         }
