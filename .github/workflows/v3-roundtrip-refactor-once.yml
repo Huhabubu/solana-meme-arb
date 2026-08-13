@@ -1,0 +1,528 @@
+name: v3-roundtrip-refactor-once
+
+on:
+  push:
+    paths:
+      - '.github/workflows/v3-roundtrip-refactor-once.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  refactor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Refactor live quotes and add V3 round-trip check
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+
+          app_path = Path('src/app.rs')
+          text = app_path.read_text()
+
+          def replace_once(old, new):
+              global text
+              if text.count(old) != 1:
+                  raise SystemExit(f'expected exactly one match, got {text.count(old)} for: {old[:80]!r}')
+              text = text.replace(old, new, 1)
+
+          replace_once(
+              '    model::{Dex, PoolInfo},\n    rpc::{fetch_account_owners, fetch_accounts, verify_pool_accounts, PUBLIC_MAINNET_RPC},',
+              '    model::{Dex, PoolInfo},\n    opportunity::{evaluate_round_trip, SwapQuote},\n    rpc::{fetch_account_owners, fetch_accounts, verify_pool_accounts, PUBLIC_MAINNET_RPC},'
+          )
+          replace_once(
+              'const DEPENDENCY_WSS_WAIT_SECONDS: u64 = 45;\n',
+              'const DEPENDENCY_WSS_WAIT_SECONDS: u64 = 45;\nconst ROUND_TRIP_TEST_INPUT_LAMPORTS: u64 = 10_000_000;\n'
+          )
+          replace_once(
+              '    DependencyWssCheck,\n}',
+              '    DependencyWssCheck,\n    RoundTripCheck,\n}'
+          )
+          replace_once(
+              '        Some("dependency-wss-check") => Ok(Some(AppCommand::DependencyWssCheck)),\n',
+              '        Some("dependency-wss-check") => Ok(Some(AppCommand::DependencyWssCheck)),\n        Some("round-trip-check") => Ok(Some(AppCommand::RoundTripCheck)),\n'
+          )
+          replace_once(
+              '"Usage: {APP_NAME} <discover|verify|helius-check|raydium-quote-check|orca-quote-check|meteora-quote-check|dependency-wss-check>"',
+              '"Usage: {APP_NAME} <discover|verify|helius-check|raydium-quote-check|orca-quote-check|meteora-quote-check|dependency-wss-check|round-trip-check>"'
+          )
+          replace_once(
+              '        AppCommand::DependencyWssCheck => run_dependency_wss_check(&client).await,\n',
+              '        AppCommand::DependencyWssCheck => run_dependency_wss_check(&client).await,\n        AppCommand::RoundTripCheck => run_round_trip_check(&client).await,\n'
+          )
+
+          ray_start = text.index('async fn quote_raydium_pool(')
+          ray_end = text.index('async fn run_orca_quote_check', ray_start)
+          ray_block = r'''#[derive(Debug)]
+          struct RaydiumLiveQuote {
+              swap: SwapQuote,
+              pool_slot: u64,
+              vault_slot: u64,
+              swap_fee_numerator: u64,
+              swap_fee_denominator: u64,
+              output_decimals: u64,
+          }
+
+          async fn quote_raydium_pool(client: &Client, config: &HeliusConfig, pool: &PoolInfo) -> Result<()> {
+              let live = quote_raydium_pool_amount(
+                  client,
+                  config,
+                  pool,
+                  WSOL,
+                  RAYDIUM_QUOTE_TEST_INPUT_LAMPORTS,
+              )
+              .await?;
+              let output_ui = live.swap.amount_out as f64 / 10_f64.powi(live.output_decimals as i32);
+              println!(
+                  "{}/WSOL Raydium Standard verified: pool={} pool_slot={} vault_slot={} fee={}/{} input=0.01 WSOL output_raw={} output_ui={:.8}",
+                  token_symbol_for_pool(pool)?,
+                  pool.address,
+                  live.pool_slot,
+                  live.vault_slot,
+                  live.swap_fee_numerator,
+                  live.swap_fee_denominator,
+                  live.swap.amount_out,
+                  output_ui
+              );
+              Ok(())
+          }
+
+          async fn quote_raydium_pool_amount(
+              client: &Client,
+              config: &HeliusConfig,
+              pool: &PoolInfo,
+              input_mint: &str,
+              amount_in: u64,
+          ) -> Result<RaydiumLiveQuote> {
+              let pool_batch = fetch_accounts(
+                  client,
+                  config.http_url().as_str(),
+                  std::slice::from_ref(&pool.address),
+                  None,
+              )
+              .await?;
+              let pool_account = pool_batch
+                  .accounts
+                  .first()
+                  .and_then(Option::as_ref)
+                  .with_context(|| format!("Raydium pool account missing: {}", pool.address))?;
+              if pool_account.owner != RAYDIUM_AMM_V4_PROGRAM_ID {
+                  bail!("Raydium pool owner mismatch for {}", pool.address);
+              }
+              let state = decode_amm_v4(&pool_account.data)?;
+              if !pool.matches_pair(&state.coin_mint, &state.pc_mint) {
+                  bail!(
+                      "Raydium decoded mints do not match discovery metadata for {}",
+                      pool.address
+                  );
+              }
+
+              let vault_addresses = vec![state.coin_vault.clone(), state.pc_vault.clone()];
+              let vault_batch = fetch_accounts(
+                  client,
+                  config.http_url().as_str(),
+                  &vault_addresses,
+                  Some(pool_batch.slot),
+              )
+              .await?;
+              if vault_batch.accounts.len() != 2 {
+                  bail!("Raydium vault RPC returned unexpected account count");
+              }
+              let coin_vault_data = vault_batch.accounts[0]
+                  .as_ref()
+                  .context("Raydium coin vault missing")?;
+              let pc_vault_data = vault_batch.accounts[1]
+                  .as_ref()
+                  .context("Raydium pc vault missing")?;
+              if coin_vault_data.owner != SPL_TOKEN_PROGRAM_ID
+                  || pc_vault_data.owner != SPL_TOKEN_PROGRAM_ID
+              {
+                  bail!("Raydium AMM v4 vault is not owned by the classic SPL Token program");
+              }
+              let coin_vault = decode_spl_token_account(&coin_vault_data.data)?;
+              let pc_vault = decode_spl_token_account(&pc_vault_data.data)?;
+              if coin_vault.mint != state.coin_mint || pc_vault.mint != state.pc_mint {
+                  bail!("Raydium vault mint does not match decoded pool state");
+              }
+
+              let quote = quote_base_in(
+                  &state,
+                  coin_vault.amount,
+                  pc_vault.amount,
+                  input_mint,
+                  amount_in,
+                  unix_timestamp()?,
+              )?;
+              let output_decimals = if quote.output_mint == state.coin_mint {
+                  state.coin_decimals
+              } else {
+                  state.pc_decimals
+              };
+              let swap = SwapQuote::new(
+                  pool.dex,
+                  pool.address.clone(),
+                  quote.input_mint,
+                  quote.output_mint,
+                  quote.amount_in,
+                  quote.amount_out,
+                  pool_batch.slot,
+              )?;
+
+              Ok(RaydiumLiveQuote {
+                  swap,
+                  pool_slot: pool_batch.slot,
+                  vault_slot: vault_batch.slot,
+                  swap_fee_numerator: state.swap_fee_numerator,
+                  swap_fee_denominator: state.swap_fee_denominator,
+                  output_decimals,
+              })
+          }
+
+          '''
+          text = text[:ray_start] + ray_block + text[ray_end:]
+
+          orca_start = text.index('async fn quote_orca_pool(')
+          orca_end = text.index('async fn run_meteora_quote_check', orca_start)
+          orca_block = r'''#[derive(Debug)]
+          struct OrcaLiveQuote {
+              swap: SwapQuote,
+              tick_spacing: String,
+              fee_rate: String,
+              adaptive_fee: bool,
+              output_decimals: u8,
+          }
+
+          async fn quote_orca_pool(client: &Client, config: &HeliusConfig, pool: &PoolInfo) -> Result<()> {
+              let live = quote_orca_pool_amount(
+                  client,
+                  config,
+                  pool,
+                  WSOL,
+                  ORCA_QUOTE_TEST_INPUT_LAMPORTS,
+              )
+              .await?;
+              let output_ui =
+                  live.swap.amount_out as f64 / 10_f64.powi(i32::from(live.output_decimals));
+              println!(
+                  "{}/WSOL Orca Whirlpool verified: pool={} snapshot_slot={} tick_spacing={} fee_rate={} adaptive_fee={} input=0.01 WSOL output_raw={} output_ui={:.8}",
+                  token_symbol_for_pool(pool)?,
+                  pool.address,
+                  live.swap.snapshot_slot,
+                  live.tick_spacing,
+                  live.fee_rate,
+                  live.adaptive_fee,
+                  live.swap.amount_out,
+                  output_ui
+              );
+              Ok(())
+          }
+
+          async fn quote_orca_pool_amount(
+              client: &Client,
+              config: &HeliusConfig,
+              pool: &PoolInfo,
+              input_mint: &str,
+              amount_in: u64,
+          ) -> Result<OrcaLiveQuote> {
+              let program_id = Pubkey::from_str(ORCA_WHIRLPOOL_PROGRAM_ID)
+                  .context("invalid Orca Whirlpool program id")?;
+              let initial_batch = fetch_accounts(
+                  client,
+                  config.http_url().as_str(),
+                  std::slice::from_ref(&pool.address),
+                  None,
+              )
+              .await?;
+              let initial_account = initial_batch
+                  .accounts
+                  .first()
+                  .and_then(Option::as_ref)
+                  .with_context(|| format!("Orca Whirlpool account missing: {}", pool.address))?;
+              if initial_account.owner != ORCA_WHIRLPOOL_PROGRAM_ID {
+                  bail!("Orca Whirlpool owner mismatch for {}", pool.address);
+              }
+              let initial_whirlpool = decode_whirlpool(&initial_account.data)?;
+              let pool_pubkey = Pubkey::from_str(&pool.address).context("invalid Orca pool address")?;
+              let initial_tick_indexes = tick_array_start_indexes(
+                  initial_whirlpool.tick_current_index,
+                  initial_whirlpool.tick_spacing,
+              );
+              let tick_addresses = initial_tick_indexes
+                  .iter()
+                  .map(|index| {
+                      get_tick_array_address(&pool_pubkey, *index, Some(program_id))
+                          .map(|(address, _)| address.to_string())
+                          .map_err(|error| anyhow::anyhow!("failed to derive Orca TickArray PDA: {error}"))
+                  })
+                  .collect::<Result<Vec<_>>>()?;
+              let adaptive_fee = needs_oracle(&initial_whirlpool);
+              let oracle_address = if adaptive_fee {
+                  Some(
+                      get_oracle_address(&pool_pubkey, Some(program_id))
+                          .map_err(|error| anyhow::anyhow!("failed to derive Orca Oracle PDA: {error}"))?
+                          .0
+                          .to_string(),
+                  )
+              } else {
+                  None
+              };
+
+              let mut snapshot_addresses = Vec::with_capacity(9);
+              snapshot_addresses.push(pool.address.clone());
+              snapshot_addresses.extend(tick_addresses.iter().cloned());
+              snapshot_addresses.push(initial_whirlpool.token_mint_a.to_string());
+              snapshot_addresses.push(initial_whirlpool.token_mint_b.to_string());
+              if let Some(address) = &oracle_address {
+                  snapshot_addresses.push(address.clone());
+              }
+              let snapshot = fetch_accounts(
+                  client,
+                  config.http_url().as_str(),
+                  &snapshot_addresses,
+                  Some(initial_batch.slot),
+              )
+              .await?;
+              let accounts = &snapshot.accounts;
+              let expected_len = if adaptive_fee { 9 } else { 8 };
+              if accounts.len() != expected_len {
+                  bail!("Orca snapshot account count mismatch");
+              }
+
+              let pool_account = accounts[0]
+                  .as_ref()
+                  .context("Orca snapshot Whirlpool account missing")?;
+              if pool_account.owner != ORCA_WHIRLPOOL_PROGRAM_ID {
+                  bail!("Orca snapshot Whirlpool owner mismatch");
+              }
+              let whirlpool = decode_whirlpool(&pool_account.data)?;
+              let mint_a = whirlpool.token_mint_a.to_string();
+              let mint_b = whirlpool.token_mint_b.to_string();
+              if !pool.matches_pair(&mint_a, &mint_b) {
+                  bail!(
+                      "Orca decoded mints do not match discovery metadata for {}",
+                      pool.address
+                  );
+              }
+              let snapshot_tick_indexes =
+                  tick_array_start_indexes(whirlpool.tick_current_index, whirlpool.tick_spacing);
+              if snapshot_tick_indexes != initial_tick_indexes {
+                  bail!(
+                      "Orca tick array dependency changed while building coherent snapshot; retry required"
+                  );
+              }
+              if needs_oracle(&whirlpool) != adaptive_fee {
+                  bail!("Orca adaptive-fee configuration changed while building snapshot");
+              }
+
+              let mut tick_facades = Vec::with_capacity(5);
+              for index in 0..5 {
+                  if let Some(tick_account) = accounts[index + 1].as_ref() {
+                      if tick_account.owner != ORCA_WHIRLPOOL_PROGRAM_ID {
+                          bail!("Orca TickArray owner mismatch at {}", tick_addresses[index]);
+                      }
+                  }
+                  tick_facades.push(decode_tick_array_or_default(
+                      accounts[index + 1]
+                          .as_ref()
+                          .map(|account| account.data.as_slice()),
+                      snapshot_tick_indexes[index],
+                  )?);
+              }
+              let tick_arrays: [TickArrayFacade; 5] = tick_facades
+                  .try_into()
+                  .map_err(|_| anyhow::anyhow!("Orca snapshot did not produce exactly five TickArrays"))?;
+
+              let mint_a_account = accounts[6].as_ref().context("Orca token mint A missing")?;
+              let mint_b_account = accounts[7].as_ref().context("Orca token mint B missing")?;
+              if mint_a_account.owner != SPL_TOKEN_PROGRAM_ID
+                  || mint_b_account.owner != SPL_TOKEN_PROGRAM_ID
+              {
+                  bail!("Orca live quote currently requires classic SPL Token mints");
+              }
+              let mint_a_state = decode_spl_token_mint(&mint_a_account.data)?;
+              let mint_b_state = decode_spl_token_mint(&mint_b_account.data)?;
+              if !mint_a_state.is_initialized || !mint_b_state.is_initialized {
+                  bail!("Orca pool references an uninitialized SPL Token mint");
+              }
+
+              let oracle = if adaptive_fee {
+                  let oracle_account = accounts[8]
+                      .as_ref()
+                      .context("Orca adaptive-fee Oracle missing")?;
+                  if oracle_account.owner != ORCA_WHIRLPOOL_PROGRAM_ID {
+                      bail!("Orca Oracle owner mismatch");
+                  }
+                  let oracle = decode_oracle(&oracle_account.data)?;
+                  if oracle.whirlpool != pool_pubkey {
+                      bail!("Orca Oracle points to a different Whirlpool");
+                  }
+                  Some(oracle.into())
+              } else {
+                  None
+              };
+
+              let quote = quote_orca_exact_in(
+                  &whirlpool,
+                  tick_arrays,
+                  oracle,
+                  input_mint,
+                  amount_in,
+                  unix_timestamp()?,
+              )?;
+              let (output_mint, output_decimals) = if input_mint == mint_a {
+                  (mint_b, mint_b_state.decimals)
+              } else if input_mint == mint_b {
+                  (mint_a, mint_a_state.decimals)
+              } else {
+                  bail!("Orca input mint is not part of the decoded pool");
+              };
+              let swap = SwapQuote::new(
+                  pool.dex,
+                  pool.address.clone(),
+                  input_mint,
+                  output_mint,
+                  amount_in,
+                  quote.token_est_out,
+                  snapshot.slot,
+              )?;
+
+              Ok(OrcaLiveQuote {
+                  swap,
+                  tick_spacing: whirlpool.tick_spacing.to_string(),
+                  fee_rate: whirlpool.fee_rate.to_string(),
+                  adaptive_fee,
+                  output_decimals,
+              })
+          }
+
+          async fn run_round_trip_check(client: &Client) -> Result<()> {
+              let config = HeliusConfig::from_env()?;
+              let mut verified_routes = 0usize;
+
+              for token in tracked_tokens() {
+                  let (_, candidates) = discover_candidates(client, token).await?;
+                  let pools = supported_quote_pools(&candidates);
+                  let raydium = pools
+                      .iter()
+                      .find(|pool| pool.dex == Dex::Raydium)
+                      .with_context(|| format!("{}/WSOL has no supported Raydium Standard pool", token.symbol))?;
+                  let orca = pools
+                      .iter()
+                      .find(|pool| pool.dex == Dex::Orca)
+                      .with_context(|| format!("{}/WSOL has no supported Orca Whirlpool", token.symbol))?;
+
+                  let first = quote_raydium_pool_amount(
+                      client,
+                      &config,
+                      raydium,
+                      WSOL,
+                      ROUND_TRIP_TEST_INPUT_LAMPORTS,
+                  )
+                  .await?;
+                  let second = quote_orca_pool_amount(
+                      client,
+                      &config,
+                      orca,
+                      token.mint,
+                      first.swap.amount_out,
+                  )
+                  .await?;
+                  let raydium_to_orca = evaluate_round_trip(&first.swap, &second.swap)?;
+                  if raydium_to_orca.base_mint != WSOL
+                      || raydium_to_orca.intermediate_mint != token.mint
+                  {
+                      bail!("Raydium->Orca round trip produced unexpected mints");
+                  }
+                  println!(
+                      "{}/WSOL V3 round trip verified: Raydium->Orca input={} token_out={} final={} gross_profit_raw={} gross_return_bps={} slots={}..{}",
+                      token.symbol,
+                      raydium_to_orca.input_amount,
+                      raydium_to_orca.intermediate_amount,
+                      raydium_to_orca.final_amount,
+                      raydium_to_orca.gross_profit_raw,
+                      raydium_to_orca.gross_return_bps,
+                      raydium_to_orca.oldest_slot,
+                      raydium_to_orca.newest_slot
+                  );
+                  verified_routes += 1;
+
+                  let first = quote_orca_pool_amount(
+                      client,
+                      &config,
+                      orca,
+                      WSOL,
+                      ROUND_TRIP_TEST_INPUT_LAMPORTS,
+                  )
+                  .await?;
+                  let second = quote_raydium_pool_amount(
+                      client,
+                      &config,
+                      raydium,
+                      token.mint,
+                      first.swap.amount_out,
+                  )
+                  .await?;
+                  let orca_to_raydium = evaluate_round_trip(&first.swap, &second.swap)?;
+                  if orca_to_raydium.base_mint != WSOL
+                      || orca_to_raydium.intermediate_mint != token.mint
+                  {
+                      bail!("Orca->Raydium round trip produced unexpected mints");
+                  }
+                  println!(
+                      "{}/WSOL V3 round trip verified: Orca->Raydium input={} token_out={} final={} gross_profit_raw={} gross_return_bps={} slots={}..{}",
+                      token.symbol,
+                      orca_to_raydium.input_amount,
+                      orca_to_raydium.intermediate_amount,
+                      orca_to_raydium.final_amount,
+                      orca_to_raydium.gross_profit_raw,
+                      orca_to_raydium.gross_return_bps,
+                      orca_to_raydium.oldest_slot,
+                      orca_to_raydium.newest_slot
+                  );
+                  verified_routes += 1;
+              }
+
+              let expected_routes = tracked_tokens().len() * 2;
+              if verified_routes != expected_routes {
+                  bail!(
+                      "V3 round-trip verification count mismatch: expected {expected_routes}, got {verified_routes}"
+                  );
+              }
+              println!("V3 Raydium/Orca two-leg round-trip verification passed for {verified_routes} routes");
+              Ok(())
+          }
+
+          '''
+          text = text[:orca_start] + orca_block + text[orca_end:]
+
+          replace_once(
+              '        assert_eq!(\n            parse_command(Some("dependency-wss-check")).unwrap(),\n            Some(AppCommand::DependencyWssCheck)\n        );',
+              '        assert_eq!(\n            parse_command(Some("dependency-wss-check")).unwrap(),\n            Some(AppCommand::DependencyWssCheck)\n        );\n        assert_eq!(\n            parse_command(Some("round-trip-check")).unwrap(),\n            Some(AppCommand::RoundTripCheck)\n        );'
+          )
+          replace_once(
+              '        assert_eq!(METEORA_BIN_ARRAY_TAKE_COUNT, 3);\n',
+              '        assert_eq!(METEORA_BIN_ARRAY_TAKE_COUNT, 3);\n        assert_eq!(ROUND_TRIP_TEST_INPUT_LAMPORTS, 10_000_000);\n'
+          )
+
+          app_path.write_text(text)
+
+          ci_path = Path('.github/workflows/ci.yml')
+          ci = ci_path.read_text()
+          marker = '''      # V2 最后一层：订阅真正参与报价的 Pool/Vault/TickArray/BinArray 等依赖账户，\n'''
+          if ci.count(marker) != 1:
+              raise SystemExit('CI insertion marker mismatch')
+          step = '''      # V3 第一层：真实计算 Raydium/Orca 双方向两腿闭环，允许结果为负但必须完成金额与 Mint 连续性校验。\n      - name: Live V3 Raydium Orca round-trip verification\n        if: github.event_name == 'push' && github.ref == 'refs/heads/main'\n        timeout-minutes: 3\n        env:\n          HELIUS_API_KEY: ${{ secrets.HELIUS_API_KEY }}\n        run: |\n          if [ -z "$HELIUS_API_KEY" ]; then\n            echo "HELIUS_API_KEY secret is not configured; V3 round-trip verification skipped."\n            exit 0\n          fi\n          cargo run -- round-trip-check\n\n'''
+          ci = ci.replace(marker, step + marker, 1)
+          ci_path.write_text(ci)
+          PY
+
+      - name: Commit refactor
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/app.rs .github/workflows/ci.yml
+          git diff --cached --quiet && { echo "No V3 refactor changes produced"; exit 1; }
+          git commit -m "feat: add live V3 Raydium Orca round trip"
+          git push
