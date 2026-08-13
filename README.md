@@ -12,7 +12,7 @@
 |---|---|---|
 | Stage 0 | 仓库、Rust 工程骨架、GitHub Actions CI | ✅ 已完成并验证 |
 | V0 | BONK / WIF 跨 DEX 池发现与链上账户核验 | ✅ 已完成并验证 |
-| V1 | Helius RPC/WSS 实时池账户订阅 | 🔄 代码层已验证，真实 Helius 连接待 Secret 注入 |
+| V1 | Helius RPC/WSS 实时池账户订阅 | 🔄 Secret 已配置，真实 Helius 端到端验证已触发 |
 | V2 | DEX Pool State 解析与本地 Swap Quote | ⏳ 未开始 |
 | V3 | 跨池套利机会计算、记录与统计 | ⏳ 未开始 |
 | V4 | 原子交易构造与 `simulateTransaction` | ⏳ 未开始 |
@@ -70,9 +70,10 @@ GitHub Actions 已在真实 runner 上完成：
 - `tokio-tungstenite 0.30.0` 已在实际 GitHub Runner / Rust `1.97.1` 上编译通过。
 - Helius 配置读取、HTTP `getVersion` 响应解析、`accountSubscribe` 请求构造、订阅确认解析、`accountNotification` 解析、`subscription id ↔ PoolInfo` 映射均有单元测试覆盖。
 - WSS 逻辑要求：全部候选池收到订阅确认，并且至少收到一个真实账户更新，才允许端到端函数返回成功。
-- 当前 **尚未完成真实 Helius HTTP/WSS 验证**。本次 CI 日志明确输出：`HELIUS_API_KEY secret is not configured; V1 live verification skipped.`
+- 上一次 CI **尚未完成真实 Helius HTTP/WSS 验证**，日志明确输出：`HELIUS_API_KEY secret is not configured; V1 live verification skipped.`
+- 2026-08-13 用户已配置 `HELIUS_API_KEY` Repository Secret；新的真实端到端验证已通过本次 README 提交触发。结果出来前仍不把 V1 标记为完成。
 
-因此当前 CI 总体为绿色，只能说明已执行的代码/测试通过，**不能据此宣称 V1 已完成或 Helius 实时订阅已经验证成功**。
+因此只有新的 Helius 真实联网步骤成功后，才能宣称 V1 完成。
 
 ### V0 监控候选筛选规则
 
@@ -150,9 +151,9 @@ V1 首次完整编译后，`clippy -D warnings` 拒绝了“先 `is_some()` 再 
 ## 当前问题 / 阻塞 / 风险
 
 - 当前开发主要依赖 GitHub Actions 进行 Rust 编译和真实联网测试，因为本次 ChatGPT 执行环境没有可直接使用的 Rust toolchain。
-- **V1 当前唯一硬阻塞：GitHub Actions 还没有配置名为 `HELIUS_API_KEY` 的 Repository Secret。** GitHub 连接器没有创建 Actions Secret 的能力，因此不能由当前自动化接口安全代填。
+- `HELIUS_API_KEY` Repository Secret 已由用户配置；当前正在等待新的真实 Helius HTTP/WSS 端到端测试结果。
 - `actions/checkout@v4` 当前在 GitHub runner 上有 Node.js 20 弃用警告；GitHub 当前强制使用 Node 24，本项目 CI 仍成功。后续单独处理，不与套利业务逻辑混改。
-- 用户提供的临时 Helius API Key **尚未写入仓库，也尚未提交到 Git 历史，也尚未被真实 Helius 测试使用**。
+- 用户提供的临时 Helius API Key **没有写入仓库，也没有提交到 Git 历史**；仅由 GitHub Actions Secret 在运行时注入。
 - DEX REST API 的 TVL 属于动态外部数据，不能视为链上实时成交价格。
 - 当前只证明“V0 完整链路 + V1 协议/代码逻辑”有效，**没有任何证据证明套利策略可盈利**。
 
@@ -160,13 +161,12 @@ V1 首次完整编译后，`clippy -D warnings` 拒绝了“先 `is_some()` 再 
 
 V1 剩余步骤：
 
-1. 将临时 Key 安全配置为 GitHub Actions Repository Secret：`HELIUS_API_KEY`。
-2. 触发 `cargo run -- helius-check`。
-3. 真实验证 Helius HTTP `getVersion`。
-4. 真实建立 Helius WSS 连接并订阅当前候选池。
-5. 要求全部订阅得到确认，并至少收到一个真实 `accountNotification`。
-6. 核对通知能够通过 `subscription id` 映射回正确 Pool Account / DEX。
-7. 端到端测试通过后才把 V1 标记为完成，然后进入 V2。
+1. 等待本次 `cargo run -- helius-check` 的真实结果。
+2. 真实验证 Helius HTTP `getVersion`。
+3. 真实建立 Helius WSS 连接并订阅当前候选池。
+4. 要求全部订阅得到确认，并至少收到一个真实 `accountNotification`。
+5. 核对通知能够通过 `subscription id` 映射回正确 Pool Account / DEX。
+6. 端到端测试通过后才把 V1 标记为完成，然后进入 V2。
 
 ## 开发与记录约定
 
@@ -202,4 +202,4 @@ V1 剩余步骤：
 - V1 Helius 配置、HTTP/WSS 协议层与订阅映射逻辑已实现。
 - V1 当前单元测试提升至 **34 passed / 0 failed**。
 - 修复 V1 `clippy` 的不必要 `expect` 问题。
-- V1 真实 Helius 测试因 `HELIUS_API_KEY` Repository Secret 尚未配置而明确跳过，阶段保持进行中。
+- 用户已配置 `HELIUS_API_KEY` Repository Secret；已触发新的 V1 Helius 真实联网验证，等待实际结果。
