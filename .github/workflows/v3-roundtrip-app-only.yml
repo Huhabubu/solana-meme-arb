@@ -1,0 +1,39 @@
+name: v3-roundtrip-app-only
+
+on:
+  push:
+    paths:
+      - '.github/workflows/v3-roundtrip-app-only.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  refactor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Reuse generated V3 app refactor
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+
+          workflow = Path('.github/workflows/v3-roundtrip-refactor-once.yml').read_text()
+          start_marker = "          python3 <<'PY'\n"
+          end_marker = "\n          PY\n"
+          start = workflow.index(start_marker) + len(start_marker)
+          end = workflow.index(end_marker, start)
+          lines = workflow[start:end].splitlines()
+          script = '\n'.join(line[10:] if line.startswith('          ') else line for line in lines)
+          exec(compile(script, 'v3-refactor.py', 'exec'))
+          PY
+
+      - name: Commit app only
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/app.rs
+          git diff --cached --quiet && { echo "No app.rs changes produced"; exit 1; }
+          git commit -m "feat: add live V3 Raydium Orca round trip"
+          git push
