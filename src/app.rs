@@ -35,7 +35,7 @@ use crate::{
     },
     helius::{check_http, subscribe_accounts_and_wait_for_update, subscribe_and_wait_for_update},
     model::{Dex, PoolInfo},
-    opportunity::{directed_route_indices, evaluate_round_trip, SwapQuote},
+    opportunity::{directed_route_indices, evaluate_round_trip_curve, SwapQuote},
     rpc::{fetch_account_owners, fetch_accounts, verify_pool_accounts, PUBLIC_MAINNET_RPC},
     state::{DependencyKind, PoolDependencies, QuoteState, VersionedAccountData},
     token_account::{decode_spl_token_account, decode_spl_token_mint, SPL_TOKEN_PROGRAM_ID},
@@ -48,7 +48,7 @@ const ORCA_QUOTE_TEST_INPUT_LAMPORTS: u64 = 10_000_000;
 const METEORA_QUOTE_TEST_INPUT_LAMPORTS: u64 = 10_000_000;
 const METEORA_BIN_ARRAY_TAKE_COUNT: u8 = 3;
 const DEPENDENCY_WSS_WAIT_SECONDS: u64 = 45;
-const ROUND_TRIP_TEST_INPUT_LAMPORTS: u64 = 10_000_000;
+const ROUND_TRIP_PROBE_LAMPORTS: [u64; 3] = [10_000_000, 50_000_000, 100_000_000];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AppCommand {
@@ -278,6 +278,22 @@ async fn quote_raydium_pool_amount(
     input_mint: &str,
     amount_in: u64,
 ) -> Result<RaydiumLiveQuote> {
+    quote_raydium_pool_amounts(client, config, pool, input_mint, &[amount_in])
+        .await?
+        .pop()
+        .context("Raydium single-amount quote batch returned no result")
+}
+
+async fn quote_raydium_pool_amounts(
+    client: &Client,
+    config: &HeliusConfig,
+    pool: &PoolInfo,
+    input_mint: &str,
+    amounts_in: &[u64],
+) -> Result<Vec<RaydiumLiveQuote>> {
+    if amounts_in.is_empty() {
+        bail!("Raydium quote batch must contain at least one amount");
+    }
     let pool_batch = fetch_accounts(
         client,
         config.http_url().as_str(),
@@ -328,37 +344,41 @@ async fn quote_raydium_pool_amount(
         bail!("Raydium vault mint does not match decoded pool state");
     }
 
-    let quote = quote_base_in(
-        &state,
-        coin_vault.amount,
-        pc_vault.amount,
-        input_mint,
-        amount_in,
-        unix_timestamp()?,
-    )?;
-    let output_decimals = if quote.output_mint == state.coin_mint {
-        state.coin_decimals
-    } else {
-        state.pc_decimals
-    };
-    let swap = SwapQuote::new(
-        pool.dex,
-        pool.address.clone(),
-        quote.input_mint,
-        quote.output_mint,
-        quote.amount_in,
-        quote.amount_out,
-        pool_batch.slot,
-    )?;
-
-    Ok(RaydiumLiveQuote {
-        swap,
-        pool_slot: pool_batch.slot,
-        vault_slot: vault_batch.slot,
-        swap_fee_numerator: state.swap_fee_numerator,
-        swap_fee_denominator: state.swap_fee_denominator,
-        output_decimals,
-    })
+    let timestamp = unix_timestamp()?;
+    let mut results = Vec::with_capacity(amounts_in.len());
+    for &amount_in in amounts_in {
+        let quote = quote_base_in(
+            &state,
+            coin_vault.amount,
+            pc_vault.amount,
+            input_mint,
+            amount_in,
+            timestamp,
+        )?;
+        let output_decimals = if quote.output_mint == state.coin_mint {
+            state.coin_decimals
+        } else {
+            state.pc_decimals
+        };
+        let swap = SwapQuote::new(
+            pool.dex,
+            pool.address.clone(),
+            quote.input_mint,
+            quote.output_mint,
+            quote.amount_in,
+            quote.amount_out,
+            pool_batch.slot,
+        )?;
+        results.push(RaydiumLiveQuote {
+            swap,
+            pool_slot: pool_batch.slot,
+            vault_slot: vault_batch.slot,
+            swap_fee_numerator: state.swap_fee_numerator,
+            swap_fee_denominator: state.swap_fee_denominator,
+            output_decimals,
+        });
+    }
+    Ok(results)
 }
 
 async fn run_orca_quote_check(client: &Client) -> Result<()> {
@@ -415,6 +435,22 @@ async fn quote_orca_pool_amount(
     input_mint: &str,
     amount_in: u64,
 ) -> Result<OrcaLiveQuote> {
+    quote_orca_pool_amounts(client, config, pool, input_mint, &[amount_in])
+        .await?
+        .pop()
+        .context("Orca single-amount quote batch returned no result")
+}
+
+async fn quote_orca_pool_amounts(
+    client: &Client,
+    config: &HeliusConfig,
+    pool: &PoolInfo,
+    input_mint: &str,
+    amounts_in: &[u64],
+) -> Result<Vec<OrcaLiveQuote>> {
+    if amounts_in.is_empty() {
+        bail!("Orca quote batch must contain at least one amount");
+    }
     let program_id =
         Pubkey::from_str(ORCA_WHIRLPOOL_PROGRAM_ID).context("invalid Orca Whirlpool program id")?;
     let initial_batch = fetch_accounts(
@@ -551,14 +587,6 @@ async fn quote_orca_pool_amount(
         None
     };
 
-    let quote = quote_orca_exact_in(
-        &whirlpool,
-        tick_arrays,
-        oracle,
-        input_mint,
-        amount_in,
-        unix_timestamp()?,
-    )?;
     let (output_mint, output_decimals) = if input_mint == mint_a {
         (mint_b, mint_b_state.decimals)
     } else if input_mint == mint_b {
@@ -566,48 +594,66 @@ async fn quote_orca_pool_amount(
     } else {
         bail!("Orca input mint is not part of the decoded pool");
     };
-    let swap = SwapQuote::new(
-        pool.dex,
-        pool.address.clone(),
-        input_mint,
-        output_mint,
-        amount_in,
-        quote.token_est_out,
-        snapshot.slot,
-    )?;
-
-    Ok(OrcaLiveQuote {
-        swap,
-        tick_spacing: whirlpool.tick_spacing.to_string(),
-        fee_rate: whirlpool.fee_rate.to_string(),
-        adaptive_fee,
-        output_decimals,
-    })
+    let timestamp = unix_timestamp()?;
+    let mut results = Vec::with_capacity(amounts_in.len());
+    for &amount_in in amounts_in {
+        let quote = quote_orca_exact_in(
+            &whirlpool,
+            tick_arrays.clone(),
+            oracle.clone(),
+            input_mint,
+            amount_in,
+            timestamp,
+        )?;
+        let swap = SwapQuote::new(
+            pool.dex,
+            pool.address.clone(),
+            input_mint,
+            output_mint.clone(),
+            amount_in,
+            quote.token_est_out,
+            snapshot.slot,
+        )?;
+        results.push(OrcaLiveQuote {
+            swap,
+            tick_spacing: whirlpool.tick_spacing.to_string(),
+            fee_rate: whirlpool.fee_rate.to_string(),
+            adaptive_fee,
+            output_decimals,
+        });
+    }
+    Ok(results)
 }
 
-async fn quote_supported_pool_amount(
+async fn quote_supported_pool_amounts(
     client: &Client,
     config: &HeliusConfig,
     pool: &PoolInfo,
     input_mint: &str,
-    amount_in: u64,
-) -> Result<SwapQuote> {
+    amounts_in: &[u64],
+) -> Result<Vec<SwapQuote>> {
     match pool.dex {
-        Dex::Raydium => Ok(
-            quote_raydium_pool_amount(client, config, pool, input_mint, amount_in)
-                .await?
-                .swap,
-        ),
-        Dex::Orca => Ok(
-            quote_orca_pool_amount(client, config, pool, input_mint, amount_in)
-                .await?
-                .swap,
-        ),
-        Dex::MeteoraDlmm => Ok(quote_meteora_pool_amount(
-            client, config, pool, input_mint, amount_in,
+        Dex::Raydium => Ok(quote_raydium_pool_amounts(
+            client, config, pool, input_mint, amounts_in,
         )
         .await?
-        .swap),
+        .into_iter()
+        .map(|quote| quote.swap)
+        .collect()),
+        Dex::Orca => Ok(
+            quote_orca_pool_amounts(client, config, pool, input_mint, amounts_in)
+                .await?
+                .into_iter()
+                .map(|quote| quote.swap)
+                .collect(),
+        ),
+        Dex::MeteoraDlmm => Ok(quote_meteora_pool_amounts(
+            client, config, pool, input_mint, amounts_in,
+        )
+        .await?
+        .into_iter()
+        .map(|quote| quote.swap)
+        .collect()),
         Dex::MeteoraDammV2 => {
             bail!("Meteora DAMM v2 is not part of the V3 quoteable universe")
         }
@@ -617,6 +663,7 @@ async fn quote_supported_pool_amount(
 async fn run_round_trip_check(client: &Client) -> Result<()> {
     let config = HeliusConfig::from_env()?;
     let mut verified_routes = 0usize;
+    let mut verified_points = 0usize;
 
     for token in tracked_tokens() {
         let (_, candidates) = discover_candidates(client, token).await?;
@@ -640,50 +687,93 @@ async fn run_round_trip_check(client: &Client) -> Result<()> {
         for (first_index, second_index) in routes {
             let first_pool = &pools[first_index];
             let second_pool = &pools[second_index];
-            let first = quote_supported_pool_amount(
+            let first_legs = quote_supported_pool_amounts(
                 client,
                 &config,
                 first_pool,
                 WSOL,
-                ROUND_TRIP_TEST_INPUT_LAMPORTS,
+                &ROUND_TRIP_PROBE_LAMPORTS,
             )
             .await?;
-            let second = quote_supported_pool_amount(
+            let first_slot = first_legs
+                .first()
+                .context("V3 first-leg quote batch is empty")?
+                .snapshot_slot;
+            if first_legs
+                .iter()
+                .any(|quote| quote.snapshot_slot != first_slot)
+            {
+                bail!("V3 first-leg curve mixed multiple snapshots");
+            }
+            let intermediate_inputs = first_legs
+                .iter()
+                .map(|quote| quote.amount_out)
+                .collect::<Vec<_>>();
+            let second_legs = quote_supported_pool_amounts(
                 client,
                 &config,
                 second_pool,
                 token.mint,
-                first.amount_out,
+                &intermediate_inputs,
             )
             .await?;
-            let opportunity = evaluate_round_trip(&first, &second)?;
-            if opportunity.base_mint != WSOL || opportunity.intermediate_mint != token.mint {
-                bail!("V3 round trip produced unexpected mints");
+            let second_slot = second_legs
+                .first()
+                .context("V3 second-leg quote batch is empty")?
+                .snapshot_slot;
+            if second_legs
+                .iter()
+                .any(|quote| quote.snapshot_slot != second_slot)
+            {
+                bail!("V3 second-leg curve mixed multiple snapshots");
+            }
+            let curve = evaluate_round_trip_curve(&first_legs, &second_legs)?;
+            if curve.len() != ROUND_TRIP_PROBE_LAMPORTS.len() {
+                bail!("V3 round-trip curve point count mismatch");
+            }
+
+            for opportunity in &curve {
+                if opportunity.base_mint != WSOL || opportunity.intermediate_mint != token.mint {
+                    bail!("V3 round trip produced unexpected mints");
+                }
+                println!(
+                    "{}/WSOL V3 curve point: {}->{} input={} token_out={} final={} gross_profit_raw={} gross_return_ppm={} slots={}..{}",
+                    token.symbol,
+                    first_pool.dex,
+                    second_pool.dex,
+                    opportunity.input_amount,
+                    opportunity.intermediate_amount,
+                    opportunity.final_amount,
+                    opportunity.gross_profit_raw,
+                    opportunity.gross_return_ppm,
+                    opportunity.oldest_slot,
+                    opportunity.newest_slot
+                );
+                verified_points += 1;
             }
             println!(
-                "{}/WSOL V3 round trip verified: {}->{} input={} token_out={} final={} gross_profit_raw={} gross_return_bps={} slots={}..{}",
+                "{}/WSOL V3 curve verified: {}->{} points={} first_slot={} second_slot={}",
                 token.symbol,
                 first_pool.dex,
                 second_pool.dex,
-                opportunity.input_amount,
-                opportunity.intermediate_amount,
-                opportunity.final_amount,
-                opportunity.gross_profit_raw,
-                opportunity.gross_return_bps,
-                opportunity.oldest_slot,
-                opportunity.newest_slot
+                curve.len(),
+                first_slot,
+                second_slot
             );
             verified_routes += 1;
         }
     }
 
     let expected_routes = tracked_tokens().len() * 6;
-    if verified_routes != expected_routes {
+    let expected_points = expected_routes * ROUND_TRIP_PROBE_LAMPORTS.len();
+    if verified_routes != expected_routes || verified_points != expected_points {
         bail!(
-            "V3 round-trip verification count mismatch: expected {expected_routes}, got {verified_routes}"
+            "V3 curve verification count mismatch: expected {expected_routes} routes/{expected_points} points, got {verified_routes}/{verified_points}"
         );
     }
-    println!("V3 all-DEX two-leg round-trip verification passed for {verified_routes} routes");
+    println!(
+        "V3 all-DEX multi-size round-trip verification passed for {verified_routes} routes and {verified_points} points"
+    );
     Ok(())
 }
 
@@ -768,6 +858,22 @@ async fn quote_meteora_pool_amount(
     input_mint: &str,
     amount_in: u64,
 ) -> Result<MeteoraLiveQuote> {
+    quote_meteora_pool_amounts(client, config, pool, input_mint, &[amount_in])
+        .await?
+        .pop()
+        .context("Meteora single-amount quote batch returned no result")
+}
+
+async fn quote_meteora_pool_amounts(
+    client: &Client,
+    config: &HeliusConfig,
+    pool: &PoolInfo,
+    input_mint: &str,
+    amounts_in: &[u64],
+) -> Result<Vec<MeteoraLiveQuote>> {
+    if amounts_in.is_empty() {
+        bail!("Meteora quote batch must contain at least one amount");
+    }
     let bitmap_address = bitmap_extension_address(&pool.address)?;
     let initial_addresses = vec![pool.address.clone(), bitmap_address.clone()];
     let initial =
@@ -886,21 +992,7 @@ async fn quote_meteora_pool_amount(
         }
         bin_entries.push((address.clone(), decode_bin_array(&account.data)?));
     }
-    let quote = quote_meteora_exact_in(
-        &pool.address,
-        &lb_pair,
-        amount_in,
-        snapshot_swap_for_y,
-        build_bin_array_map(bin_entries)?,
-        bitmap.as_ref(),
-        &clock,
-        &quote_mint_x,
-        &quote_mint_y,
-    )?;
-    if quote.amount_out == 0 {
-        bail!("Meteora official quote returned zero output");
-    }
-
+    let bin_arrays = build_bin_array_map(bin_entries)?;
     let (output_mint, output_account) = if snapshot_swap_for_y {
         (mint_y, mint_y_account)
     } else {
@@ -911,25 +1003,43 @@ async fn quote_meteora_pool_amount(
     } else {
         None
     };
-    let swap = SwapQuote::new(
-        pool.dex,
-        pool.address.clone(),
-        input_mint,
-        output_mint,
-        amount_in,
-        quote.amount_out,
-        snapshot.slot,
-    )?;
 
-    Ok(MeteoraLiveQuote {
-        swap,
-        active_id: lb_pair.active_id,
-        bin_array_count: snapshot_bin_addresses.len(),
-        swap_for_y: snapshot_swap_for_y,
-        fee: quote.fee,
-        protocol_fee: quote.protocol_fee,
-        output_decimals,
-    })
+    let mut results = Vec::with_capacity(amounts_in.len());
+    for &amount_in in amounts_in {
+        let quote = quote_meteora_exact_in(
+            &pool.address,
+            &lb_pair,
+            amount_in,
+            snapshot_swap_for_y,
+            bin_arrays.clone(),
+            bitmap.as_ref(),
+            &clock,
+            &quote_mint_x,
+            &quote_mint_y,
+        )?;
+        if quote.amount_out == 0 {
+            bail!("Meteora official quote returned zero output");
+        }
+        let swap = SwapQuote::new(
+            pool.dex,
+            pool.address.clone(),
+            input_mint,
+            output_mint.clone(),
+            amount_in,
+            quote.amount_out,
+            snapshot.slot,
+        )?;
+        results.push(MeteoraLiveQuote {
+            swap,
+            active_id: lb_pair.active_id,
+            bin_array_count: snapshot_bin_addresses.len(),
+            swap_for_y: snapshot_swap_for_y,
+            fee: quote.fee,
+            protocol_fee: quote.protocol_fee,
+            output_decimals,
+        });
+    }
+    Ok(results)
 }
 
 async fn build_pool_dependencies(
@@ -1332,6 +1442,9 @@ mod tests {
         assert_eq!(ORCA_QUOTE_TEST_INPUT_LAMPORTS, 10_000_000);
         assert_eq!(METEORA_QUOTE_TEST_INPUT_LAMPORTS, 10_000_000);
         assert_eq!(METEORA_BIN_ARRAY_TAKE_COUNT, 3);
-        assert_eq!(ROUND_TRIP_TEST_INPUT_LAMPORTS, 10_000_000);
+        assert_eq!(
+            ROUND_TRIP_PROBE_LAMPORTS,
+            [10_000_000, 50_000_000, 100_000_000]
+        );
     }
 }
