@@ -137,7 +137,10 @@ pub async fn fetch_accounts(
     parse_full_accounts_response(&body)
 }
 
-fn build_full_accounts_request(addresses: &[String], min_context_slot: Option<u64>) -> Result<Value> {
+fn build_full_accounts_request(
+    addresses: &[String],
+    min_context_slot: Option<u64>,
+) -> Result<Value> {
     if addresses.len() > 100 {
         bail!("getMultipleAccounts supports at most 100 addresses per request");
     }
@@ -297,7 +300,9 @@ mod tests {
 
     #[test]
     fn full_account_request_rejects_more_than_100_addresses() {
-        let addresses = (0..101).map(|i| format!("address-{i}")).collect::<Vec<_>>();
+        let addresses = (0..101)
+            .map(|i| format!("address-{i}"))
+            .collect::<Vec<_>>();
         assert!(build_full_accounts_request(&addresses, None).is_err());
     }
 
