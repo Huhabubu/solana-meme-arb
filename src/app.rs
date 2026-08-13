@@ -747,8 +747,8 @@ async fn run_round_trip_check(client: &Client) -> Result<()> {
             let mut curve_indices = Vec::new();
             for ((index, first_quote), second_point) in first_indices
                 .into_iter()
-                .zip(first_available.into_iter())
-                .zip(second_points.into_iter())
+                .zip(first_available)
+                .zip(second_points)
             {
                 if let Some(second_quote) = second_point {
                     curve_indices.push(index);
