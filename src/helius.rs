@@ -1,7 +1,8 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use futures_util::{SinkExt, StreamExt};
 use reqwest::Client;
 use serde::Deserialize;
@@ -19,6 +20,15 @@ pub struct AccountUpdate {
     pub pool: PoolInfo,
     pub subscription_id: u64,
     pub slot: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawAccountUpdate {
+    pub address: String,
+    pub subscription_id: u64,
+    pub slot: u64,
+    pub owner: String,
+    pub data: Vec<u8>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -48,6 +58,8 @@ enum ServerEvent {
     AccountNotification {
         subscription_id: u64,
         slot: u64,
+        owner: String,
+        data: Vec<u8>,
     },
     RpcError {
         request_id: Option<u64>,
@@ -57,37 +69,44 @@ enum ServerEvent {
     Other,
 }
 
-struct SubscriptionTracker {
-    pending: HashMap<u64, PoolInfo>,
-    active: HashMap<u64, PoolInfo>,
+struct AddressSubscriptionTracker {
+    pending: HashMap<u64, String>,
+    active: HashMap<u64, String>,
 }
 
-impl SubscriptionTracker {
-    fn new(pools: &[PoolInfo]) -> Self {
-        let pending = pools
-            .iter()
-            .enumerate()
-            .map(|(index, pool)| ((index + 1) as u64, pool.clone()))
-            .collect();
-        Self {
+impl AddressSubscriptionTracker {
+    fn new(addresses: &[String]) -> Result<Self> {
+        let mut seen = HashSet::new();
+        let mut pending = HashMap::with_capacity(addresses.len());
+        for (index, address) in addresses.iter().enumerate() {
+            if address.trim().is_empty() {
+                bail!("cannot subscribe to an empty account address");
+            }
+            if !seen.insert(address.clone()) {
+                bail!("duplicate account subscription address: {address}");
+            }
+            pending.insert((index + 1) as u64, address.clone());
+        }
+        Ok(Self {
             pending,
             active: HashMap::new(),
-        }
+        })
     }
 
     fn acknowledge(&mut self, request_id: u64, subscription_id: u64) -> Result<()> {
-        let pool = self.pending.remove(&request_id).with_context(|| {
+        let address = self.pending.remove(&request_id).with_context(|| {
             format!("unknown or duplicate subscription request id {request_id}")
         })?;
-        if self.active.insert(subscription_id, pool).is_some() {
+        if self.active.insert(subscription_id, address).is_some() {
             bail!("duplicate subscription id {subscription_id}");
         }
         Ok(())
     }
 
-    fn resolve(&self, subscription_id: u64) -> Result<&PoolInfo> {
+    fn resolve(&self, subscription_id: u64) -> Result<&str> {
         self.active
             .get(&subscription_id)
+            .map(String::as_str)
             .with_context(|| format!("notification for unknown subscription id {subscription_id}"))
     }
 
@@ -173,6 +192,29 @@ fn parse_server_event(text: &str) -> Result<ServerEvent> {
         let params = value
             .get("params")
             .context("accountNotification missing params")?;
+        let account = params
+            .pointer("/result/value")
+            .context("accountNotification missing account value")?;
+        let owner = account
+            .get("owner")
+            .and_then(Value::as_str)
+            .context("accountNotification missing owner")?
+            .to_owned();
+        let encoded = account
+            .pointer("/data/0")
+            .and_then(Value::as_str)
+            .context("accountNotification missing base64 data")?;
+        let encoding = account
+            .pointer("/data/1")
+            .and_then(Value::as_str)
+            .context("accountNotification missing data encoding")?;
+        if encoding != "base64" {
+            bail!("unsupported Helius accountNotification encoding: {encoding}");
+        }
+        let data = BASE64
+            .decode(encoded)
+            .context("invalid base64 Helius accountNotification data")?;
+
         return Ok(ServerEvent::AccountNotification {
             subscription_id: params
                 .get("subscription")
@@ -182,6 +224,8 @@ fn parse_server_event(text: &str) -> Result<ServerEvent> {
                 .pointer("/result/context/slot")
                 .and_then(Value::as_u64)
                 .context("accountNotification missing slot")?,
+            owner,
+            data,
         });
     }
 
@@ -199,25 +243,34 @@ fn parse_server_event(text: &str) -> Result<ServerEvent> {
     Ok(ServerEvent::Other)
 }
 
-/// 订阅全部候选池；只有全部收到订阅确认且至少收到一次真实账户更新后才返回成功。
-pub async fn subscribe_and_wait_for_update(
+/// 通用账户订阅：全部订阅确认后，等待 accepted_addresses 中任意账户出现真实更新。
+/// accepted_addresses 为空时接受任意已订阅地址。
+pub async fn subscribe_accounts_and_wait_for_update(
     config: &HeliusConfig,
-    pools: &[PoolInfo],
+    addresses: &[String],
+    accepted_addresses: &HashSet<String>,
     wait_timeout: Duration,
-) -> Result<AccountUpdate> {
-    if pools.is_empty() {
-        bail!("cannot subscribe to an empty pool list");
+) -> Result<RawAccountUpdate> {
+    if addresses.is_empty() {
+        bail!("cannot subscribe to an empty account list");
+    }
+    if !accepted_addresses.is_empty()
+        && accepted_addresses
+            .iter()
+            .any(|address| !addresses.contains(address))
+    {
+        bail!("accepted account set contains an address that is not subscribed");
     }
 
     let wss_url = config.wss_url();
     let (mut socket, _) = connect_async(wss_url.as_str())
         .await
         .map_err(|_| anyhow::anyhow!("Helius WSS connection failed"))?;
-    let mut tracker = SubscriptionTracker::new(pools);
+    let mut tracker = AddressSubscriptionTracker::new(addresses)?;
 
-    for (index, pool) in pools.iter().enumerate() {
+    for (index, address) in addresses.iter().enumerate() {
         let request_id = (index + 1) as u64;
-        let request = build_account_subscribe_request(request_id, &pool.address);
+        let request = build_account_subscribe_request(request_id, address);
         socket
             .send(Message::Text(request.into()))
             .await
@@ -225,11 +278,11 @@ pub async fn subscribe_and_wait_for_update(
     }
 
     timeout(wait_timeout, async {
-        let mut first_update: Option<AccountUpdate> = None;
+        let mut first_accepted_update: Option<RawAccountUpdate> = None;
 
         loop {
             if tracker.all_acknowledged() {
-                if let Some(update) = first_update.take() {
+                if let Some(update) = first_accepted_update.take() {
                     return Ok(update);
                 }
             }
@@ -237,7 +290,7 @@ pub async fn subscribe_and_wait_for_update(
             let message = socket
                 .next()
                 .await
-                .context("Helius WSS closed before V1 verification completed")?
+                .context("Helius WSS closed before account subscription verification completed")?
                 .map_err(|_| anyhow::anyhow!("Helius WSS receive error"))?;
 
             match message {
@@ -249,13 +302,21 @@ pub async fn subscribe_and_wait_for_update(
                     ServerEvent::AccountNotification {
                         subscription_id,
                         slot,
+                        owner,
+                        data,
                     } => {
-                        let pool = tracker.resolve(subscription_id)?.clone();
-                        first_update.get_or_insert(AccountUpdate {
-                            pool,
-                            subscription_id,
-                            slot,
-                        });
+                        let address = tracker.resolve(subscription_id)?.to_owned();
+                        let accepted = accepted_addresses.is_empty()
+                            || accepted_addresses.contains(&address);
+                        if accepted {
+                            first_accepted_update.get_or_insert(RawAccountUpdate {
+                                address,
+                                subscription_id,
+                                slot,
+                                owner,
+                                data,
+                            });
+                        }
                     }
                     ServerEvent::RpcError {
                         request_id,
@@ -266,7 +327,9 @@ pub async fn subscribe_and_wait_for_update(
                     }
                     ServerEvent::Other => {}
                 },
-                Message::Close(_) => bail!("Helius WSS closed before V1 verification completed"),
+                Message::Close(_) => {
+                    bail!("Helius WSS closed before account subscription verification completed")
+                }
                 Message::Ping(payload) => {
                     socket
                         .send(Message::Pong(payload))
@@ -278,7 +341,40 @@ pub async fn subscribe_and_wait_for_update(
         }
     })
     .await
-    .context("timed out waiting for Helius subscriptions and account update")?
+    .context("timed out waiting for Helius subscriptions and accepted account update")?
+}
+
+/// V1 回归包装：继续保持“Pool Account → PoolInfo”的旧接口和验收语义。
+pub async fn subscribe_and_wait_for_update(
+    config: &HeliusConfig,
+    pools: &[PoolInfo],
+    wait_timeout: Duration,
+) -> Result<AccountUpdate> {
+    if pools.is_empty() {
+        bail!("cannot subscribe to an empty pool list");
+    }
+    let addresses = pools
+        .iter()
+        .map(|pool| pool.address.clone())
+        .collect::<Vec<_>>();
+    let update = subscribe_accounts_and_wait_for_update(
+        config,
+        &addresses,
+        &HashSet::new(),
+        wait_timeout,
+    )
+    .await?;
+    let pool = pools
+        .iter()
+        .find(|pool| pool.address == update.address)
+        .context("V1 account update did not map back to a PoolInfo")?
+        .clone();
+
+    Ok(AccountUpdate {
+        pool,
+        subscription_id: update.subscription_id,
+        slot: update.slot,
+    })
 }
 
 #[cfg(test)]
@@ -334,19 +430,42 @@ mod tests {
     }
 
     #[test]
-    fn parses_account_notification() {
-        let text = r#"{
-            "jsonrpc":"2.0",
-            "method":"accountNotification",
-            "params":{"result":{"context":{"slot":999},"value":{}},"subscription":123}
-        }"#;
+    fn parses_account_notification_with_owner_and_data() {
+        let encoded = BASE64.encode([1u8, 2, 3]);
+        let text = format!(
+            r#"{{
+                "jsonrpc":"2.0",
+                "method":"accountNotification",
+                "params":{{
+                    "result":{{"context":{{"slot":999}},"value":{{"owner":"program","data":["{encoded}","base64"]}}}},
+                    "subscription":123
+                }}
+            }}"#
+        );
         assert_eq!(
-            parse_server_event(text).unwrap(),
+            parse_server_event(&text).unwrap(),
             ServerEvent::AccountNotification {
                 subscription_id: 123,
-                slot: 999
+                slot: 999,
+                owner: "program".into(),
+                data: vec![1, 2, 3]
             }
         );
+    }
+
+    #[test]
+    fn rejects_account_notification_with_wrong_encoding_or_bad_base64() {
+        let wrong_encoding = r#"{
+            "method":"accountNotification",
+            "params":{"result":{"context":{"slot":1},"value":{"owner":"p","data":["abc","base58"]}},"subscription":1}
+        }"#;
+        assert!(parse_server_event(wrong_encoding).is_err());
+
+        let bad_base64 = r#"{
+            "method":"accountNotification",
+            "params":{"result":{"context":{"slot":1},"value":{"owner":"p","data":["%%%","base64"]}},"subscription":1}
+        }"#;
+        assert!(parse_server_event(bad_base64).is_err());
     }
 
     #[test]
@@ -366,31 +485,39 @@ mod tests {
     }
 
     #[test]
-    fn tracker_maps_request_to_subscription_and_pool() {
-        let pools = vec![pool("pool-a"), pool("pool-b")];
-        let mut tracker = SubscriptionTracker::new(&pools);
+    fn address_tracker_maps_request_to_subscription_and_address() {
+        let addresses = vec!["account-a".to_owned(), "account-b".to_owned()];
+        let mut tracker = AddressSubscriptionTracker::new(&addresses).unwrap();
         assert!(!tracker.all_acknowledged());
 
         tracker.acknowledge(1, 101).unwrap();
         tracker.acknowledge(2, 202).unwrap();
         assert!(tracker.all_acknowledged());
-        assert_eq!(tracker.resolve(101).unwrap().address, "pool-a");
-        assert_eq!(tracker.resolve(202).unwrap().address, "pool-b");
+        assert_eq!(tracker.resolve(101).unwrap(), "account-a");
+        assert_eq!(tracker.resolve(202).unwrap(), "account-b");
     }
 
     #[test]
-    fn tracker_rejects_unknown_request_and_subscription() {
-        let pools = vec![pool("pool-a")];
-        let mut tracker = SubscriptionTracker::new(&pools);
+    fn address_tracker_rejects_duplicate_empty_and_unknown_entries() {
+        assert!(AddressSubscriptionTracker::new(&["".into()]).is_err());
+        assert!(AddressSubscriptionTracker::new(&["a".into(), "a".into()]).is_err());
+
+        let addresses = vec!["account-a".to_owned()];
+        let mut tracker = AddressSubscriptionTracker::new(&addresses).unwrap();
         assert!(tracker.acknowledge(99, 101).is_err());
         assert!(tracker.resolve(999).is_err());
     }
 
     #[test]
-    fn tracker_rejects_duplicate_subscription_id() {
-        let pools = vec![pool("pool-a"), pool("pool-b")];
-        let mut tracker = SubscriptionTracker::new(&pools);
+    fn address_tracker_rejects_duplicate_subscription_id() {
+        let addresses = vec!["account-a".to_owned(), "account-b".to_owned()];
+        let mut tracker = AddressSubscriptionTracker::new(&addresses).unwrap();
         tracker.acknowledge(1, 101).unwrap();
         assert!(tracker.acknowledge(2, 101).is_err());
+    }
+
+    #[test]
+    fn pool_fixture_remains_valid_for_v1_wrapper() {
+        assert_eq!(pool("pool-a").address, "pool-a");
     }
 }
