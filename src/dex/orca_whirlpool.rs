@@ -1,7 +1,9 @@
 use std::str::FromStr;
 
 use anyhow::{bail, Context, Result};
-use orca_whirlpools_client::{TickArray, Whirlpool, WHIRLPOOL_DISCRIMINATOR};
+use orca_whirlpools_client::{
+    Oracle, TickArray, Whirlpool, ORACLE_DISCRIMINATOR, WHIRLPOOL_DISCRIMINATOR,
+};
 use orca_whirlpools_core::{
     get_tick_array_start_tick_index, swap_quote_by_input_token, ExactInSwapQuote, OracleFacade,
     TickArrayFacade, TickFacade, TICK_ARRAY_SIZE,
@@ -24,6 +26,22 @@ pub fn decode_whirlpool(data: &[u8]) -> Result<Whirlpool> {
     }
 
     Whirlpool::from_bytes(data).context("failed to decode Orca Whirlpool account")
+}
+
+/// Adaptive Fee 池的 Oracle 也使用 Orca 官方生成的账户解码器。
+pub fn decode_oracle(data: &[u8]) -> Result<Oracle> {
+    if data.len() != Oracle::LEN {
+        bail!(
+            "Orca Oracle account length mismatch: expected {}, got {}",
+            Oracle::LEN,
+            data.len()
+        );
+    }
+    if data.get(..8) != Some(ORACLE_DISCRIMINATOR.as_slice()) {
+        bail!("Orca Oracle discriminator mismatch");
+    }
+
+    Oracle::from_bytes(data).context("failed to decode Orca Oracle account")
 }
 
 /// Orca 官方高层 SDK 为一个 swap 同时准备当前 TickArray、向上两个和向下两个，共 5 个数组。
@@ -86,7 +104,7 @@ pub fn quote_exact_in(
     } else {
         bail!("input mint is not part of this Orca Whirlpool");
     };
-
+n
     swap_quote_by_input_token(
         amount_in,
         specified_token_a,
@@ -126,7 +144,19 @@ mod tests {
         let mut wrong_discriminator = vec![0u8; Whirlpool::LEN];
         wrong_discriminator[..8].copy_from_slice(&[1u8; 8]);
         assert!(decode_whirlpool(&wrong_discriminator).is_err());
-        assert!(decode_whirlpool(&vec![0u8; Whirlpool::LEN - 1]).is_err());
+        assert!(decode_whirlpool(&[0u8; Whirlpool::LEN - 1]).is_err());
+    }
+
+    #[test]
+    fn decodes_official_oracle_layout_and_rejects_bad_header() {
+        let mut data = vec![0u8; Oracle::LEN];
+        data[..8].copy_from_slice(&ORACLE_DISCRIMINATOR);
+        let oracle = decode_oracle(&data).unwrap();
+        assert_eq!(oracle.discriminator, ORACLE_DISCRIMINATOR);
+
+        data[0] ^= 1;
+        assert!(decode_oracle(&data).is_err());
+        assert!(decode_oracle(&[0u8; Oracle::LEN - 1]).is_err());
     }
 
     #[test]
