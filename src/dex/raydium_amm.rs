@@ -110,8 +110,7 @@ pub fn quote_base_in(
         bail!("Raydium AMM v4 pool status does not currently allow swaps");
     }
 
-    let (coin_reserve, pc_reserve) =
-        effective_reserves(state, coin_vault_amount, pc_vault_amount)?;
+    let (coin_reserve, pc_reserve) = effective_reserves(state, coin_vault_amount, pc_vault_amount)?;
     let fee_amount = ceil_fraction(
         amount_in,
         state.swap_fee_numerator,
@@ -269,7 +268,10 @@ mod tests {
     #[test]
     fn effective_reserves_subtract_pending_pnl() {
         let state = sample_state();
-        assert_eq!(effective_reserves(&state, 10_000, 20_000).unwrap(), (9_900, 19_800));
+        assert_eq!(
+            effective_reserves(&state, 10_000, 20_000).unwrap(),
+            (9_900, 19_800)
+        );
         assert!(effective_reserves(&state, 99, 20_000).is_err());
     }
 
