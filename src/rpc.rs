@@ -1,12 +1,19 @@
+use std::time::Duration;
+
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use tokio::time::sleep;
 
 use crate::model::PoolInfo;
 
 pub const PUBLIC_MAINNET_RPC: &str = "https://api.mainnet-beta.solana.com";
+
+const MIN_CONTEXT_SLOT_NOT_REACHED_CODE: i64 = -32016;
+const FULL_ACCOUNT_MAX_ATTEMPTS: usize = 3;
+const MIN_CONTEXT_SLOT_RETRY_BASE_MS: u64 = 200;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccountData {
@@ -105,6 +112,9 @@ pub async fn fetch_account_owners(
 }
 
 /// 读取完整账户字节。错误信息刻意不携带 rpc_url，避免 Helius API Key 被 reqwest 错误链打印。
+///
+/// `-32016` 表示节点还没有追上调用方要求的 `minContextSlot`。这种情况下允许短暂、有限重试，
+/// 但每次都复用完全相同的请求，因此不会降低 `minContextSlot` 或回退读取旧状态。
 pub async fn fetch_accounts(
     client: &Client,
     rpc_url: &str,
@@ -119,22 +129,33 @@ pub async fn fetch_accounts(
     }
 
     let request = build_full_accounts_request(addresses, min_context_slot)?;
-    let response = client
-        .post(rpc_url)
-        .json(&request)
-        .send()
-        .await
-        .map_err(|_| anyhow::anyhow!("Solana RPC full-account request failed"))?;
-    let status = response.status();
-    if !status.is_success() {
-        bail!("Solana RPC full-account request returned status {status}");
-    }
-    let body = response
-        .text()
-        .await
-        .map_err(|_| anyhow::anyhow!("failed to read Solana RPC full-account response"))?;
+    for attempt in 0..FULL_ACCOUNT_MAX_ATTEMPTS {
+        let response = client
+            .post(rpc_url)
+            .json(&request)
+            .send()
+            .await
+            .map_err(|_| anyhow::anyhow!("Solana RPC full-account request failed"))?;
+        let status = response.status();
+        if !status.is_success() {
+            bail!("Solana RPC full-account request returned status {status}");
+        }
+        let body = response
+            .text()
+            .await
+            .map_err(|_| anyhow::anyhow!("failed to read Solana RPC full-account response"))?;
 
-    parse_full_accounts_response(&body)
+        if let Some(code) = full_accounts_rpc_error_code(&body) {
+            if should_retry_min_context_slot_error(code, attempt, min_context_slot.is_some()) {
+                sleep(Duration::from_millis(retry_delay_ms(attempt))).await;
+                continue;
+            }
+        }
+
+        return parse_full_accounts_response(&body);
+    }
+
+    unreachable!("the final fetch_accounts attempt always returns instead of retrying")
 }
 
 fn build_full_accounts_request(
@@ -159,6 +180,27 @@ fn build_full_accounts_request(
         "method": "getMultipleAccounts",
         "params": [addresses, config]
     }))
+}
+
+fn full_accounts_rpc_error_code(body: &str) -> Option<i64> {
+    serde_json::from_str::<FullRpcEnvelope>(body)
+        .ok()?
+        .error
+        .map(|error| error.code)
+}
+
+fn should_retry_min_context_slot_error(
+    code: i64,
+    attempt: usize,
+    has_min_context_slot: bool,
+) -> bool {
+    has_min_context_slot
+        && code == MIN_CONTEXT_SLOT_NOT_REACHED_CODE
+        && attempt + 1 < FULL_ACCOUNT_MAX_ATTEMPTS
+}
+
+fn retry_delay_ms(attempt: usize) -> u64 {
+    MIN_CONTEXT_SLOT_RETRY_BASE_MS * (attempt as u64 + 1)
 }
 
 fn parse_account_owners(body: &str) -> Result<Vec<Option<String>>> {
@@ -302,6 +344,25 @@ mod tests {
     fn full_account_request_rejects_more_than_100_addresses() {
         let addresses = (0..101).map(|i| format!("address-{i}")).collect::<Vec<_>>();
         assert!(build_full_accounts_request(&addresses, None).is_err());
+    }
+
+    #[test]
+    fn retry_policy_is_narrow_and_bounded() {
+        assert!(should_retry_min_context_slot_error(-32016, 0, true));
+        assert!(should_retry_min_context_slot_error(-32016, 1, true));
+        assert!(!should_retry_min_context_slot_error(-32016, 2, true));
+        assert!(!should_retry_min_context_slot_error(-32016, 0, false));
+        assert!(!should_retry_min_context_slot_error(-32602, 0, true));
+        assert_eq!(retry_delay_ms(0), 200);
+        assert_eq!(retry_delay_ms(1), 400);
+    }
+
+    #[test]
+    fn extracts_full_account_rpc_error_code_without_hiding_parse_errors() {
+        let lagging = r#"{"jsonrpc":"2.0","error":{"code":-32016,"message":"Minimum context slot has not been reached"},"id":1}"#;
+        assert_eq!(full_accounts_rpc_error_code(lagging), Some(-32016));
+        assert_eq!(full_accounts_rpc_error_code("not-json"), None);
+        assert!(parse_full_accounts_response("not-json").is_err());
     }
 
     #[test]
