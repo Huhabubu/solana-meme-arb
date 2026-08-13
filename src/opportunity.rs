@@ -1,4 +1,4 @@
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 
 use crate::model::Dex;
 
@@ -68,6 +68,48 @@ pub struct RoundTripOpportunity {
     pub newest_slot: u64,
 }
 
+/// V3 只负责“把已经估计出的执行成本正确计入净利润”。
+/// DEX swap fee 已经反映在两腿 Quote 的输出里，因此这里禁止再放 DEX fee，避免重复扣费。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExecutionCost {
+    pub base_fee_lamports: u64,
+    pub priority_fee_lamports: u64,
+    pub jito_tip_lamports: u64,
+    pub other_lamports: u64,
+}
+
+impl ExecutionCost {
+    pub const ZERO: Self = Self {
+        base_fee_lamports: 0,
+        priority_fee_lamports: 0,
+        jito_tip_lamports: 0,
+        other_lamports: 0,
+    };
+
+    pub fn total_lamports(self) -> Result<u64> {
+        self.base_fee_lamports
+            .checked_add(self.priority_fee_lamports)
+            .and_then(|value| value.checked_add(self.jito_tip_lamports))
+            .and_then(|value| value.checked_add(self.other_lamports))
+            .context("execution cost overflow")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetOpportunity {
+    pub round_trip: RoundTripOpportunity,
+    pub execution_cost: ExecutionCost,
+    pub execution_cost_lamports: u64,
+    pub net_profit_raw: i128,
+    pub net_return_ppm: i128,
+}
+
+impl NetOpportunity {
+    pub fn is_profitable(&self) -> bool {
+        self.net_profit_raw > 0
+    }
+}
+
 /// 为 N 个不同池生成全部有向两池路径索引；每个池都可以作为第一腿或第二腿，
 /// 但同一池不会和自己组成套利闭环。
 pub fn directed_route_indices(pool_count: usize) -> Vec<(usize, usize)> {
@@ -83,7 +125,7 @@ pub fn directed_route_indices(pool_count: usize) -> Vec<(usize, usize)> {
 }
 
 /// 评估两腿 exact-input 闭环。DEX swap fee 已经包含在各腿 Quote 输出中；
-/// 这里的 gross profit 只是不再扣 Priority Fee / Jito Tip 等执行成本。
+/// 这里的 gross profit 还没有扣 Priority Fee / Jito Tip 等执行成本。
 pub fn evaluate_round_trip(
     first_leg: &SwapQuote,
     second_leg: &SwapQuote,
@@ -121,6 +163,28 @@ pub fn evaluate_round_trip(
     })
 }
 
+/// 把独立的执行成本模型应用到已经验证过的两腿闭环。
+/// 成本以 lamports 计，因此只适用于当前以 WSOL/SOL 为 base asset 的研究路径。
+pub fn apply_execution_cost(
+    round_trip: &RoundTripOpportunity,
+    execution_cost: ExecutionCost,
+) -> Result<NetOpportunity> {
+    let execution_cost_lamports = execution_cost.total_lamports()?;
+    let net_profit_raw = round_trip
+        .gross_profit_raw
+        .checked_sub(i128::from(execution_cost_lamports))
+        .context("net profit overflow")?;
+    let net_return_ppm = scaled_return(net_profit_raw, round_trip.input_amount, 1_000_000)?;
+
+    Ok(NetOpportunity {
+        round_trip: round_trip.clone(),
+        execution_cost,
+        execution_cost_lamports,
+        net_profit_raw,
+        net_return_ppm,
+    })
+}
+
 /// 同一路径的多金额曲线按索引成对验算。每个点仍复用 `evaluate_round_trip` 的
 /// Mint、金额连续性与不同 Pool 校验，不允许批量接口绕过单点安全条件。
 pub fn evaluate_round_trip_curve(
@@ -148,7 +212,7 @@ fn scaled_return(profit_raw: i128, input_amount: u64, scale: i128) -> Result<i12
     profit_raw
         .checked_mul(scale)
         .map(|value| value / i128::from(input_amount))
-        .ok_or_else(|| anyhow::anyhow!("scaled return overflow"))
+        .context("scaled return overflow")
 }
 
 #[cfg(test)]
@@ -176,6 +240,20 @@ mod tests {
         .unwrap()
     }
 
+    fn profitable_round_trip() -> RoundTripOpportunity {
+        let first = quote(Dex::Orca, "orca", "SOL", "TOKEN", 1_000_000, 2_000_000, 100);
+        let second = quote(
+            Dex::Raydium,
+            "raydium",
+            "TOKEN",
+            "SOL",
+            2_000_000,
+            1_010_000,
+            103,
+        );
+        evaluate_round_trip(&first, &second).unwrap()
+    }
+
     #[test]
     fn swap_quote_constructor_rejects_invalid_identity_and_amounts() {
         assert!(SwapQuote::new(Dex::Raydium, "", "A", "B", 1, 1, 1).is_err());
@@ -197,18 +275,7 @@ mod tests {
 
     #[test]
     fn evaluates_profitable_round_trip_and_preserves_slot_range() {
-        let first = quote(Dex::Orca, "orca", "SOL", "TOKEN", 1_000_000, 2_000_000, 100);
-        let second = quote(
-            Dex::Raydium,
-            "raydium",
-            "TOKEN",
-            "SOL",
-            2_000_000,
-            1_010_000,
-            103,
-        );
-
-        let opportunity = evaluate_round_trip(&first, &second).unwrap();
+        let opportunity = profitable_round_trip();
         assert_eq!(opportunity.base_mint, "SOL");
         assert_eq!(opportunity.intermediate_mint, "TOKEN");
         assert_eq!(opportunity.input_amount, 1_000_000);
@@ -243,6 +310,71 @@ mod tests {
         assert_eq!(opportunity.gross_return_ppm, -10_000);
         assert_eq!(opportunity.oldest_slot, 9);
         assert_eq!(opportunity.newest_slot, 10);
+    }
+
+    #[test]
+    fn execution_cost_totals_components_and_detects_overflow() {
+        let cost = ExecutionCost {
+            base_fee_lamports: 5_000,
+            priority_fee_lamports: 2_000,
+            jito_tip_lamports: 1_000,
+            other_lamports: 500,
+        };
+        assert_eq!(cost.total_lamports().unwrap(), 8_500);
+
+        let overflow = ExecutionCost {
+            base_fee_lamports: u64::MAX,
+            priority_fee_lamports: 1,
+            jito_tip_lamports: 0,
+            other_lamports: 0,
+        };
+        assert!(overflow.total_lamports().is_err());
+    }
+
+    #[test]
+    fn zero_execution_cost_preserves_gross_profit() {
+        let gross = profitable_round_trip();
+        let net = apply_execution_cost(&gross, ExecutionCost::ZERO).unwrap();
+        assert_eq!(net.execution_cost_lamports, 0);
+        assert_eq!(net.net_profit_raw, gross.gross_profit_raw);
+        assert_eq!(net.net_return_ppm, gross.gross_return_ppm);
+        assert!(net.is_profitable());
+    }
+
+    #[test]
+    fn execution_cost_can_turn_gross_profit_into_net_loss() {
+        let gross = profitable_round_trip();
+        let cost = ExecutionCost {
+            base_fee_lamports: 5_000,
+            priority_fee_lamports: 3_000,
+            jito_tip_lamports: 4_000,
+            other_lamports: 0,
+        };
+        let net = apply_execution_cost(&gross, cost).unwrap();
+        assert_eq!(net.execution_cost_lamports, 12_000);
+        assert_eq!(net.net_profit_raw, -2_000);
+        assert_eq!(net.net_return_ppm, -2_000);
+        assert!(!net.is_profitable());
+    }
+
+    #[test]
+    fn execution_cost_makes_existing_loss_more_negative() {
+        let first = quote(Dex::Raydium, "a", "SOL", "TOKEN", 1_000_000, 2_000_000, 1);
+        let second = quote(Dex::Orca, "b", "TOKEN", "SOL", 2_000_000, 990_000, 2);
+        let gross = evaluate_round_trip(&first, &second).unwrap();
+        let net = apply_execution_cost(
+            &gross,
+            ExecutionCost {
+                base_fee_lamports: 5_000,
+                priority_fee_lamports: 0,
+                jito_tip_lamports: 1_000,
+                other_lamports: 0,
+            },
+        )
+        .unwrap();
+        assert_eq!(gross.gross_profit_raw, -10_000);
+        assert_eq!(net.net_profit_raw, -16_000);
+        assert_eq!(net.net_return_ppm, -16_000);
     }
 
     #[test]
