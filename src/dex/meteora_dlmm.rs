@@ -1,6 +1,11 @@
 use std::{collections::HashMap, mem::size_of, str::FromStr};
 
-use anchor_client::solana_sdk::{account::Account, clock::Clock, pubkey::Pubkey};
+use anchor_client::solana_sdk::{
+    account::Account,
+    clock::Clock,
+    pubkey::Pubkey,
+    sysvar,
+};
 use anchor_lang::Discriminator;
 use anyhow::{bail, Context, Result};
 use commons::dlmm::accounts::{BinArray, BinArrayBitmapExtension, LbPair};
@@ -47,6 +52,10 @@ pub fn bitmap_extension_address(lb_pair: &str) -> Result<String> {
     Ok(derive_bin_array_bitmap_extension(lb_pair).0.to_string())
 }
 
+pub fn clock_sysvar_address() -> String {
+    sysvar::clock::id().to_string()
+}
+
 /// 直接调用 Meteora 官方 `get_bin_array_pubkeys_for_swap`，由 LbPair 的内部 bitmap
 /// 和可选 extension 决定当前方向真正需要读取哪些 BinArray。
 pub fn bin_array_addresses_for_swap(
@@ -69,6 +78,17 @@ pub fn bin_array_addresses_for_swap(
         take_count,
     )
     .map(|keys| keys.into_iter().map(|key| key.to_string()).collect())
+}
+
+pub fn build_bin_array_map(entries: Vec<(String, BinArray)>) -> Result<HashMap<Pubkey, BinArray>> {
+    let mut map = HashMap::with_capacity(entries.len());
+    for (address, bin_array) in entries {
+        let pubkey = Pubkey::from_str(&address).context("invalid Meteora BinArray address")?;
+        if map.insert(pubkey, bin_array).is_some() {
+            bail!("duplicate Meteora BinArray address: {address}");
+        }
+    }
+    Ok(map)
 }
 
 pub fn decode_clock(data: &[u8]) -> Result<Clock> {
@@ -186,12 +206,13 @@ mod tests {
     }
 
     #[test]
-    fn bitmap_address_is_deterministic_and_invalid_pair_is_rejected() {
+    fn bitmap_and_clock_addresses_are_deterministic() {
         let pair = Pubkey::new_from_array([9u8; 32]).to_string();
         assert_eq!(
             bitmap_extension_address(&pair).unwrap(),
             bitmap_extension_address(&pair).unwrap()
         );
+        assert_eq!(clock_sysvar_address(), sysvar::clock::id().to_string());
         assert!(bitmap_extension_address("not-a-pubkey").is_err());
     }
 
@@ -203,6 +224,24 @@ mod tests {
         assert!(bin_array_addresses_for_swap(&address, &pair, None, true, 0)
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn bin_array_map_rejects_duplicate_and_invalid_addresses() {
+        let data = zeroed_anchor_account::<BinArray>(size_of::<BinArray>());
+        let bin_array = decode_bin_array(&data).unwrap();
+        let address = Pubkey::new_from_array([5u8; 32]).to_string();
+
+        assert_eq!(
+            build_bin_array_map(vec![(address.clone(), bin_array)]).unwrap().len(),
+            1
+        );
+        assert!(build_bin_array_map(vec![
+            (address.clone(), bin_array),
+            (address, bin_array)
+        ])
+        .is_err());
+        assert!(build_bin_array_map(vec![("invalid".into(), bin_array)]).is_err());
     }
 
     #[test]
