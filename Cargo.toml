@@ -8,6 +8,7 @@ publish = false
 anyhow = "1"
 base64 = "0.22"
 bs58 = "0.5"
+commons = { git = "https://github.com/MeteoraAg/dlmm-sdk.git", rev = "fb02e51ae677bbd18e76543f702dae40632426db" }
 futures-util = "0.3"
 orca_whirlpools_client = "8.0.0"
 orca_whirlpools_core = "2.1.1"
