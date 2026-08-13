@@ -30,11 +30,8 @@ async fn main() -> Result<()> {
             bail!("{} / WSOL: no exact pools found", token.symbol);
         }
 
-        let candidates = select_monitoring_candidates(
-            &discovered,
-            MIN_MONITOR_TVL_USD,
-            MAX_POOLS_PER_DEX,
-        );
+        let candidates =
+            select_monitoring_candidates(&discovered, MIN_MONITOR_TVL_USD, MAX_POOLS_PER_DEX);
         if candidates.is_empty() {
             bail!(
                 "{} / WSOL: pools exist but none meet monitoring threshold",
