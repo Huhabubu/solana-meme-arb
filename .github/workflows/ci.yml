@@ -128,15 +128,15 @@ jobs:
           fi
           cargo run -- meteora-quote-check
 
-      # V3 第一层：真实计算 Raydium/Orca 双方向两腿闭环，允许结果为负但必须完成金额与 Mint 连续性校验。
-      - name: Live V3 Raydium Orca round-trip verification
+      # V3：三个已支持 DEX 的全部有向两池路径；每条路径用同一腿快照测试多个输入金额。
+      - name: Live V3 all-DEX multi-size round-trip verification
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         timeout-minutes: 3
         env:
           HELIUS_API_KEY: ${{ secrets.HELIUS_API_KEY }}
         run: |
           if [ -z "$HELIUS_API_KEY" ]; then
-            echo "HELIUS_API_KEY secret is not configured; V3 round-trip verification skipped."
+            echo "HELIUS_API_KEY secret is not configured; V3 multi-size round-trip verification skipped."
             exit 0
           fi
           cargo run -- round-trip-check
