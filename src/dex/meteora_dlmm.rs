@@ -1,24 +1,13 @@
 use std::{collections::HashMap, mem::size_of, str::FromStr};
 
-use anchor_client::solana_sdk::{
-    account::Account,
-    clock::Clock,
-    pubkey::Pubkey,
-};
+use anchor_client::solana_sdk::{account::Account, clock::Clock, pubkey::Pubkey};
 use anchor_lang::Discriminator;
 use anyhow::{bail, Context, Result};
+use commons::dlmm::accounts::{BinArray, BinArrayBitmapExtension, LbPair};
 use commons::{
     derive_bin_array_bitmap_extension, get_bin_array_pubkeys_for_swap,
     pod_read_unaligned_skip_disc, quote_exact_in as meteora_quote_exact_in, SwapExactInQuote,
 };
-use commons::dlmm::accounts::{BinArray, BinArrayBitmapExtension, LbPair};
-
-pub type MeteoraPubkey = Pubkey;
-pub type MeteoraLbPair = LbPair;
-pub type MeteoraBinArray = BinArray;
-pub type MeteoraBitmapExtension = BinArrayBitmapExtension;
-pub type MeteoraClock = Clock;
-pub type MeteoraAccount = Account;
 
 /// Meteora 官方 Rust SDK 的账户类型是 zero-copy POD；这里额外校验 Anchor discriminator，
 /// 防止“长度正确但账户类型错误”的字节被当成 LbPair。
@@ -174,9 +163,8 @@ mod tests {
 
     #[test]
     fn decodes_zeroed_bitmap_and_bin_array_layouts() {
-        let bitmap = zeroed_anchor_account::<BinArrayBitmapExtension>(
-            size_of::<BinArrayBitmapExtension>(),
-        );
+        let bitmap =
+            zeroed_anchor_account::<BinArrayBitmapExtension>(size_of::<BinArrayBitmapExtension>());
         assert!(decode_bitmap_extension(&bitmap).is_ok());
 
         let bin_array = zeroed_anchor_account::<BinArray>(size_of::<BinArray>());
@@ -192,7 +180,9 @@ mod tests {
 
         assert!(swap_for_y_for_input(&pair, &pair.token_x_mint.to_string()).unwrap());
         assert!(!swap_for_y_for_input(&pair, &pair.token_y_mint.to_string()).unwrap());
-        assert!(swap_for_y_for_input(&pair, &Pubkey::new_from_array([3u8; 32]).to_string()).is_err());
+        assert!(
+            swap_for_y_for_input(&pair, &Pubkey::new_from_array([3u8; 32]).to_string()).is_err()
+        );
     }
 
     #[test]
