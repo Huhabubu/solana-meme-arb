@@ -38,9 +38,7 @@ async fn main() -> Result<()> {
         "helius-check" => run_helius_check(&client).await,
         "raydium-quote-check" => run_raydium_quote_check(&client).await,
         _ => {
-            println!(
-                "Usage: {APP_NAME} <discover|verify|helius-check|raydium-quote-check>"
-            );
+            println!("Usage: {APP_NAME} <discover|verify|helius-check|raydium-quote-check>");
             Ok(())
         }
     }
@@ -148,7 +146,10 @@ async fn run_raydium_quote_check(client: &Client) -> Result<()> {
                 && pool.pool_type == "Standard"
         });
         let Some(pool) = pool else {
-            println!("{}/WSOL: no selected Raydium Standard AMM v4 pool", token.symbol);
+            println!(
+                "{}/WSOL: no selected Raydium Standard AMM v4 pool",
+                token.symbol
+            );
             continue;
         };
 
@@ -175,7 +176,10 @@ async fn run_raydium_quote_check(client: &Client) -> Result<()> {
 
         let state = decode_amm_v4(&pool_account.data)?;
         if !pool.matches_pair(&state.coin_mint, &state.pc_mint) {
-            bail!("Raydium decoded mints do not match discovery metadata for {}", pool.address);
+            bail!(
+                "Raydium decoded mints do not match discovery metadata for {}",
+                pool.address
+            );
         }
 
         let vault_addresses = vec![state.coin_vault.clone(), state.pc_vault.clone()];
@@ -190,9 +194,17 @@ async fn run_raydium_quote_check(client: &Client) -> Result<()> {
             bail!("Raydium vault RPC returned unexpected account count");
         }
         let mut vaults = vault_batch.accounts.into_iter();
-        let coin_vault_data = vaults.next().flatten().context("Raydium coin vault missing")?;
-        let pc_vault_data = vaults.next().flatten().context("Raydium pc vault missing")?;
-        if coin_vault_data.owner != SPL_TOKEN_PROGRAM_ID || pc_vault_data.owner != SPL_TOKEN_PROGRAM_ID {
+        let coin_vault_data = vaults
+            .next()
+            .flatten()
+            .context("Raydium coin vault missing")?;
+        let pc_vault_data = vaults
+            .next()
+            .flatten()
+            .context("Raydium pc vault missing")?;
+        if coin_vault_data.owner != SPL_TOKEN_PROGRAM_ID
+            || pc_vault_data.owner != SPL_TOKEN_PROGRAM_ID
+        {
             bail!("Raydium AMM v4 vault is not owned by the classic SPL Token program");
         }
 
