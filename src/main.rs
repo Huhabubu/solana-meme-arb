@@ -1,16 +1,22 @@
+mod config;
 mod dex;
 mod discovery;
+mod helius;
 mod model;
 mod rpc;
 mod serde_utils;
 mod tokens;
 
+use std::time::Duration;
+
 use anyhow::{bail, Result};
 use reqwest::Client;
 
+use config::HeliusConfig;
 use discovery::{
     discover_pair, select_monitoring_candidates, MAX_POOLS_PER_DEX, MIN_MONITOR_TVL_USD,
 };
+use helius::{check_http, subscribe_and_wait_for_update};
 use model::PoolInfo;
 use rpc::{fetch_account_owners, verify_pool_accounts, PUBLIC_MAINNET_RPC};
 use tokens::{tracked_tokens, Token, WSOL};
@@ -25,8 +31,9 @@ async fn main() -> Result<()> {
     match command.as_str() {
         "discover" => run_discover(&client).await,
         "verify" => run_verify(&client).await,
+        "helius-check" => run_helius_check(&client).await,
         _ => {
-            println!("Usage: {APP_NAME} <discover|verify>");
+            println!("Usage: {APP_NAME} <discover|verify|helius-check>");
             Ok(())
         }
     }
@@ -92,6 +99,27 @@ async fn run_verify(client: &Client) -> Result<()> {
             );
         }
     }
+
+    Ok(())
+}
+
+async fn run_helius_check(client: &Client) -> Result<()> {
+    let config = HeliusConfig::from_env()?;
+    let version = check_http(client, &config).await?;
+    println!("Helius HTTP verified: Solana core {version}");
+
+    let mut pools = Vec::new();
+    for token in tracked_tokens() {
+        let (_, candidates) = discover_candidates(client, token).await?;
+        pools.extend(candidates);
+    }
+
+    println!("Helius WSS subscribing to {} candidate pools", pools.len());
+    let update = subscribe_and_wait_for_update(&config, &pools, Duration::from_secs(45)).await?;
+    println!(
+        "Helius WSS verified: update slot={} dex={} pool={} subscription={}",
+        update.slot, update.pool.dex, update.pool.address, update.subscription_id
+    );
 
     Ok(())
 }
