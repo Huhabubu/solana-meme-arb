@@ -54,7 +54,7 @@ mod tests {
 
     #[test]
     fn rejects_non_classic_token_account_length() {
-        assert!(decode_spl_token_account(&vec![0u8; SPL_TOKEN_ACCOUNT_LEN - 1]).is_err());
-        assert!(decode_spl_token_account(&vec![0u8; SPL_TOKEN_ACCOUNT_LEN + 1]).is_err());
+        assert!(decode_spl_token_account(&[0u8; SPL_TOKEN_ACCOUNT_LEN - 1]).is_err());
+        assert!(decode_spl_token_account(&[0u8; SPL_TOKEN_ACCOUNT_LEN + 1]).is_err());
     }
 }
