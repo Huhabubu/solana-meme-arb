@@ -77,7 +77,8 @@ jobs:
               records=0
               bytes=0
             fi
-            printf '2h sample heartbeat: elapsed=%ss records=%s jsonl_bytes=%s\n' "$elapsed" "$records" "$bytes"
+            recoveries=$(grep -c 'V3.6 monitor minContextSlot recovery:' /tmp/monitor-2h.log 2>/dev/null || true)
+            printf '2h sample heartbeat: elapsed=%ss records=%s jsonl_bytes=%s context_slot_recoveries=%s\n' "$elapsed" "$records" "$bytes" "$recoveries"
           done
 
           set +e
