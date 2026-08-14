@@ -1,0 +1,65 @@
+name: release-build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install stable Rust
+        run: |
+          rustup update stable
+          rustup default stable
+
+      - name: Resolve Rust cache key
+        id: rust-version
+        run: echo "version=$(rustc --version | awk '{print $2}')" >> "$GITHUB_OUTPUT"
+
+      # release 使用独立 primary key；第一次可从普通 CI 的 Cargo cache 恢复，
+      # 完成后保存包含 release profile 产物的新缓存，避免以后每次部署都冷编译。
+      - name: Restore release Cargo cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-release-cargo-${{ steps.rust-version.outputs.version }}-${{ hashFiles('Cargo.toml', 'Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-release-cargo-${{ steps.rust-version.outputs.version }}-
+            ${{ runner.os }}-cargo-${{ steps.rust-version.outputs.version }}-
+
+      - name: Release build
+        run: cargo build --release --locked
+
+      - name: Release tests
+        run: cargo test --release --locked --all-targets
+
+      - name: Package deployment bundle
+        run: |
+          rm -rf dist
+          mkdir -p dist
+          cp target/release/solana-meme-arb dist/solana-meme-arb
+          cp deploy/solana-meme-arb.service dist/solana-meme-arb.service
+          cp deploy/monitor.env.example dist/monitor.env.example
+          cp deploy/README.md dist/DEPLOY.md
+          printf 'commit=%s\nrustc=%s\n' "$GITHUB_SHA" "$(rustc --version)" > dist/BUILD-INFO.txt
+          sha256sum dist/solana-meme-arb > dist/SHA256SUMS
+          ls -lh dist
+          cat dist/BUILD-INFO.txt
+          cat dist/SHA256SUMS
+
+      - name: Upload deployment artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: solana-meme-arb-linux-x86_64-${{ github.sha }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
