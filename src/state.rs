@@ -121,6 +121,10 @@ impl QuoteState {
         self.dependencies_by_pool.get(pool_address)
     }
 
+    pub fn account_data(&self, address: &str) -> Option<&VersionedAccountData> {
+        self.account_data.get(address)
+    }
+
     pub fn affected_pools(&self, account_address: &str) -> Vec<String> {
         let mut pools = self
             .pools_by_account
@@ -244,6 +248,25 @@ mod tests {
     #[test]
     fn dependency_account_rejects_empty_address() {
         assert!(DependencyAccount::new(" ", DependencyKind::PoolState).is_err());
+    }
+
+    #[test]
+    fn account_data_accessor_returns_only_loaded_versions() {
+        let mut state = QuoteState::new();
+        state
+            .replace_pool_dependencies(
+                PoolDependencies::new(
+                    pool("pool-a"),
+                    vec![dep("vault", DependencyKind::TokenVault)],
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        assert!(state.account_data("vault").is_none());
+        state.apply_account_update("vault", version(9, 7)).unwrap();
+        let loaded = state.account_data("vault").unwrap();
+        assert_eq!(loaded.slot, 9);
+        assert_eq!(loaded.data, vec![7]);
     }
 
     #[test]

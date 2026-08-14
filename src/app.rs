@@ -40,6 +40,7 @@ use crate::{
         evaluate_round_trip, evaluate_round_trip_curve, DirectedPoolRoute, ExecutionCost,
         LiquidityStage, OpportunityEvent, OpportunityEventOutcome, SwapQuote,
     },
+    quote_context::{QuoteContextCache, QuoteRuntime},
     rpc::{fetch_account_owners, fetch_accounts, verify_pool_accounts, PUBLIC_MAINNET_RPC},
     state::{DependencyKind, PoolDependencies, QuoteState, VersionedAccountData},
     token_account::{decode_spl_token_account, decode_spl_token_mint, SPL_TOKEN_PROGRAM_ID},
@@ -679,22 +680,20 @@ fn v3_cost_floor() -> ExecutionCost {
     }
 }
 
-async fn evaluate_live_route_events(
-    client: &Client,
-    config: &HeliusConfig,
+fn evaluate_cached_route_events(
+    cache: &QuoteContextCache,
     route: &DirectedPoolRoute,
     execution_cost: ExecutionCost,
+    runtime: QuoteRuntime<'_>,
 ) -> Result<Vec<OpportunityEvent>> {
-    let first_points = quote_supported_pool_amounts(
-        client,
-        config,
-        &route.first_pool,
+    let first_points = cache.quote_many(
+        &route.first_pool.address,
         WSOL,
         &ROUND_TRIP_PROBE_LAMPORTS,
-    )
-    .await?;
+        runtime,
+    )?;
     if first_points.len() != ROUND_TRIP_PROBE_LAMPORTS.len() {
-        bail!("V3.5 first-leg quote point count mismatch");
+        bail!("V3.5 cached first-leg quote point count mismatch");
     }
 
     let mut events = Vec::with_capacity(ROUND_TRIP_PROBE_LAMPORTS.len());
@@ -716,16 +715,14 @@ async fn evaluate_live_route_events(
             .iter()
             .map(|(_, quote)| quote.amount_out)
             .collect::<Vec<_>>();
-        let second_points = quote_supported_pool_amounts(
-            client,
-            config,
-            &route.second_pool,
+        let second_points = cache.quote_many(
+            &route.second_pool.address,
             &route.token_mint,
             &second_inputs,
-        )
-        .await?;
+            runtime,
+        )?;
         if second_points.len() != available_first.len() {
-            bail!("V3.5 second-leg quote point count mismatch");
+            bail!("V3.5 cached second-leg quote point count mismatch");
         }
 
         for ((index, first_quote), second_point) in available_first.into_iter().zip(second_points) {
@@ -745,7 +742,7 @@ async fn evaluate_live_route_events(
 
     events.sort_by_key(|event| event.input_amount);
     if events.len() != ROUND_TRIP_PROBE_LAMPORTS.len() {
-        bail!("V3.5 route did not account for every probe amount");
+        bail!("V3.5 cached route did not account for every probe amount");
     }
     Ok(events)
 }
@@ -1342,13 +1339,22 @@ async fn build_pool_dependencies(
                 })
                 .transpose()?;
             let swap_for_y = swap_for_y_for_input(&lb_pair, WSOL)?;
-            let bins = bin_array_addresses_for_swap(
+            let mut bins = bin_array_addresses_for_swap(
                 &pool.address,
                 &lb_pair,
                 bitmap.as_ref(),
                 swap_for_y,
                 METEORA_BIN_ARRAY_TAKE_COUNT,
             )?;
+            bins.extend(bin_array_addresses_for_swap(
+                &pool.address,
+                &lb_pair,
+                bitmap.as_ref(),
+                !swap_for_y,
+                METEORA_BIN_ARRAY_TAKE_COUNT,
+            )?);
+            bins.sort();
+            bins.dedup();
             meteora_dlmm_dependencies(
                 pool,
                 &lb_pair,
@@ -1569,6 +1575,10 @@ async fn run_dependency_wss_check(client: &Client) -> Result<()> {
 async fn run_opportunity_wss_check(client: &Client) -> Result<()> {
     let config = HeliusConfig::from_env()?;
     let (mut state, pools) = build_quote_state(client, &config).await?;
+    let mut cache = QuoteContextCache::build(&state, &pools)?;
+    if cache.len() != pools.len() {
+        bail!("V3.5 quote context cache did not cover every pool");
+    }
     let addresses = state.unique_dependency_addresses();
     let accepted_addresses = addresses.iter().cloned().collect::<HashSet<_>>();
     if accepted_addresses.is_empty() {
@@ -1576,9 +1586,9 @@ async fn run_opportunity_wss_check(client: &Client) -> Result<()> {
     }
 
     println!(
-        "V3.5 opportunity WSS subscribing to {} unique dependencies across {} quoteable pools",
+        "V3.5 opportunity WSS subscribing to {} unique dependencies across {} cached quote contexts",
         addresses.len(),
-        pools.len()
+        cache.len()
     );
     let update = subscribe_accounts_and_wait_for_update(
         &config,
@@ -1615,8 +1625,9 @@ async fn run_opportunity_wss_check(client: &Client) -> Result<()> {
         let kind = state
             .dependency_kind(pool_address, &update.address)
             .context("V3.5 updated account missing dependency kind")?;
+        let old_context_slot = cache.snapshot_slot(pool_address)?;
         println!(
-            "  affected pool={} dex={} kind={kind:?}; refreshing dynamic dependencies",
+            "  affected pool={} dex={} kind={kind:?}; refreshing dependencies/context from local QuoteState",
             dependencies.pool.address, dependencies.pool.dex
         );
         refresh_pool_dependencies(client, &config, &mut state, &dependencies.pool, update.slot)
@@ -1624,24 +1635,53 @@ async fn run_opportunity_wss_check(client: &Client) -> Result<()> {
         if !state.missing_accounts_for_pool(pool_address)?.is_empty() {
             bail!("V3.5 refreshed affected-pool dependencies are incomplete");
         }
+        cache.refresh_pool(&state, &dependencies.pool)?;
+        let new_context_slot = cache.snapshot_slot(pool_address)?;
+        if new_context_slot < old_context_slot || new_context_slot < update.slot {
+            bail!("V3.5 affected quote context did not advance to the WSS update slot");
+        }
     }
 
     let routes = affected_directed_pool_routes(&pools, &affected_pools, WSOL)?;
     if routes.is_empty() {
         bail!("V3.5 affected pools produced no related arbitrage routes");
     }
+
+    // Meteora 官方本地 Quote 需要 Clock；Clock 不作为 WSS trigger，但每轮机会重算只刷新一次。
+    let clock_address = clock_sysvar_address();
+    let clock_batch = fetch_accounts(
+        client,
+        config.http_url().as_str(),
+        std::slice::from_ref(&clock_address),
+        Some(update.slot),
+    )
+    .await?;
+    let clock_account = clock_batch.accounts[0]
+        .as_ref()
+        .context("V3.5 Clock sysvar account missing")?;
+    let clock = decode_clock(&clock_account.data)?;
+    let runtime = QuoteRuntime {
+        unix_timestamp: unix_timestamp()?,
+        meteora_clock: Some(&clock),
+    };
     let cost_floor = v3_cost_floor();
     let mut event_count = 0usize;
     let mut evaluated_count = 0usize;
     let mut unavailable_count = 0usize;
     let mut net_positive_count = 0usize;
 
+    println!(
+        "V3.5 local context recompute: {} affected pool(s), {} related route(s); route evaluator performs no pool snapshot HTTP requests, Clock refreshed once at slot {}",
+        affected_pools.len(),
+        routes.len(),
+        clock_batch.slot
+    );
     for route in &routes {
         let token = tracked_tokens()
             .iter()
             .find(|token| token.mint == route.token_mint)
             .context("V3.5 route token is outside tracked universe")?;
-        let events = evaluate_live_route_events(client, &config, route, cost_floor).await?;
+        let events = evaluate_cached_route_events(&cache, route, cost_floor, runtime)?;
         for event in &events {
             match &event.outcome {
                 OpportunityEventOutcome::Evaluated {
@@ -1660,7 +1700,7 @@ async fn run_opportunity_wss_check(client: &Client) -> Result<()> {
                         net_positive_count += 1;
                     }
                     println!(
-                        "{}/WSOL V3.5 event: {}->{} input={} token_out={} final={} gross_profit_raw={} gross_return_ppm={} execution_cost={} net_profit_raw={} net_return_ppm={} slots={}..{}",
+                        "{}/WSOL V3.5 cached event: {}->{} input={} token_out={} final={} gross_profit_raw={} gross_return_ppm={} execution_cost={} net_profit_raw={} net_return_ppm={} slots={}..{}",
                         token.symbol,
                         event.first_dex,
                         event.second_dex,
@@ -1679,7 +1719,7 @@ async fn run_opportunity_wss_check(client: &Client) -> Result<()> {
                 OpportunityEventOutcome::InsufficientLiquidity { stage } => {
                     unavailable_count += 1;
                     println!(
-                        "{}/WSOL V3.5 event: {}->{} input={} status=insufficient_liquidity stage={stage:?}",
+                        "{}/WSOL V3.5 cached event: {}->{} input={} status=insufficient_liquidity stage={stage:?}",
                         token.symbol,
                         event.first_dex,
                         event.second_dex,
@@ -1694,7 +1734,7 @@ async fn run_opportunity_wss_check(client: &Client) -> Result<()> {
     let expected_events = routes.len() * ROUND_TRIP_PROBE_LAMPORTS.len();
     if event_count != expected_events || evaluated_count + unavailable_count != event_count {
         bail!(
-            "V3.5 opportunity event accounting mismatch: routes={} expected_events={} events={} evaluated={} unavailable={}",
+            "V3.5 cached opportunity event accounting mismatch: routes={} expected_events={} events={} evaluated={} unavailable={}",
             routes.len(),
             expected_events,
             event_count,
@@ -1703,7 +1743,7 @@ async fn run_opportunity_wss_check(client: &Client) -> Result<()> {
         );
     }
     println!(
-        "V3.5 dependency-triggered opportunity recompute verified: {} affected pool(s), {} related route(s), {} event(s), {} evaluated, {} insufficient-liquidity, {} net-positive",
+        "V3.5 local-context opportunity recompute verified: {} affected pool(s), {} related route(s), {} event(s), {} evaluated, {} insufficient-liquidity, {} net-positive",
         affected_pools.len(),
         routes.len(),
         event_count,
