@@ -6,6 +6,7 @@ mod discovery;
 mod helius;
 mod model;
 mod opportunity;
+mod persistence;
 mod quote_context;
 mod rpc;
 mod serde_utils;

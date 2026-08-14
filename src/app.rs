@@ -40,6 +40,7 @@ use crate::{
         evaluate_round_trip, evaluate_round_trip_curve, DirectedPoolRoute, ExecutionCost,
         LiquidityStage, OpportunityEvent, OpportunityEventOutcome, SwapQuote,
     },
+    persistence::{append_records, read_records, summarize_records, OpportunityRecord},
     quote_context::{QuoteContextCache, QuoteRuntime},
     rpc::{fetch_account_owners, fetch_accounts, verify_pool_accounts, PUBLIC_MAINNET_RPC},
     state::{DependencyKind, PoolDependencies, QuoteState, VersionedAccountData},
@@ -1669,6 +1670,7 @@ async fn run_opportunity_wss_check(client: &Client) -> Result<()> {
     let mut evaluated_count = 0usize;
     let mut unavailable_count = 0usize;
     let mut net_positive_count = 0usize;
+    let mut persistence_events = Vec::new();
 
     println!(
         "V3.5 local context recompute: {} affected pool(s), {} related route(s); route evaluator performs no pool snapshot HTTP requests, Clock refreshed once at slot {}",
@@ -1682,6 +1684,7 @@ async fn run_opportunity_wss_check(client: &Client) -> Result<()> {
             .find(|token| token.mint == route.token_mint)
             .context("V3.5 route token is outside tracked universe")?;
         let events = evaluate_cached_route_events(&cache, route, cost_floor, runtime)?;
+        persistence_events.extend(events.iter().cloned());
         for event in &events {
             match &event.outcome {
                 OpportunityEventOutcome::Evaluated {
@@ -1751,6 +1754,51 @@ async fn run_opportunity_wss_check(client: &Client) -> Result<()> {
         unavailable_count,
         net_positive_count
     );
+
+    if let Ok(log_path) = std::env::var("OPPORTUNITY_LOG_PATH") {
+        if log_path.trim().is_empty() {
+            bail!("OPPORTUNITY_LOG_PATH cannot be empty when configured");
+        }
+        let path = std::path::Path::new(&log_path);
+        let before_count = if path.exists() {
+            read_records(path)?.len()
+        } else {
+            0
+        };
+        let observed_at_unix_ms = unix_timestamp_millis()?;
+        let records = persistence_events
+            .iter()
+            .map(|event| {
+                OpportunityRecord::from_event(
+                    event,
+                    observed_at_unix_ms,
+                    update.slot,
+                    &update.address,
+                    update.subscription_id,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if records.len() != event_count {
+            bail!("V3.6 persistence record count diverged from opportunity events");
+        }
+        append_records(path, &records)?;
+        let stored = read_records(path)?;
+        if stored.len() != before_count + records.len() {
+            bail!("V3.6 persistence append count mismatch");
+        }
+        let stats = summarize_records(&stored)?;
+        println!(
+            "V3.6 persistence verified: path={} appended={} total={} evaluated={} insufficient_liquidity={} gross_positive={} net_positive={} groups={}",
+            path.display(),
+            records.len(),
+            stats.total,
+            stats.evaluated,
+            stats.insufficient_liquidity,
+            stats.gross_positive,
+            stats.net_positive,
+            stats.groups.len()
+        );
+    }
     Ok(())
 }
 
@@ -1759,6 +1807,14 @@ fn unix_timestamp() -> Result<u64> {
         .duration_since(UNIX_EPOCH)
         .context("system clock is before Unix epoch")?
         .as_secs())
+}
+
+fn unix_timestamp_millis() -> Result<u64> {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before Unix epoch")?
+        .as_millis();
+    u64::try_from(millis).context("Unix millisecond timestamp overflow")
 }
 
 #[cfg(test)]
