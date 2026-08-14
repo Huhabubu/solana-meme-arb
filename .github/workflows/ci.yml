@@ -141,17 +141,20 @@ jobs:
           fi
           cargo run -- round-trip-check
 
-      # V3.5：真实订阅全部 Quote 依赖。收到更新后必须完成：反向索引 → affected Pool →
-      # 动态依赖刷新 → 仅相关 Token 的 affected routes → 结构化 OpportunityEvent。
-      # 该步骤同时覆盖原 V2 dependency WSS routing 回归。
-      - name: Live V3 dependency-triggered opportunity verification
+      # V3.5/V3.6：真实 WSS update → affected Pool Context → related routes → OpportunityEvent；
+      # 同一步把事件追加写到临时 JSONL，再由程序重读并汇总，验证持久化链路。
+      - name: Live V3 dependency-triggered opportunity and persistence verification
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         timeout-minutes: 4
         env:
           HELIUS_API_KEY: ${{ secrets.HELIUS_API_KEY }}
+          OPPORTUNITY_LOG_PATH: ${{ runner.temp }}/opportunity-events.jsonl
         run: |
           if [ -z "$HELIUS_API_KEY" ]; then
-            echo "HELIUS_API_KEY secret is not configured; V3.5 opportunity WSS verification skipped."
+            echo "HELIUS_API_KEY secret is not configured; V3.6 opportunity persistence verification skipped."
             exit 0
           fi
+          rm -f "$OPPORTUNITY_LOG_PATH"
           cargo run -- opportunity-wss-check
+          test -s "$OPPORTUNITY_LOG_PATH"
+          echo "V3.6 JSONL line count: $(wc -l < "$OPPORTUNITY_LOG_PATH")"
