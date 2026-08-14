@@ -1,0 +1,687 @@
+name: v35-route-engine-once
+
+on:
+  push:
+    paths:
+      - '.github/workflows/v35-route-engine-once.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  integrate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        run: |
+          rustup update stable
+          rustup default stable
+          rustup component add rustfmt clippy
+
+      - name: Resolve Rust cache key
+        id: rust-version
+        run: echo "version=$(rustc --version | awk '{print $2}')" >> "$GITHUB_OUTPUT"
+
+      - name: Restore Cargo cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ steps.rust-version.outputs.version }}-${{ hashFiles('Cargo.toml', 'Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-${{ steps.rust-version.outputs.version }}-
+
+      - name: Integrate affected-route engine and events
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+
+          # ---------- opportunity.rs ----------
+          path = Path('src/opportunity.rs')
+          text = path.read_text()
+          old = 'use anyhow::{bail, Context, Result};\n\nuse crate::model::Dex;'
+          new = 'use std::collections::HashSet;\n\nuse anyhow::{bail, Context, Result};\n\nuse crate::model::{Dex, PoolInfo};'
+          if text.count(old) != 1:
+              raise SystemExit(f'opportunity import anchor count={text.count(old)}')
+          text = text.replace(old, new, 1)
+
+          marker = '/// 为 N 个不同池生成全部有向两池路径索引；每个池都可以作为第一腿或第二腿，\n'
+          if text.count(marker) != 1:
+              raise SystemExit(f'route insertion marker count={text.count(marker)}')
+          addition = r'''#[derive(Debug, Clone, PartialEq)]
+          pub struct DirectedPoolRoute {
+              pub token_mint: String,
+              pub first_pool: PoolInfo,
+              pub second_pool: PoolInfo,
+          }
+
+          #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+          pub enum LiquidityStage {
+              FirstLeg,
+              SecondLeg,
+          }
+
+          #[derive(Debug, Clone, PartialEq, Eq)]
+          pub enum OpportunityEventOutcome {
+              Evaluated {
+                  intermediate_amount: u64,
+                  final_amount: u64,
+                  gross_profit_raw: i128,
+                  gross_return_ppm: i128,
+                  execution_cost_lamports: u64,
+                  net_profit_raw: i128,
+                  net_return_ppm: i128,
+                  oldest_slot: u64,
+                  newest_slot: u64,
+              },
+              InsufficientLiquidity {
+                  stage: LiquidityStage,
+              },
+          }
+
+          #[derive(Debug, Clone, PartialEq, Eq)]
+          pub struct OpportunityEvent {
+              pub token_mint: String,
+              pub first_dex: Dex,
+              pub first_pool: String,
+              pub second_dex: Dex,
+              pub second_pool: String,
+              pub input_amount: u64,
+              pub outcome: OpportunityEventOutcome,
+          }
+
+          impl OpportunityEvent {
+              pub fn evaluated(route: &DirectedPoolRoute, net: &NetOpportunity) -> Result<Self> {
+                  let round_trip = &net.round_trip;
+                  if route.token_mint != round_trip.intermediate_mint {
+                      bail!("opportunity event token mint does not match round trip");
+                  }
+                  if route.first_pool.address != round_trip.first_leg.pool_address
+                      || route.first_pool.dex != round_trip.first_leg.dex
+                      || route.second_pool.address != round_trip.second_leg.pool_address
+                      || route.second_pool.dex != round_trip.second_leg.dex
+                  {
+                      bail!("opportunity event route does not match round trip legs");
+                  }
+
+                  Ok(Self {
+                      token_mint: route.token_mint.clone(),
+                      first_dex: route.first_pool.dex,
+                      first_pool: route.first_pool.address.clone(),
+                      second_dex: route.second_pool.dex,
+                      second_pool: route.second_pool.address.clone(),
+                      input_amount: round_trip.input_amount,
+                      outcome: OpportunityEventOutcome::Evaluated {
+                          intermediate_amount: round_trip.intermediate_amount,
+                          final_amount: round_trip.final_amount,
+                          gross_profit_raw: round_trip.gross_profit_raw,
+                          gross_return_ppm: round_trip.gross_return_ppm,
+                          execution_cost_lamports: net.execution_cost_lamports,
+                          net_profit_raw: net.net_profit_raw,
+                          net_return_ppm: net.net_return_ppm,
+                          oldest_slot: round_trip.oldest_slot,
+                          newest_slot: round_trip.newest_slot,
+                      },
+                  })
+              }
+
+              pub fn insufficient_liquidity(
+                  route: &DirectedPoolRoute,
+                  input_amount: u64,
+                  stage: LiquidityStage,
+              ) -> Result<Self> {
+                  if input_amount == 0 {
+                      bail!("opportunity event input amount must be positive");
+                  }
+                  Ok(Self {
+                      token_mint: route.token_mint.clone(),
+                      first_dex: route.first_pool.dex,
+                      first_pool: route.first_pool.address.clone(),
+                      second_dex: route.second_pool.dex,
+                      second_pool: route.second_pool.address.clone(),
+                      input_amount,
+                      outcome: OpportunityEventOutcome::InsufficientLiquidity { stage },
+                  })
+              }
+          }
+
+          /// 只生成与本次受影响 Pool 有关的有向两池路径，同时严格限制在同一个 Token/WSOL 交易对内。
+          /// 一个依赖账户若同时影响多个池，最终路径仍按 (first_pool, second_pool) 去重。
+          pub fn affected_directed_pool_routes(
+              pools: &[PoolInfo],
+              affected_pool_addresses: &[String],
+              base_mint: &str,
+          ) -> Result<Vec<DirectedPoolRoute>> {
+              if base_mint.trim().is_empty() {
+                  bail!("affected-route base mint cannot be empty");
+              }
+              if affected_pool_addresses.is_empty() {
+                  return Ok(Vec::new());
+              }
+
+              let mut pool_addresses = HashSet::new();
+              for pool in pools {
+                  if !pool_addresses.insert(pool.address.as_str()) {
+                      bail!("duplicate pool address in opportunity universe: {}", pool.address);
+                  }
+              }
+
+              let affected = affected_pool_addresses
+                  .iter()
+                  .map(String::as_str)
+                  .collect::<HashSet<_>>();
+              for address in &affected {
+                  if !pool_addresses.contains(address) {
+                      bail!("affected pool is outside opportunity universe: {address}");
+                  }
+              }
+
+              let token_mints = pools
+                  .iter()
+                  .map(|pool| token_mint_for_base(pool, base_mint))
+                  .collect::<Result<Vec<_>>>()?;
+              let mut routes = Vec::new();
+              let mut seen = HashSet::new();
+              for first in 0..pools.len() {
+                  for second in 0..pools.len() {
+                      if first == second || token_mints[first] != token_mints[second] {
+                          continue;
+                      }
+                      if !affected.contains(pools[first].address.as_str())
+                          && !affected.contains(pools[second].address.as_str())
+                      {
+                          continue;
+                      }
+                      let key = (pools[first].address.as_str(), pools[second].address.as_str());
+                      if seen.insert(key) {
+                          routes.push(DirectedPoolRoute {
+                              token_mint: token_mints[first].to_owned(),
+                              first_pool: pools[first].clone(),
+                              second_pool: pools[second].clone(),
+                          });
+                      }
+                  }
+              }
+              Ok(routes)
+          }
+
+          fn token_mint_for_base<'a>(pool: &'a PoolInfo, base_mint: &str) -> Result<&'a str> {
+              match (pool.mint_a == base_mint, pool.mint_b == base_mint) {
+                  (true, false) => Ok(pool.mint_b.as_str()),
+                  (false, true) => Ok(pool.mint_a.as_str()),
+                  _ => bail!(
+                      "pool is not a valid single-base pair for affected-route engine: {}",
+                      pool.address
+                  ),
+              }
+          }
+
+          '''
+          text = text.replace(marker, addition + marker, 1)
+
+          test_insert = text.rfind('\n}')
+          if test_insert < 0:
+              raise SystemExit('opportunity test module closing brace not found')
+          tests = r'''
+
+              fn route_pool(dex: Dex, address: &str, token: &str) -> PoolInfo {
+                  PoolInfo {
+                      dex,
+                      address: address.into(),
+                      pool_type: "test".into(),
+                      program_id: Some("program".into()),
+                      mint_a: token.into(),
+                      mint_b: "SOL".into(),
+                      tvl_usd: 1_000.0,
+                  }
+              }
+
+              #[test]
+              fn affected_routes_only_cover_the_updated_tokens_group() {
+                  let pools = vec![
+                      route_pool(Dex::Raydium, "a", "TOKEN1"),
+                      route_pool(Dex::Orca, "b", "TOKEN1"),
+                      route_pool(Dex::MeteoraDlmm, "c", "TOKEN1"),
+                      route_pool(Dex::Raydium, "d", "TOKEN2"),
+                      route_pool(Dex::Orca, "e", "TOKEN2"),
+                      route_pool(Dex::MeteoraDlmm, "f", "TOKEN2"),
+                  ];
+                  let routes = affected_directed_pool_routes(&pools, &["b".into()], "SOL").unwrap();
+                  let pairs = routes
+                      .iter()
+                      .map(|route| (route.first_pool.address.as_str(), route.second_pool.address.as_str()))
+                      .collect::<Vec<_>>();
+                  assert_eq!(pairs, vec![("a", "b"), ("b", "a"), ("b", "c"), ("c", "b")]);
+                  assert!(routes.iter().all(|route| route.token_mint == "TOKEN1"));
+              }
+
+              #[test]
+              fn multiple_affected_pools_expand_to_all_related_routes_without_duplicates() {
+                  let pools = vec![
+                      route_pool(Dex::Raydium, "a", "TOKEN1"),
+                      route_pool(Dex::Orca, "b", "TOKEN1"),
+                      route_pool(Dex::MeteoraDlmm, "c", "TOKEN1"),
+                  ];
+                  let routes = affected_directed_pool_routes(
+                      &pools,
+                      &["b".into(), "c".into(), "b".into()],
+                      "SOL",
+                  )
+                  .unwrap();
+                  assert_eq!(routes.len(), 6);
+                  let pairs = routes
+                      .iter()
+                      .map(|route| (route.first_pool.address.clone(), route.second_pool.address.clone()))
+                      .collect::<HashSet<_>>();
+                  assert_eq!(pairs.len(), 6);
+              }
+
+              #[test]
+              fn affected_routes_reject_unknown_pool_and_invalid_base_universe() {
+                  let pools = vec![
+                      route_pool(Dex::Raydium, "a", "TOKEN1"),
+                      route_pool(Dex::Orca, "b", "TOKEN1"),
+                  ];
+                  assert!(affected_directed_pool_routes(&pools, &["missing".into()], "SOL").is_err());
+
+                  let mut invalid = pools;
+                  invalid[1].mint_b = "OTHER".into();
+                  assert!(affected_directed_pool_routes(&invalid, &["a".into()], "SOL").is_err());
+              }
+
+              #[test]
+              fn opportunity_event_preserves_evaluated_net_result() {
+                  let gross = profitable_round_trip();
+                  let net = apply_execution_cost(
+                      &gross,
+                      ExecutionCost {
+                          base_fee_lamports: 5_000,
+                          priority_fee_lamports: 0,
+                          jito_tip_lamports: 1_000,
+                          other_lamports: 0,
+                      },
+                  )
+                  .unwrap();
+                  let route = DirectedPoolRoute {
+                      token_mint: "TOKEN".into(),
+                      first_pool: route_pool(Dex::Orca, "orca", "TOKEN"),
+                      second_pool: route_pool(Dex::Raydium, "raydium", "TOKEN"),
+                  };
+                  let event = OpportunityEvent::evaluated(&route, &net).unwrap();
+                  assert_eq!(event.input_amount, 1_000_000);
+                  assert_eq!(event.first_pool, "orca");
+                  assert_eq!(event.second_pool, "raydium");
+                  assert_eq!(
+                      event.outcome,
+                      OpportunityEventOutcome::Evaluated {
+                          intermediate_amount: 2_000_000,
+                          final_amount: 1_010_000,
+                          gross_profit_raw: 10_000,
+                          gross_return_ppm: 10_000,
+                          execution_cost_lamports: 6_000,
+                          net_profit_raw: 4_000,
+                          net_return_ppm: 4_000,
+                          oldest_slot: 100,
+                          newest_slot: 103,
+                      }
+                  );
+              }
+
+              #[test]
+              fn opportunity_event_keeps_liquidity_failure_as_explicit_state() {
+                  let route = DirectedPoolRoute {
+                      token_mint: "TOKEN".into(),
+                      first_pool: route_pool(Dex::Orca, "orca", "TOKEN"),
+                      second_pool: route_pool(Dex::Raydium, "raydium", "TOKEN"),
+                  };
+                  let event = OpportunityEvent::insufficient_liquidity(
+                      &route,
+                      100_000_000,
+                      LiquidityStage::SecondLeg,
+                  )
+                  .unwrap();
+                  assert_eq!(event.input_amount, 100_000_000);
+                  assert_eq!(
+                      event.outcome,
+                      OpportunityEventOutcome::InsufficientLiquidity {
+                          stage: LiquidityStage::SecondLeg
+                      }
+                  );
+                  assert!(OpportunityEvent::insufficient_liquidity(
+                      &route,
+                      0,
+                      LiquidityStage::FirstLeg
+                  )
+                  .is_err());
+              }
+          '''
+          text = text[:test_insert] + tests + text[test_insert:]
+          path.write_text(text)
+
+          # ---------- app.rs ----------
+          path = Path('src/app.rs')
+          text = path.read_text()
+          old_import = '''    opportunity::{
+                  apply_execution_cost, directed_route_indices, evaluate_round_trip_curve, ExecutionCost,
+                  SwapQuote,
+              },'''
+          new_import = '''    opportunity::{
+                  affected_directed_pool_routes, apply_execution_cost, directed_route_indices,
+                  evaluate_round_trip, evaluate_round_trip_curve, DirectedPoolRoute, ExecutionCost,
+                  LiquidityStage, OpportunityEvent, OpportunityEventOutcome, SwapQuote,
+              },'''
+          if text.count(old_import) != 1:
+              raise SystemExit(f'app opportunity import anchor count={text.count(old_import)}')
+          text = text.replace(old_import, new_import, 1)
+
+          text = text.replace(
+              '    DependencyWssCheck,\n    RoundTripCheck,',
+              '    DependencyWssCheck,\n    OpportunityWssCheck,\n    RoundTripCheck,',
+              1,
+          )
+          text = text.replace(
+              '        Some("dependency-wss-check") => Ok(Some(AppCommand::DependencyWssCheck)),\n        Some("round-trip-check") => Ok(Some(AppCommand::RoundTripCheck)),',
+              '        Some("dependency-wss-check") => Ok(Some(AppCommand::DependencyWssCheck)),\n        Some("opportunity-wss-check") => Ok(Some(AppCommand::OpportunityWssCheck)),\n        Some("round-trip-check") => Ok(Some(AppCommand::RoundTripCheck)),',
+              1,
+          )
+          text = text.replace(
+              'dependency-wss-check|round-trip-check>',
+              'dependency-wss-check|opportunity-wss-check|round-trip-check>',
+              1,
+          )
+          text = text.replace(
+              '        AppCommand::DependencyWssCheck => run_dependency_wss_check(&client).await,\n        AppCommand::RoundTripCheck => run_round_trip_check(&client).await,',
+              '        AppCommand::DependencyWssCheck => run_dependency_wss_check(&client).await,\n        AppCommand::OpportunityWssCheck => run_opportunity_wss_check(&client).await,\n        AppCommand::RoundTripCheck => run_round_trip_check(&client).await,',
+              1,
+          )
+
+          helper_marker = 'async fn run_round_trip_check(client: &Client) -> Result<()> {'
+          if text.count(helper_marker) != 1:
+              raise SystemExit(f'live route helper marker count={text.count(helper_marker)}')
+          helper = r'''fn v3_cost_floor() -> ExecutionCost {
+              ExecutionCost {
+                  base_fee_lamports: V3_COST_FLOOR_BASE_FEE_LAMPORTS,
+                  jito_tip_lamports: V3_COST_FLOOR_JITO_TIP_LAMPORTS,
+                  ..ExecutionCost::ZERO
+              }
+          }
+
+          async fn evaluate_live_route_events(
+              client: &Client,
+              config: &HeliusConfig,
+              route: &DirectedPoolRoute,
+              execution_cost: ExecutionCost,
+          ) -> Result<Vec<OpportunityEvent>> {
+              let first_points = quote_supported_pool_amounts(
+                  client,
+                  config,
+                  &route.first_pool,
+                  WSOL,
+                  &ROUND_TRIP_PROBE_LAMPORTS,
+              )
+              .await?;
+              if first_points.len() != ROUND_TRIP_PROBE_LAMPORTS.len() {
+                  bail!("V3.5 first-leg quote point count mismatch");
+              }
+
+              let mut events = Vec::with_capacity(ROUND_TRIP_PROBE_LAMPORTS.len());
+              let mut available_first = Vec::new();
+              for (index, point) in first_points.into_iter().enumerate() {
+                  if let Some(quote) = point {
+                      available_first.push((index, quote));
+                  } else {
+                      events.push(OpportunityEvent::insufficient_liquidity(
+                          route,
+                          ROUND_TRIP_PROBE_LAMPORTS[index],
+                          LiquidityStage::FirstLeg,
+                      )?);
+                  }
+              }
+
+              if !available_first.is_empty() {
+                  let second_inputs = available_first
+                      .iter()
+                      .map(|(_, quote)| quote.amount_out)
+                      .collect::<Vec<_>>();
+                  let second_points = quote_supported_pool_amounts(
+                      client,
+                      config,
+                      &route.second_pool,
+                      &route.token_mint,
+                      &second_inputs,
+                  )
+                  .await?;
+                  if second_points.len() != available_first.len() {
+                      bail!("V3.5 second-leg quote point count mismatch");
+                  }
+
+                  for ((index, first_quote), second_point) in
+                      available_first.into_iter().zip(second_points)
+                  {
+                      if let Some(second_quote) = second_point {
+                          let gross = evaluate_round_trip(&first_quote, &second_quote)?;
+                          let net = apply_execution_cost(&gross, execution_cost)?;
+                          events.push(OpportunityEvent::evaluated(route, &net)?);
+                      } else {
+                          events.push(OpportunityEvent::insufficient_liquidity(
+                              route,
+                              ROUND_TRIP_PROBE_LAMPORTS[index],
+                              LiquidityStage::SecondLeg,
+                          )?);
+                      }
+                  }
+              }
+
+              events.sort_by_key(|event| event.input_amount);
+              if events.len() != ROUND_TRIP_PROBE_LAMPORTS.len() {
+                  bail!("V3.5 route did not account for every probe amount");
+              }
+              Ok(events)
+          }
+
+          '''
+          text = text.replace(helper_marker, helper + helper_marker, 1)
+
+          insert_marker = '\nfn unix_timestamp() -> Result<u64> {'
+          if text.count(insert_marker) != 1:
+              raise SystemExit(f'opportunity WSS insertion marker count={text.count(insert_marker)}')
+          new_command = r'''
+          async fn run_opportunity_wss_check(client: &Client) -> Result<()> {
+              let config = HeliusConfig::from_env()?;
+              let (mut state, pools) = build_quote_state(client, &config).await?;
+              let addresses = state.unique_dependency_addresses();
+              let accepted_addresses = addresses.iter().cloned().collect::<HashSet<_>>();
+              if accepted_addresses.is_empty() {
+                  bail!("V3.5 opportunity universe has no quote dependency accounts");
+              }
+
+              println!(
+                  "V3.5 opportunity WSS subscribing to {} unique dependencies across {} quoteable pools",
+                  addresses.len(),
+                  pools.len()
+              );
+              let update = subscribe_accounts_and_wait_for_update(
+                  &config,
+                  &addresses,
+                  &accepted_addresses,
+                  Duration::from_secs(DEPENDENCY_WSS_WAIT_SECONDS),
+              )
+              .await?;
+              let applied = state.apply_account_update(
+                  &update.address,
+                  VersionedAccountData {
+                      slot: update.slot,
+                      owner: update.owner.clone(),
+                      data: update.data.clone(),
+                  },
+              )?;
+              if !applied.accepted {
+                  bail!("V3.5 received dependency update older than local QuoteState");
+              }
+              if applied.affected_pools.is_empty() {
+                  bail!("V3.5 dependency update did not map to any affected pool");
+              }
+
+              let affected_pools = applied.affected_pools.clone();
+              println!(
+                  "V3.5 trigger: address={} slot={} subscription={} affected_pools={:?}",
+                  update.address, update.slot, update.subscription_id, affected_pools
+              );
+              for pool_address in &affected_pools {
+                  let dependencies = state
+                      .dependencies_for_pool(pool_address)
+                      .context("V3.5 affected pool disappeared from QuoteState")?
+                      .clone();
+                  let kind = state
+                      .dependency_kind(pool_address, &update.address)
+                      .context("V3.5 updated account missing dependency kind")?;
+                  println!(
+                      "  affected pool={} dex={} kind={kind:?}; refreshing dynamic dependencies",
+                      dependencies.pool.address, dependencies.pool.dex
+                  );
+                  refresh_pool_dependencies(
+                      client,
+                      &config,
+                      &mut state,
+                      &dependencies.pool,
+                      update.slot,
+                  )
+                  .await?;
+                  if !state.missing_accounts_for_pool(pool_address)?.is_empty() {
+                      bail!("V3.5 refreshed affected-pool dependencies are incomplete");
+                  }
+              }
+
+              let routes = affected_directed_pool_routes(&pools, &affected_pools, WSOL)?;
+              if routes.is_empty() {
+                  bail!("V3.5 affected pools produced no related arbitrage routes");
+              }
+              let cost_floor = v3_cost_floor();
+              let mut event_count = 0usize;
+              let mut evaluated_count = 0usize;
+              let mut unavailable_count = 0usize;
+              let mut net_positive_count = 0usize;
+
+              for route in &routes {
+                  let token = tracked_tokens()
+                      .iter()
+                      .find(|token| token.mint == route.token_mint)
+                      .context("V3.5 route token is outside tracked universe")?;
+                  let events = evaluate_live_route_events(client, &config, route, cost_floor).await?;
+                  for event in &events {
+                      match &event.outcome {
+                          OpportunityEventOutcome::Evaluated {
+                              intermediate_amount,
+                              final_amount,
+                              gross_profit_raw,
+                              gross_return_ppm,
+                              execution_cost_lamports,
+                              net_profit_raw,
+                              net_return_ppm,
+                              oldest_slot,
+                              newest_slot,
+                          } => {
+                              evaluated_count += 1;
+                              if *net_profit_raw > 0 {
+                                  net_positive_count += 1;
+                              }
+                              println!(
+                                  "{}/WSOL V3.5 event: {}->{} input={} token_out={} final={} gross_profit_raw={} gross_return_ppm={} execution_cost={} net_profit_raw={} net_return_ppm={} slots={}..{}",
+                                  token.symbol,
+                                  event.first_dex,
+                                  event.second_dex,
+                                  event.input_amount,
+                                  intermediate_amount,
+                                  final_amount,
+                                  gross_profit_raw,
+                                  gross_return_ppm,
+                                  execution_cost_lamports,
+                                  net_profit_raw,
+                                  net_return_ppm,
+                                  oldest_slot,
+                                  newest_slot
+                              );
+                          }
+                          OpportunityEventOutcome::InsufficientLiquidity { stage } => {
+                              unavailable_count += 1;
+                              println!(
+                                  "{}/WSOL V3.5 event: {}->{} input={} status=insufficient_liquidity stage={stage:?}",
+                                  token.symbol,
+                                  event.first_dex,
+                                  event.second_dex,
+                                  event.input_amount
+                              );
+                          }
+                      }
+                  }
+                  event_count += events.len();
+              }
+
+              let expected_events = routes.len() * ROUND_TRIP_PROBE_LAMPORTS.len();
+              if event_count != expected_events || evaluated_count + unavailable_count != event_count {
+                  bail!(
+                      "V3.5 opportunity event accounting mismatch: routes={} expected_events={} events={} evaluated={} unavailable={}",
+                      routes.len(),
+                      expected_events,
+                      event_count,
+                      evaluated_count,
+                      unavailable_count
+                  );
+              }
+              println!(
+                  "V3.5 dependency-triggered opportunity recompute verified: {} affected pool(s), {} related route(s), {} event(s), {} evaluated, {} insufficient-liquidity, {} net-positive",
+                  affected_pools.len(),
+                  routes.len(),
+                  event_count,
+                  evaluated_count,
+                  unavailable_count,
+                  net_positive_count
+              );
+              Ok(())
+          }
+          '''
+          text = text.replace(insert_marker, new_command + insert_marker, 1)
+
+          old_test = '''        assert_eq!(
+                      parse_command(Some("round-trip-check")).unwrap(),
+                      Some(AppCommand::RoundTripCheck)
+                  );'''
+          new_test = '''        assert_eq!(
+                      parse_command(Some("opportunity-wss-check")).unwrap(),
+                      Some(AppCommand::OpportunityWssCheck)
+                  );
+                  assert_eq!(
+                      parse_command(Some("round-trip-check")).unwrap(),
+                      Some(AppCommand::RoundTripCheck)
+                  );'''
+          if text.count(old_test) != 1:
+              raise SystemExit(f'app command test anchor count={text.count(old_test)}')
+          text = text.replace(old_test, new_test, 1)
+          path.write_text(text)
+          PY
+
+      - name: Format
+        run: cargo fmt --all
+
+      - name: Compile check
+        run: cargo check --all-targets
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Tests
+        run: cargo test --all-targets
+
+      - name: Commit source integration
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/opportunity.rs src/app.rs
+          git diff --cached --quiet && { echo "No V3.5 source changes produced"; exit 1; }
+          git commit -m "feat: route WSS updates into opportunity events"
+          git push
