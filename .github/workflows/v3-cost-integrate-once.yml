@@ -1,0 +1,291 @@
+name: v3-cost-integrate-once
+
+on:
+  push:
+    paths:
+      - '.github/workflows/v3-cost-integrate-once.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  integrate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Integrate execution cost into live V3 round trip
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+
+          path = Path('src/app.rs')
+          text = path.read_text()
+
+          old_import = '    opportunity::{directed_route_indices, evaluate_round_trip_curve, SwapQuote},'
+          new_import = '''    opportunity::{
+              apply_execution_cost, directed_route_indices, evaluate_round_trip_curve, ExecutionCost,
+              SwapQuote,
+          },'''
+          if text.count(old_import) != 1:
+              raise SystemExit(f'expected one opportunity import anchor, got {text.count(old_import)}')
+          text = text.replace(old_import, new_import, 1)
+
+          probe = 'const ROUND_TRIP_PROBE_LAMPORTS: [u64; 3] = [10_000_000, 50_000_000, 100_000_000];'
+          constants = probe + '''
+          // V3.4 只用作净利润链路的成本下界：当前假设一笔交易仅 1 个普通签名，
+          // 并使用 Jito 文档最低 bundle tip。Priority Fee 在 V4 得到真实 CU 结构后再动态估计。
+          const V3_COST_FLOOR_BASE_FEE_LAMPORTS: u64 = 5_000;
+          const V3_COST_FLOOR_JITO_TIP_LAMPORTS: u64 = 1_000;'''
+          if text.count(probe) != 1:
+              raise SystemExit(f'expected one probe constant anchor, got {text.count(probe)}')
+          text = text.replace(probe, constants, 1)
+
+          start_marker = 'async fn run_round_trip_check(client: &Client) -> Result<()> {'
+          end_marker = '\nasync fn run_meteora_quote_check(client: &Client) -> Result<()> {'
+          start = text.find(start_marker)
+          end = text.find(end_marker, start)
+          if start < 0 or end < 0:
+              raise SystemExit(f'round-trip function boundary not found: start={start}, end={end}')
+
+          new_function = r'''async fn run_round_trip_check(client: &Client) -> Result<()> {
+              let config = HeliusConfig::from_env()?;
+              let cost_floor = ExecutionCost {
+                  base_fee_lamports: V3_COST_FLOOR_BASE_FEE_LAMPORTS,
+                  jito_tip_lamports: V3_COST_FLOOR_JITO_TIP_LAMPORTS,
+                  ..ExecutionCost::ZERO
+              };
+              let cost_floor_lamports = cost_floor.total_lamports()?;
+              let mut verified_routes = 0usize;
+              let mut evaluated_points = 0usize;
+              let mut unavailable_points = 0usize;
+              let mut gross_profitable_points = 0usize;
+              let mut net_profitable_points = 0usize;
+
+              println!(
+                  "V3 execution cost floor: base={} priority={} jito_tip={} other={} total={} lamports; lower-bound research scenario, not a live landing-cost estimate",
+                  cost_floor.base_fee_lamports,
+                  cost_floor.priority_fee_lamports,
+                  cost_floor.jito_tip_lamports,
+                  cost_floor.other_lamports,
+                  cost_floor_lamports
+              );
+
+              for token in tracked_tokens() {
+                  let (_, candidates) = discover_candidates(client, token).await?;
+                  let pools = supported_quote_pools(&candidates);
+                  if pools.len() != 3 {
+                      bail!(
+                          "{}/WSOL expected exactly 3 V3 quoteable pools, got {}",
+                          token.symbol,
+                          pools.len()
+                      );
+                  }
+                  let routes = directed_route_indices(pools.len());
+                  if routes.len() != 6 {
+                      bail!(
+                          "{}/WSOL expected 6 directed two-pool routes, got {}",
+                          token.symbol,
+                          routes.len()
+                      );
+                  }
+
+                  for (first_index, second_index) in routes {
+                      let first_pool = &pools[first_index];
+                      let second_pool = &pools[second_index];
+                      let first_points = quote_supported_pool_amounts(
+                          client,
+                          &config,
+                          first_pool,
+                          WSOL,
+                          &ROUND_TRIP_PROBE_LAMPORTS,
+                      )
+                      .await?;
+                      if first_points.len() != ROUND_TRIP_PROBE_LAMPORTS.len() {
+                          bail!("V3 first-leg quote point count mismatch");
+                      }
+
+                      let mut first_available = Vec::new();
+                      let mut first_indices = Vec::new();
+                      let mut intermediate_inputs = Vec::new();
+                      for (index, point) in first_points.iter().enumerate() {
+                          if let Some(quote) = point {
+                              first_indices.push(index);
+                              intermediate_inputs.push(quote.amount_out);
+                              first_available.push(quote.clone());
+                          } else {
+                              println!(
+                                  "{}/WSOL V3 curve point unavailable: {}->{} input={} stage=first_leg reason=insufficient_liquidity",
+                                  token.symbol,
+                                  first_pool.dex,
+                                  second_pool.dex,
+                                  ROUND_TRIP_PROBE_LAMPORTS[index]
+                              );
+                              unavailable_points += 1;
+                          }
+                      }
+                      if first_available.is_empty() {
+                          bail!("V3 route has no executable first-leg probe amount");
+                      }
+                      let first_slot = first_available[0].snapshot_slot;
+                      if first_available
+                          .iter()
+                          .any(|quote| quote.snapshot_slot != first_slot)
+                      {
+                          bail!("V3 first-leg curve mixed multiple snapshots");
+                      }
+
+                      let second_points = quote_supported_pool_amounts(
+                          client,
+                          &config,
+                          second_pool,
+                          token.mint,
+                          &intermediate_inputs,
+                      )
+                      .await?;
+                      if second_points.len() != first_available.len() {
+                          bail!("V3 second-leg quote point count mismatch");
+                      }
+
+                      let mut curve_first = Vec::new();
+                      let mut curve_second = Vec::new();
+                      let mut curve_indices = Vec::new();
+                      for ((index, first_quote), second_point) in first_indices
+                          .into_iter()
+                          .zip(first_available)
+                          .zip(second_points)
+                      {
+                          if let Some(second_quote) = second_point {
+                              curve_indices.push(index);
+                              curve_first.push(first_quote);
+                              curve_second.push(second_quote);
+                          } else {
+                              println!(
+                                  "{}/WSOL V3 curve point unavailable: {}->{} input={} stage=second_leg reason=insufficient_liquidity",
+                                  token.symbol,
+                                  first_pool.dex,
+                                  second_pool.dex,
+                                  ROUND_TRIP_PROBE_LAMPORTS[index]
+                              );
+                              unavailable_points += 1;
+                          }
+                      }
+                      if curve_first.is_empty() {
+                          bail!("V3 route has no fully executable probe amount");
+                      }
+                      let second_slot = curve_second[0].snapshot_slot;
+                      if curve_second
+                          .iter()
+                          .any(|quote| quote.snapshot_slot != second_slot)
+                      {
+                          bail!("V3 second-leg curve mixed multiple snapshots");
+                      }
+                      let curve = evaluate_round_trip_curve(&curve_first, &curve_second)?;
+                      if curve.len() != curve_indices.len() {
+                          bail!("V3 evaluated curve/index count mismatch");
+                      }
+
+                      for (index, opportunity) in curve_indices.into_iter().zip(curve.iter()) {
+                          if opportunity.base_mint != WSOL
+                              || opportunity.intermediate_mint != token.mint
+                          {
+                              bail!("V3 round trip produced unexpected mints");
+                          }
+                          if opportunity.input_amount != ROUND_TRIP_PROBE_LAMPORTS[index] {
+                              bail!("V3 round-trip result no longer matches original probe amount");
+                          }
+
+                          let net = apply_execution_cost(opportunity, cost_floor)?;
+                          if opportunity.gross_profit_raw > 0 {
+                              gross_profitable_points += 1;
+                          }
+                          if net.is_profitable() {
+                              net_profitable_points += 1;
+                          }
+                          if net.net_profit_raw > opportunity.gross_profit_raw {
+                              bail!("execution cost unexpectedly improved profit");
+                          }
+
+                          println!(
+                              "{}/WSOL V3 curve point: {}->{} input={} token_out={} final={} gross_profit_raw={} gross_return_ppm={} execution_cost_floor={} net_profit_floor_raw={} net_return_floor_ppm={} slots={}..{}",
+                              token.symbol,
+                              first_pool.dex,
+                              second_pool.dex,
+                              opportunity.input_amount,
+                              opportunity.intermediate_amount,
+                              opportunity.final_amount,
+                              opportunity.gross_profit_raw,
+                              opportunity.gross_return_ppm,
+                              net.execution_cost_lamports,
+                              net.net_profit_raw,
+                              net.net_return_ppm,
+                              opportunity.oldest_slot,
+                              opportunity.newest_slot
+                          );
+                          evaluated_points += 1;
+                      }
+                      println!(
+                          "{}/WSOL V3 curve verified: {}->{} evaluated={} unavailable={} first_slot={} second_slot={}",
+                          token.symbol,
+                          first_pool.dex,
+                          second_pool.dex,
+                          curve.len(),
+                          ROUND_TRIP_PROBE_LAMPORTS.len() - curve.len(),
+                          first_slot,
+                          second_slot
+                      );
+                      verified_routes += 1;
+                  }
+              }
+
+              let expected_routes = tracked_tokens().len() * 6;
+              let expected_points = expected_routes * ROUND_TRIP_PROBE_LAMPORTS.len();
+              if verified_routes != expected_routes
+                  || evaluated_points + unavailable_points != expected_points
+              {
+                  bail!(
+                      "V3 curve verification count mismatch: expected {expected_routes} routes/{expected_points} accounted points, got {verified_routes} routes/{} evaluated/{unavailable_points} unavailable",
+                      evaluated_points
+                  );
+              }
+              if net_profitable_points > gross_profitable_points {
+                  bail!("net-profitable point count cannot exceed gross-profitable point count");
+              }
+              println!(
+                  "V3 all-DEX multi-size round-trip verification passed for {verified_routes} routes: {evaluated_points} evaluated, {unavailable_points} insufficient-liquidity points, {gross_profitable_points} gross-positive, {net_profitable_points} positive under {cost_floor_lamports}-lamport cost floor"
+              );
+              Ok(())
+          }
+          '''
+
+          text = text[:start] + new_function + text[end:]
+          path.write_text(text)
+          PY
+
+      - name: Install stable Rust
+        run: |
+          rustup update stable
+          rustup default stable
+          rustup component add rustfmt clippy
+
+      - name: Format
+        run: cargo fmt --all
+
+      - name: Compile check
+        run: cargo check --all-targets
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Tests
+        run: cargo test --all-targets
+
+      - name: Commit integration
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/app.rs
+          git diff --cached --quiet && { echo "No V3 cost integration changes produced"; exit 1; }
+          git commit -m "feat: integrate V3 execution cost floor"
+          git push
