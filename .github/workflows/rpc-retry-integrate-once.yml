@@ -1,0 +1,237 @@
+name: rpc-retry-integrate-once
+
+on:
+  push:
+    paths:
+      - '.github/workflows/rpc-retry-integrate-once.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  integrate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Integrate bounded transient HTTP retry
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+
+          path = Path('src/rpc.rs')
+          text = path.read_text()
+
+          text = text.replace(
+              'use reqwest::Client;',
+              'use reqwest::{header::RETRY_AFTER, Client, StatusCode};',
+              1,
+          )
+
+          old_constants = '''const MIN_CONTEXT_SLOT_NOT_REACHED_CODE: i64 = -32016;
+          const FULL_ACCOUNT_MAX_ATTEMPTS: usize = 3;
+          const MIN_CONTEXT_SLOT_RETRY_BASE_MS: u64 = 200;'''
+          new_constants = '''const MIN_CONTEXT_SLOT_NOT_REACHED_CODE: i64 = -32016;
+          const MIN_CONTEXT_SLOT_MAX_RETRIES: usize = 2;
+          const MIN_CONTEXT_SLOT_RETRY_BASE_MS: u64 = 200;
+          const TRANSIENT_HTTP_MAX_RETRIES: usize = 4;
+          const TRANSIENT_HTTP_RETRY_BASE_MS: u64 = 1_000;
+          const TRANSIENT_HTTP_RETRY_MAX_MS: u64 = 30_000;'''
+          if text.count(old_constants) != 1:
+              raise SystemExit(f'constants anchor count={text.count(old_constants)}')
+          text = text.replace(old_constants, new_constants, 1)
+
+          start_marker = 'pub async fn fetch_accounts('
+          end_marker = '\nfn build_full_accounts_request('
+          start = text.find(start_marker)
+          end = text.find(end_marker, start)
+          if start < 0 or end < 0:
+              raise SystemExit(f'fetch_accounts boundary not found: start={start}, end={end}')
+
+          new_fetch = r'''pub async fn fetch_accounts(
+              client: &Client,
+              rpc_url: &str,
+              addresses: &[String],
+              min_context_slot: Option<u64>,
+          ) -> Result<AccountBatch> {
+              if addresses.is_empty() {
+                  return Ok(AccountBatch {
+                      slot: min_context_slot.unwrap_or_default(),
+                      accounts: Vec::new(),
+                  });
+              }
+
+              let request = build_full_accounts_request(addresses, min_context_slot)?;
+              let mut min_context_retries = 0usize;
+              let mut transient_http_retries = 0usize;
+
+              loop {
+                  let response = client
+                      .post(rpc_url)
+                      .json(&request)
+                      .send()
+                      .await
+                      .map_err(|_| anyhow::anyhow!("Solana RPC full-account request failed"))?;
+                  let status = response.status();
+
+                  if !status.is_success() {
+                      if should_retry_http_status(status, transient_http_retries) {
+                          let retry_after = response
+                              .headers()
+                              .get(RETRY_AFTER)
+                              .and_then(|value| value.to_str().ok());
+                          let delay_ms = transient_http_retry_delay_ms(
+                              transient_http_retries,
+                              retry_after,
+                          );
+                          transient_http_retries += 1;
+                          sleep(Duration::from_millis(delay_ms)).await;
+                          continue;
+                      }
+                      bail!("Solana RPC full-account request returned status {status}");
+                  }
+
+                  let body = response
+                      .text()
+                      .await
+                      .map_err(|_| anyhow::anyhow!("failed to read Solana RPC full-account response"))?;
+
+                  if let Some(code) = full_accounts_rpc_error_code(&body) {
+                      if should_retry_min_context_slot_error(
+                          code,
+                          min_context_retries,
+                          min_context_slot.is_some(),
+                      ) {
+                          sleep(Duration::from_millis(min_context_retry_delay_ms(
+                              min_context_retries,
+                          )))
+                          .await;
+                          min_context_retries += 1;
+                          continue;
+                      }
+                  }
+
+                  return parse_full_accounts_response(&body);
+              }
+          }
+          '''
+          text = text[:start] + new_fetch + text[end:]
+
+          helper_start = text.find('fn should_retry_min_context_slot_error(')
+          helper_end = text.find('\nfn parse_account_owners(', helper_start)
+          if helper_start < 0 or helper_end < 0:
+              raise SystemExit(f'retry helper boundary not found: start={helper_start}, end={helper_end}')
+
+          new_helpers = r'''fn should_retry_min_context_slot_error(
+              code: i64,
+              retry_count: usize,
+              has_min_context_slot: bool,
+          ) -> bool {
+              has_min_context_slot
+                  && code == MIN_CONTEXT_SLOT_NOT_REACHED_CODE
+                  && retry_count < MIN_CONTEXT_SLOT_MAX_RETRIES
+          }
+
+          fn min_context_retry_delay_ms(retry_count: usize) -> u64 {
+              MIN_CONTEXT_SLOT_RETRY_BASE_MS * (retry_count as u64 + 1)
+          }
+
+          fn should_retry_http_status(status: StatusCode, retry_count: usize) -> bool {
+              retry_count < TRANSIENT_HTTP_MAX_RETRIES
+                  && matches!(status.as_u16(), 408 | 429 | 500 | 502 | 503 | 504)
+          }
+
+          fn transient_http_retry_delay_ms(retry_count: usize, retry_after: Option<&str>) -> u64 {
+              if let Some(seconds) = retry_after.and_then(|value| value.parse::<u64>().ok()) {
+                  return seconds
+                      .saturating_mul(1_000)
+                      .min(TRANSIENT_HTTP_RETRY_MAX_MS);
+              }
+
+              TRANSIENT_HTTP_RETRY_BASE_MS
+                  .saturating_mul(1_u64 << retry_count.min(5))
+                  .min(TRANSIENT_HTTP_RETRY_MAX_MS)
+          }
+          '''
+          text = text[:helper_start] + new_helpers + text[helper_end:]
+
+          old_test = '''    #[test]
+              fn retry_policy_is_narrow_and_bounded() {
+                  assert!(should_retry_min_context_slot_error(-32016, 0, true));
+                  assert!(should_retry_min_context_slot_error(-32016, 1, true));
+                  assert!(!should_retry_min_context_slot_error(-32016, 2, true));
+                  assert!(!should_retry_min_context_slot_error(-32016, 0, false));
+                  assert!(!should_retry_min_context_slot_error(-32602, 0, true));
+                  assert_eq!(retry_delay_ms(0), 200);
+                  assert_eq!(retry_delay_ms(1), 400);
+              }'''
+          new_test = '''    #[test]
+              fn retry_policy_is_narrow_and_bounded() {
+                  assert!(should_retry_min_context_slot_error(-32016, 0, true));
+                  assert!(should_retry_min_context_slot_error(-32016, 1, true));
+                  assert!(!should_retry_min_context_slot_error(-32016, 2, true));
+                  assert!(!should_retry_min_context_slot_error(-32016, 0, false));
+                  assert!(!should_retry_min_context_slot_error(-32602, 0, true));
+                  assert_eq!(min_context_retry_delay_ms(0), 200);
+                  assert_eq!(min_context_retry_delay_ms(1), 400);
+              }
+
+              #[test]
+              fn transient_http_retry_policy_is_bounded_and_selective() {
+                  for code in [408, 429, 500, 502, 503, 504] {
+                      let status = StatusCode::from_u16(code).unwrap();
+                      assert!(should_retry_http_status(status, 0));
+                      assert!(should_retry_http_status(status, 3));
+                      assert!(!should_retry_http_status(status, 4));
+                  }
+                  for code in [400, 401, 403, 404, 409, 422] {
+                      assert!(!should_retry_http_status(
+                          StatusCode::from_u16(code).unwrap(),
+                          0
+                      ));
+                  }
+              }
+
+              #[test]
+              fn transient_http_backoff_prefers_retry_after_and_caps_delay() {
+                  assert_eq!(transient_http_retry_delay_ms(0, None), 1_000);
+                  assert_eq!(transient_http_retry_delay_ms(1, None), 2_000);
+                  assert_eq!(transient_http_retry_delay_ms(3, None), 8_000);
+                  assert_eq!(transient_http_retry_delay_ms(0, Some("2")), 2_000);
+                  assert_eq!(transient_http_retry_delay_ms(0, Some("999")), 30_000);
+                  assert_eq!(transient_http_retry_delay_ms(2, Some("invalid")), 4_000);
+              }'''
+          if text.count(old_test) != 1:
+              raise SystemExit(f'retry test anchor count={text.count(old_test)}')
+          text = text.replace(old_test, new_test, 1)
+
+          path.write_text(text)
+          PY
+
+      - name: Install stable Rust
+        run: |
+          rustup update stable
+          rustup default stable
+          rustup component add rustfmt clippy
+
+      - name: Format
+        run: cargo fmt --all
+
+      - name: Compile check
+        run: cargo check --all-targets
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Tests
+        run: cargo test --all-targets
+
+      - name: Commit integration
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/rpc.rs
+          git diff --cached --quiet && { echo "No RPC retry changes produced"; exit 1; }
+          git commit -m "fix: retry transient RPC rate limits"
+          git push
