@@ -71,7 +71,7 @@ Run：`31784845211`
 
 Commit：`5f48f642787eef590eff183858ad8ece7d270687`
 
-状态：**正在运行**。
+状态：**✅ 完整跑满并成功退出**。
 
 配置：
 
@@ -81,19 +81,60 @@ OPPORTUNITY_MONITOR_UPDATE_TIMEOUT_SECONDS=45
 OPPORTUNITY_MONITOR_MAX_RECONNECTS=20
 ```
 
-每 60 秒 heartbeat 记录：
+实际运行：**2:00:35**。
+
+最终 monitor 汇总：
 
 ```text
-elapsed
-JSONL records
-JSONL bytes
-context_slot_recoveries
+processed_updates=4524
+appended_records=60252
+total_records=60252
+connected_sessions=16
+reconnects=6
+context_slot_recoveries=0
+subscription_refreshes=10
+duplicate_updates=0
+stale_updates=0
+max_updates_in_single_session=1413
+evaluated=55974
+insufficient=4278
+gross_positive=189
+net_positive=47
 ```
 
-验收重点：
+资源与数据量：
 
-- 是否跑满约 2 小时；
-- `-32016` 出现后是否转为 `context_slot_recoveries` 并继续运行；
-- reconnect / subscription refresh / duplicate / stale 的频率；
-- gross-positive / net-positive 的数量与持续性；
-- JSONL 增长速度与峰值 RSS。
+- JSONL：**60,252 行**
+- JSONL 原始大小：约 **41 MiB**
+- 峰值 RSS：**60,576 KB（约 59.2 MiB）**
+- artifact ID：`9216349069`
+- artifact size：`1,526,425` bytes（压缩后）
+- artifact digest：`sha256:0629bf633e56fdbcb8355ab6d0d637e8ce12e7954735ea0cf3da30ce33798efb`
+
+### 可靠性结论
+
+- 2 小时内没有再次出现 `-32016`，因此这次没有实际触发 `context_slot_recoveries`；恢复分支已由单测/正式 CI 验证，但仍需要更长 VPS 样本覆盖真实触发。
+- WSS 共建立 16 个 session，发生 6 次普通重连和 10 次动态依赖订阅刷新。
+- `duplicate_updates=0`、`stale_updates=0`。
+- 单个 session 最多连续处理 **1,413** 个 update。
+- monitor 跑满时限后正常退出，JSONL 与最终统计一致。
+
+### artifact 初步机会分析
+
+实际下载并解析 60,252 条 JSONL 后：
+
+- 47 个 `net_positive` probe records 中，BONK **43**，WIF **4**。
+- 这些记录只分布在 **5 个 trigger slot**，说明同一市场状态会因多个依赖账户连续更新而被重复评估。
+- 因此 **47 不能解释为 47 次独立套利机会**。后续机会统计必须按市场状态/slot/route 做 episode 去重与持续时间分析。
+- 当前最大观察到的单条净利润 probe 为 BONK `Meteora DLMM → Orca`、输入 `0.1 SOL`，`net_profit_raw=121,780 lamports`；但成本仍只是 6,000 lamports 研究下界，不能直接视为真实可执行利润。
+- WIF 的正净利润记录很少，当前样本中只在 `Orca → Raydium` 的部分金额点出现。
+
+### 当前解释边界
+
+这 2 小时样本已经证明：
+
+1. 常驻 monitor 可以在 GitHub-hosted Linux 上连续工作 2 小时；
+2. 实际市场中确实会出现正毛利润/正“研究净利润” probe；
+3. 正值高度成簇，事件级计数会显著高估独立机会；
+4. 在进入 V4 前，还需要把 **opportunity episode 去重、持续时间、真实执行成本/延迟** 纳入分析；
+5. 2 小时仍不能替代 VPS 24–72 小时长期稳定性样本。
