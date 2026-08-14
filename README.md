@@ -35,7 +35,7 @@
 | `QuoteContextCache` | ✅ | 只刷新 affected Context；相关路径完全本地 Quote |
 | JSONL 持久化 / 统计 | ✅ | append-only、严格重读、分组统计 |
 | 连续 monitor | ✅ | 长连接、去重/stale、有限重连、动态依赖刷新 |
-| Linux VPS 部署准备 | ✅ | systemd/env、x86_64/ARM64 release artifact、checksum |
+| Linux VPS 部署准备 | ✅ | systemd/env、x86_64/ARM64 release artifact、checksum、release 主网 smoke |
 | 24–72h 长时采样 | 🔄 | **尚未实际执行，因此 V3 尚未整体完成** |
 
 ## 当前研究 Universe
@@ -143,7 +143,7 @@ DEX swap fee 已体现在两腿 Quote 输出中，不重复扣除。
 
 ## Linux VPS 部署准备
 
-仓库已经提供 provider-neutral 部署层：
+仓库提供 provider-neutral 部署层：
 
 ```text
 deploy/
@@ -160,71 +160,80 @@ deploy/
 
 详细命令见 `deploy/README.md`。
 
-## Release 构建链路
+## Release 构建与部署验收
 
-生产采样不在 VPS 上现编 Rust 依赖。`release-build` 使用原生 GitHub-hosted runner 分别生成：
+生产采样不在 VPS 上现编 Rust 依赖。`release-build` 使用原生 GitHub-hosted runner分别生成 Linux x86_64 和 ARM64/aarch64 artifact。
 
-```text
-Linux x86_64 artifact
-Linux ARM64/aarch64 artifact
-```
-
-每个架构均执行：
+每个架构现在都必须执行：
 
 ```text
 cargo build --release --locked
         ↓
 cargo test --release --locked --all-targets
         ↓
-file 架构断言
+直接运行 target/release/solana-meme-arb
         ↓
-SHA256SUMS
+真实 Helius WSS / Mainnet 1-update smoke
+        ↓
+峰值 RSS 测量
+        ↓
+file 架构断言 + SHA256SUMS
         ↓
 Actions artifact
 ```
 
-### 双架构最终验收
+### 双架构 artifact / checksum 验收
 
 Run `31771245684`，commit `48e3e51c14996a3374c9f824f9220d63e1380057`：
 
+- x86_64 与 ARM64 均 native release build ✅
+- 两边 release tests：**114 passed / 0 failed** ✅
+- `file` 分别确认 x86-64 / ARM aarch64 ✅
+- 两个 artifact 均实际下载、解压并执行 `sha256sum -c SHA256SUMS` → `solana-meme-arb: OK` ✅
+
+### 最终 release binary 主网 smoke + 内存实测
+
+Run `31771794143`，commit `72ef71ddea1d910a35b47d02333b870835dd8ad7`：
+
 #### x86_64
 
-- native runner：`ubuntu-24.04`
-- release build ✅
-- release tests：**114 passed / 0 failed**
-- `file`：ELF 64-bit x86-64 ✅
-- artifact ID：`9208224334`
-- artifact size：`3,740,250` bytes
-- artifact digest：`sha256:5fdd56ce15744b16e45827bf03d4a392308ba57839163f1edb73e7f6f90f4740`
+- release tests：**114 / 114**
+- 最终 `target/release/solana-meme-arb opportunity-monitor` 直接运行
+- Helius WSS subscriptions：32
+- 真实 trigger：WSOL Mint，slot `439161856`
+- 2 affected Meteora pools → 8 routes → **24 JSONL records**
+- 20 evaluated + 4 insufficient
+- `processed_updates=1`
+- `reconnects=0`
+- 峰值 RSS：**21,304 KB（约 20.8 MiB）**
+- release smoke wall time：22.38 秒
+- binary SHA256：`21c35aa1bf1f05e19809a44440bd783595fa6119aac3418f9e523daf358c805e`
+- artifact ID：`9208425707`
+- artifact size：`3,740,179` bytes
+- artifact digest：`sha256:8bda9b9bdef5b13c8cf685dd0d6bea474ad8d10b3ea942fd3641630a950ad168`
 
 #### ARM64 / aarch64
 
-- native runner：`ubuntu-24.04-arm`
-- 首次冷 `cargo build --release --locked`：**5分31秒**
-- release tests：**114 passed / 0 failed**
-- binary：约 **8.9 MB**
-- `file`：`ELF 64-bit ... ARM aarch64` ✅
+- release tests：**114 / 114**
+- 最终 `target/release/solana-meme-arb opportunity-monitor` 直接运行
+- Helius WSS subscriptions：32
+- 同一真实 trigger：WSOL Mint，slot `439161856`
+- 2 affected Meteora pools → 8 routes → **24 JSONL records**
+- 20 evaluated + 4 insufficient
+- `processed_updates=1`
+- `reconnects=0`
+- 峰值 RSS：**19,344 KB（约 18.9 MiB）**
+- release smoke wall time：35.88 秒
 - binary SHA256：`9e700e4c1efbd655385042462a093a3bdf2e1bc9ec73bcf316302197c950e16c`
-- artifact ID：`9208302819`
-- artifact size：`3,698,494` bytes
-- artifact digest：`sha256:457b01d89cf45c76378211ab3faf35a7e10be619273db92d4580b35307413f38`
-- ARM release cache 已保存供后续复用。
+- artifact ID：`9208425400`
+- artifact size：`3,698,424` bytes
+- artifact digest：`sha256:f904b5406545458abffaf1461f57273c100f5ed4693bf20764602dfc54e7769f`
 
-两个 artifact 都实际下载、解压并执行：
+这说明**生产 release 二进制本体**在两个 CPU 架构上都真实完成了 Helius/Mainnet 监控链路，而不是只通过编译/单测。
 
-```bash
-sha256sum -c SHA256SUMS
-```
+内存数据只是短时 1-update smoke 的峰值，不能冒充 72 小时内存上限；但它为 VPS 规格提供了第一份实际基准。
 
-均得到：
-
-```text
-solana-meme-arb: OK
-```
-
-因此当前部署不再被 CPU 架构锁死：**x86_64 与 ARM64 Linux VPS 都有经过原生 release build、114 个 release tests、架构断言和 checksum 的可部署产物。**
-
-同一 commit 的普通 CI Run `31771245661` 也已全部成功。
+同一 commit 的普通 CI Run `31771794149` 也已全部成功。
 
 ## CI / 开发基础设施
 
@@ -235,7 +244,8 @@ solana-meme-arb: OK
 - `fmt / check / clippy -D warnings / tests`
 - V0–V3 真实联网回归
 - V3.6.2 连续 WSS E2E
-- 普通 Cargo cache 与不同架构的 release cache 分离
+- x86_64 / ARM64 分离 release cache
+- release artifact 必须通过 native release tests + live smoke + checksum
 - README / deploy 文档更新不触发普通 Rust CI
 - 同分支快速提交通过 `concurrency` 取消旧 CI
 
@@ -251,6 +261,7 @@ solana-meme-arb: OK
 - Orca/Meteora 不同 `Pubkey` crate：Context 层显式区分。
 - `QuoteContext` large enum：三个 DEX variant 统一 Box，不关闭 Clippy。
 - release artifact 首版 checksum 路径错误：真实下载检查时发现并修复。
+- GitHub Runner 0-step 异常：通过 concurrency group 轮换脱离异常旧组，不修改业务逻辑。
 
 ## 当前边界 / 风险
 
@@ -260,6 +271,7 @@ solana-meme-arb: OK
 - 当前成本只是研究下界，不是实盘成本。
 - 目前没有正净利润证据。
 - V3.6.2 只有两条连续 update，**没有 24–72h 长期稳定性证据**。
+- Release RSS 只有短时 smoke 数据，长期峰值仍需 VPS 样本确认。
 - VPS 尚未部署，因此没有长时数据集。
 
 ## V3 完成标准
@@ -272,7 +284,8 @@ V3 只有在 Linux VPS 长时采样后才整体标记完成。至少回答：
 4. 正价差持续多少 slot / 多久。
 5. 0.01 / 0.05 / 0.10 SOL 哪个规模更可执行。
 6. 429 / `-32016` / stale / duplicate 的实际频率。
-7. 数据是否支持继续 BONK/WIF、扩充 Universe，或根本不值得进入 V4。
+7. 实际 RSS / CPU / JSONL 增长是否稳定。
+8. 数据是否支持继续 BONK/WIF、扩充 Universe，或根本不值得进入 V4。
 
 ## 下一步
 
@@ -301,8 +314,9 @@ V3 只有在 Linux VPS 长时采样后才整体标记完成。至少回答：
 
 - V3.6.2 Run `31769969751`：114 tests，同一 WSS session 连续 2 update → 24 JSONL。
 - 增加 provider-neutral Linux VPS 部署模板：systemd + env + 中文说明。
-- 普通 CI 升级 `actions/checkout@v7`，同 commit 最新 Run `31771245661` 成功。
-- `release-build` 升级为 x86_64 + ARM64 两个原生 runner 的矩阵构建。
-- 双架构 Run `31771245684`：两边 release build、114/114 release tests、架构断言、artifact 均成功。
-- x86_64 与 ARM64 artifact 都实际下载并通过 `sha256sum -c SHA256SUMS`。
-- **当前已完成部署前全部代码/CI/release 准备；V3 下一步是实际 VPS 24–72 小时采样。**
+- `release-build` 升级为 x86_64 + ARM64 两个 native runner。
+- 双架构 artifact 已实际下载并通过 checksum。
+- Run `31771794143`：x86_64 / ARM64 **最终 release 二进制**都真实连接 Helius/Mainnet、处理 1 update 并写入 24 JSONL。
+- 实测 release 峰值 RSS：x86_64 约 20.8 MiB；ARM64 约 18.9 MiB。
+- 同 commit 普通 CI Run `31771794149` 全部成功。
+- **当前部署前可验证的代码/CI/release 工作已收口；V3 下一步是实际 VPS 24–72 小时采样。**
