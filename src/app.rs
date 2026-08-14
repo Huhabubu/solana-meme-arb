@@ -49,7 +49,10 @@ use crate::{
     },
     persistence::{append_records, read_records, summarize_records, OpportunityRecord},
     quote_context::{QuoteContextCache, QuoteRuntime},
-    rpc::{fetch_account_owners, fetch_accounts, verify_pool_accounts, PUBLIC_MAINNET_RPC},
+    rpc::{
+        fetch_account_owners, fetch_accounts, is_min_context_slot_not_reached,
+        verify_pool_accounts, PUBLIC_MAINNET_RPC,
+    },
     state::{DependencyKind, PoolDependencies, QuoteState, VersionedAccountData},
     token_account::{decode_spl_token_account, decode_spl_token_mint, SPL_TOKEN_PROGRAM_ID},
     tokens::{tracked_tokens, Token, WSOL},
@@ -1898,6 +1901,7 @@ async fn run_opportunity_monitor(client: &Client) -> Result<()> {
     let mut duplicate_updates = 0usize;
     let mut stale_updates = 0usize;
     let mut reconnects = 0usize;
+    let mut context_slot_recoveries = 0usize;
     let mut subscription_refreshes = 0usize;
     let mut connected_sessions = 0usize;
     let mut max_updates_in_single_session = 0usize;
@@ -1993,11 +1997,27 @@ async fn run_opportunity_monitor(client: &Client) -> Result<()> {
                 UpdateNovelty::New => {}
             }
 
-            let Some(result) = process_opportunity_update(
+            let result = match process_opportunity_update(
                 client, &config, &mut state, &mut cache, &pools, &update,
             )
-            .await?
-            else {
+            .await
+            {
+                Ok(result) => result,
+                Err(error) if is_min_context_slot_not_reached(&error) => {
+                    context_slot_recoveries += 1;
+                    println!(
+                "V3.6 monitor minContextSlot recovery: address={} slot={} recoveries={context_slot_recoveries}; rebuilding latest state and WSS session",
+                update.address, update.slot
+            );
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    state = build_quote_state_for_pools(client, &config, &pools).await?;
+                    cache = QuoteContextCache::build(&state, &pools)?;
+                    continue 'session;
+                }
+                Err(error) => return Err(error),
+            };
+
+            let Some(result) = result else {
                 stale_updates += 1;
                 println!(
                     "V3.6 monitor QuoteState rejected stale update: address={} slot={}",
@@ -2056,7 +2076,7 @@ async fn run_opportunity_monitor(client: &Client) -> Result<()> {
         bail!("opportunity monitor incremental statistics diverged from JSONL replay");
     }
     println!(
-        "V3.6 monitor completed: processed_updates={processed_updates} appended_records={appended_records} total_records={} connected_sessions={connected_sessions} reconnects={reconnects} subscription_refreshes={subscription_refreshes} duplicate_updates={duplicate_updates} stale_updates={stale_updates} max_updates_in_single_session={max_updates_in_single_session} evaluated={} insufficient={} gross_positive={} net_positive={}",
+        "V3.6 monitor completed: processed_updates={processed_updates} appended_records={appended_records} total_records={} connected_sessions={connected_sessions} reconnects={reconnects} context_slot_recoveries={context_slot_recoveries} subscription_refreshes={subscription_refreshes} duplicate_updates={duplicate_updates} stale_updates={stale_updates} max_updates_in_single_session={max_updates_in_single_session} evaluated={} insufficient={} gross_positive={} net_positive={}",
         final_stats.total,
         final_stats.evaluated,
         final_stats.insufficient_liquidity,

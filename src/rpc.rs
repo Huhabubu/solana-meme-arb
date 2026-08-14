@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{error::Error as StdError, fmt, time::Duration};
 
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
@@ -73,6 +73,34 @@ struct FullRpcAccount {
 struct RpcError {
     code: i64,
     message: String,
+}
+
+#[derive(Debug)]
+struct RpcResponseError {
+    code: i64,
+    message: String,
+}
+
+impl fmt::Display for RpcResponseError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "Solana RPC error {}: {}",
+            self.code, self.message
+        )
+    }
+}
+
+impl StdError for RpcResponseError {}
+
+/// 长期 monitor 用它区分“RPC 节点尚未追上 minContextSlot”和其他真实错误。
+/// 错误即使被 anyhow context 包裹，仍可沿 error chain 被识别。
+pub fn is_min_context_slot_not_reached(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<RpcResponseError>()
+            .is_some_and(|rpc_error| rpc_error.code == MIN_CONTEXT_SLOT_NOT_REACHED_CODE)
+    })
 }
 
 /// 只读取账户 owner，因此通过 dataSlice 请求 0 字节账户数据，减少 RPC 响应体积。
@@ -264,7 +292,10 @@ fn parse_full_accounts_response(body: &str) -> Result<AccountBatch> {
     let envelope: FullRpcEnvelope =
         serde_json::from_str(body).context("invalid Solana full-account RPC JSON")?;
     if let Some(error) = envelope.error {
-        bail!("Solana RPC error {}: {}", error.code, error.message);
+        return Err(anyhow::Error::new(RpcResponseError {
+            code: error.code,
+            message: error.message,
+        }));
     }
 
     let result = envelope
@@ -430,6 +461,22 @@ mod tests {
         assert_eq!(full_accounts_rpc_error_code(lagging), Some(-32016));
         assert_eq!(full_accounts_rpc_error_code("not-json"), None);
         assert!(parse_full_accounts_response("not-json").is_err());
+    }
+
+    #[test]
+    fn exhausted_min_context_slot_error_remains_machine_detectable() {
+        let lagging = r#"{"jsonrpc":"2.0","error":{"code":-32016,"message":"Minimum context slot has not been reached"},"id":1}"#;
+        let error = parse_full_accounts_response(lagging).unwrap_err();
+        assert!(is_min_context_slot_not_reached(&error));
+
+        let wrapped = parse_full_accounts_response(lagging)
+            .context("outer monitor context")
+            .unwrap_err();
+        assert!(is_min_context_slot_not_reached(&wrapped));
+
+        let other = r#"{"jsonrpc":"2.0","error":{"code":-32602,"message":"bad params"},"id":1}"#;
+        let error = parse_full_accounts_response(other).unwrap_err();
+        assert!(!is_min_context_slot_not_reached(&error));
     }
 
     #[test]
