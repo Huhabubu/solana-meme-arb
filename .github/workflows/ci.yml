@@ -158,3 +158,27 @@ jobs:
           cargo run -- opportunity-wss-check
           test -s "$OPPORTUNITY_LOG_PATH"
           echo "V3.6 JSONL line count: $(wc -l < "$OPPORTUNITY_LOG_PATH")"
+
+      # V3.6.2：同一个进程/同一个 WSS session 连续处理至少 2 条真实账户更新。
+      # 最终日志必须证明两条都在同一 session 内完成，并持续追加到同一个 JSONL。
+      - name: Live V3.6.2 continuous opportunity monitor verification
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        timeout-minutes: 4
+        env:
+          HELIUS_API_KEY: ${{ secrets.HELIUS_API_KEY }}
+          OPPORTUNITY_LOG_PATH: ${{ runner.temp }}/opportunity-monitor.jsonl
+          OPPORTUNITY_MONITOR_UPDATES: "2"
+          OPPORTUNITY_MONITOR_MAX_SECONDS: "120"
+          OPPORTUNITY_MONITOR_UPDATE_TIMEOUT_SECONDS: "45"
+          OPPORTUNITY_MONITOR_MAX_RECONNECTS: "2"
+        run: |
+          if [ -z "$HELIUS_API_KEY" ]; then
+            echo "HELIUS_API_KEY secret is not configured; V3.6.2 continuous monitor verification skipped."
+            exit 0
+          fi
+          rm -f "$OPPORTUNITY_LOG_PATH"
+          cargo run -- opportunity-monitor 2>&1 | tee "$RUNNER_TEMP/opportunity-monitor.log"
+          test -s "$OPPORTUNITY_LOG_PATH"
+          grep -q 'processed_updates=2' "$RUNNER_TEMP/opportunity-monitor.log"
+          grep -q 'max_updates_in_single_session=2' "$RUNNER_TEMP/opportunity-monitor.log"
+          echo "V3.6.2 continuous JSONL line count: $(wc -l < "$OPPORTUNITY_LOG_PATH")"
