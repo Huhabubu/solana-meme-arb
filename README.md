@@ -34,7 +34,8 @@
 | RPC 短暂限流恢复 | ✅ | 429/408/部分 5xx 有界退避；`minContextSlot` 一致性约束不降低 |
 | V3.5.1 affected-route 实时路由 | ✅ | WSS 更新 → affected pool → 相关 Token routes → 结构化 `OpportunityEvent` 已真实验证 |
 | V3.5.2 本地 Quote Context 缓存 | ✅ | 只刷新 affected Pool Context；related routes 两腿均从本地 Context Quote，正式 E2E 已验证 |
-| 机会持久化与统计 | 🔄 下一模块 | 需要把 OpportunityEvent 落盘并形成可连续监控的统计数据 |
+| V3.6.1 JSONL 持久化与统计 | ✅ | 真实 OpportunityEvent 追加写盘、严格重读、分组汇总与行数核验均已通过 |
+| V3.6.2 短时连续监控循环 | 🔄 下一模块 | 需要同一 WSS 会话处理多次 update，并持续追加同一 JSONL |
 
 > 当前仍然是**研究阶段**：没有钱包、没有私钥、没有下单逻辑，也没有证据证明策略已经可盈利。
 
@@ -329,27 +330,89 @@ V3.5 local-context opportunity recompute verified:
 
 因此 V3.5 已完成从“账户更新”到“只刷新受影响 Context，再对相关路径完全本地 Quote”的闭环。
 
+### V3.6.1 — JSONL 持久化与统计
+
+最终验收 Run `31765617583`，Job `94660799354`，已人工读取完整日志核对：
+
+- `cargo fmt` ✅
+- `cargo check` ✅
+- `cargo clippy --all-targets -- -D warnings` ✅
+- **108 passed / 0 failed** ✅
+- V0/V1/V2/V3.4/V3.5 全部真实回归 ✅
+- JSONL 文件非空、程序内重读成功、Shell 行数核验成功 ✅
+
+新增 `src/persistence.rs`：
+
+- `OpportunityRecord` schema version = 1。
+- 记录 observation time、trigger slot/account/subscription、Token、两池 DEX/Pool、输入金额、两腿输出、gross/net、成本、slot 范围与流动性状态。
+- `append_records` 使用 create + append，一条 JSON 一行，不覆盖旧记录。
+- `read_records` 逐行严格解析；空行、损坏 JSON、schema/字段语义错误直接报错，不静默跳过。
+- `summarize_records` 统计 total / evaluated / insufficient / gross-positive / net-positive / best net，并按 Token + route + amount 分组。
+
+4 组新增持久化测试覆盖：Event→Record 状态映射、两次 append 后顺序重读、损坏 JSONL 显式失败、总体与分组统计。
+
+#### 真实落盘 E2E
+
+Run `31765617583` 最后一关：
+
+- WSS 订阅 **32 个** Quote 依赖账户。
+- trigger account：`2qJr7TWGCw3qdHXSfez1YftQcyqyfDVdVGbvvJNQZkPz`。
+- kind：`TickArray`。
+- slot：`439144425`。
+- subscription：`603985`。
+- affected pool：BONK Orca `5zpyutJu9ee6jFymDGoK7F6S5Kczqtc9FomP3ueKuyA9`。
+- 1 affected pool → 4 related routes → **12 OpportunityEvent**。
+- **12 evaluated / 0 insufficient / 0 net-positive**。
+
+随后同一进程把 12 个 Event 转成 12 个 `OpportunityRecord` 并追加到：
+
+```text
+/home/runner/work/_temp/opportunity-events.jsonl
+```
+
+程序重新打开 JSONL 后汇总得到：
+
+```text
+appended=12
+total=12
+evaluated=12
+insufficient_liquidity=0
+gross_positive=0
+net_positive=0
+groups=12
+```
+
+最后 CI Shell 再执行文件非空检查与 `wc -l`，真实输出：
+
+```text
+V3.6 JSONL line count: 12
+```
+
+因此 V3.6.1 已经验证“真实 WSS OpportunityEvent → 追加写盘 → 严格重读 → 汇总统计”整条链路。
+
+> 当前验收仍是**一次 WSS trigger 的持久化 smoke test**。同一进程连续处理多次 update、断线重连后继续追加、周期性统计输出，属于 V3.6.2，尚未标记完成。
+
 ## 最新实时链路
 
-Run `31765141544` 已真实验证：
+Run `31765617583` 已真实验证：
 
 ```text
 Helius WSS dependency update
         ↓
-QuoteState 接收新 slot
+QuoteState + affected Context refresh
         ↓
-reverse index → affected Pool
-        ↓
-只刷新 affected Pool dependencies + QuoteContext
-        ↓
-affected routes
-        ↓
-两腿均从 QuoteContextCache 本地 Quote
+related routes 本地 Quote
         ↓
 OpportunityEvent + gross/net
+        ↓
+OpportunityRecord
+        ↓
+JSONL append
+        ↓
+严格重读 + 分组统计
 ```
 
-这一步结束后，实时机会重算不再为每条 route 重复执行 Pool snapshot HTTP 请求；Meteora 所需 Clock 每轮只刷新一次。
+当前一轮实测写入 12 条 JSONL，行数和 Event 数完全一致。
 
 ## CI / 开发基础设施
 
@@ -399,25 +462,26 @@ V3.4 多路径快速 full-account 请求首次触发 429。现已加入有界退
 - Orca 尚未初始化的 TickArray PDA 按官方空数组语义可用于本地 Quote，但不存在的账户无法直接 WSS 订阅；若该 PDA 后续首次初始化，需要其他已订阅依赖更新触发动态依赖刷新后才能被纳入订阅。这一边界尚未做专门的“新 TickArray 初始化”实时测试。
 - 当前所有已观察 V3 快照都没有提供正净利润证据。
 - 6,000 lamports 只是 V3.4 研究成本下界，不能当成未来实盘交易成本。
-- 实时机会重算已本地化，但还没有机会持久化与 24–72h 长期统计。
+- V3.6.1 已验证一次 trigger 的 JSONL append/read/stats，但尚未验证同一进程多事件连续运行与 WSS 断线重连。
 - 连续 24–72 小时监控不会使用 GitHub Actions 常驻运行；届时迁移 Linux VPS。
 
 ## 下一步
 
-### V3.6 — 机会持久化与监控统计
+### V3.6.2 — 短时连续监控循环
 
-目标：把每次真实 WSS 触发产生的 `OpportunityEvent` 持久化，并形成可用于 24–72h 研究的统计数据。
+目标：把现在“一次收到更新就退出”的 `opportunity-wss-check` 升级为一个可持续处理多次通知的监控循环，并持续追加同一个 JSONL。
 
-首版计划：
+计划：
 
-1. 定义稳定的持久化记录格式，包含触发时间/slot/account、Token、两池路径、输入金额、两腿输出、gross/net、成本、流动性状态。
-2. 采用追加写入，程序异常重启时不覆盖历史记录。
-3. 统计总事件数、可完整报价数、流动性不足数、gross-positive / net-positive 数，以及按 Token/路径/金额分组的机会分布。
-4. 写入与读取/汇总函数分别有单元测试，损坏记录要显式报错，不能静默跳过。
-5. GitHub Actions 做短时真实 WSS 持久化 E2E；确认事件确实落盘并可重新读取/汇总。
-6. 完成后再部署 Linux VPS 跑 24–72h，GitHub Actions 不承担长期常驻监控。
+1. 同一 WSS 连接保持订阅，连续接收多次 `accountNotification`。
+2. 每次 update 都执行：slot 校验 → affected Context refresh → affected routes → OpportunityEvent → JSONL append。
+3. 提供明确的测试模式边界，例如按持续秒数或成功处理 update 数退出；VPS 正式模式则持续运行。
+4. 处理 Ping/Pong、连接关闭与可恢复 WSS 错误；短时 CI 至少验证同一进程处理多次真实 update。
+5. 周期性输出累计 records/evaluated/insufficient/gross-positive/net-positive 统计。
+6. 断线重连策略必须保持已有 JSONL，不覆盖历史；重连后重新建立订阅/状态时不允许旧 slot 覆盖新状态。
+7. 每个新增循环/退出条件/计数函数有测试，并做真实 Helius 短时 E2E。
 
-V3.6 的短时 E2E 和持久化完成后，再进入服务器连续采样；只有连续数据支持后，V3 才会正式完成并讨论 V4。
+V3.6.2 通过后，代码层面的 V3 研究监控器才具备常驻条件；随后部署 Linux VPS 做 24–72 小时真实采样。只有连续样本证明系统能稳定记录并解释机会后，V3 才正式完成并讨论 V4。
 
 ## 开发与安全约定
 
@@ -440,4 +504,6 @@ V3.6 的短时 E2E 和持久化完成后，再进入服务器连续采样；只�
 - V3.5.1 最终 Run `31764204176`：**100 passed / 0 failed**；真实 WSOL Mint WSS update 同时映射 BONK/WIF 两个 Meteora Pool，生成 8 related routes / 24 events，20 evaluated + 4 insufficient，0 net-positive。
 - V3.5.2 新增 `QuoteContextCache`；Meteora 依赖缓存扩展到双方向 BinArray，相关 WSS 依赖达到 32 个。
 - V3.5.2 最终 Run `31765141544`：**104 passed / 0 failed**；真实 Orca TickArray update 只刷新一个 affected Context，4 related routes / 12 events 完全本地重算，0 net-positive。
-- **V3.5 整体完成；下一步进入 V3.6 机会持久化与监控统计。**
+- V3.6.1 新增稳定 JSONL schema、append/read 与分组统计。
+- V3.6.1 最终 Run `31765617583`：**108 passed / 0 failed**；真实 WSS trigger 产生 12 Event，追加 12 JSONL、重读 12、Shell 核验 12 行，0 gross/net positive。
+- **V3.6.1 完成；下一步进入 V3.6.2 短时连续监控循环。**
