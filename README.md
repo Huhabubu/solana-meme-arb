@@ -32,7 +32,8 @@
 | 不足流动性状态 | ✅ | 明确标记 `insufficient_liquidity`，不伪装成亏损或成功 Quote |
 | 执行成本 / 净利润模型 | ✅ | `ExecutionCost → NetOpportunity`，已接入真实 12 路多金额检查 |
 | RPC 短暂限流恢复 | ✅ | 429/408/部分 5xx 有界退避；`minContextSlot` 一致性约束不降低 |
-| 实时 Opportunity Engine | 🔄 下一模块 | WSS 更新后自动重算受影响池及相关路径 |
+| V3.5.1 affected-route 实时路由 | ✅ | WSS 更新 → affected pool → 相关 Token routes → 结构化 `OpportunityEvent` 已真实验证 |
+| V3.5.2 本地 Quote Context 缓存 | 🔄 下一模块 | 未变化池仍会通过 RPC-backed Quote helper 重新抓状态，待改为缓存复用 |
 | 机会持久化与统计 | ⏳ | 尚未进入 24–72h 连续采样 |
 
 > 当前仍然是**研究阶段**：没有钱包、没有私钥、没有下单逻辑，也没有证据证明策略已经可盈利。
@@ -212,18 +213,78 @@ V3.4 第一轮正式 E2E Run `31763274831` 已经真实输出毛利润→成本�
 
 新增两组 HTTP retry 单元测试后，正式测试数从 93 增到 **95**。
 
+### V3.5.1 — WSS affected-route Opportunity Engine
+
+最终验收 Run `31764204176`，已人工读取完整 Job 日志核对：
+
+- `cargo fmt` ✅
+- `cargo check` ✅
+- `cargo clippy --all-targets -- -D warnings` ✅
+- **100 passed / 0 failed** ✅
+- V0/V1/V2/V3.4 全部真实回归 ✅
+- `opportunity-wss-check` 真实执行 ✅
+
+新增：
+
+- `DirectedPoolRoute`：表示同一 Token 下有方向的两池闭环。
+- `affected_directed_pool_routes`：只生成第一腿或第二腿包含 affected pool 的相关路径，并跨 Token 分组隔离、去重。
+- `OpportunityEvent`：结构化记录一条金额 probe 的结果。
+- `OpportunityEventOutcome::Evaluated`：保存两腿输出、gross/net profit、成本和 slot 范围。
+- `OpportunityEventOutcome::InsufficientLiquidity`：显式保存 `FirstLeg / SecondLeg` 流动性不足阶段。
+
+5 组新增单元测试覆盖：单池 affected route、多个 affected pool 去重、未知 pool/错误 base 拒绝、evaluated event 字段一致性、流动性不足显式状态。
+
+#### 真实 WSS 触发
+
+本次收到的真实更新：
+
+- dependency account：`So11111111111111111111111111111111111111112`（WSOL Mint）。
+- slot：`439140377`。
+- subscription：`832759`。
+- dependency kind：`TokenMint`。
+- affected pools：
+  - BONK Meteora DLMM `6oFWm7KPLfxnwMb3z5xwBoXNSPP3JJyirAPqPSiVcnsp`
+  - WIF Meteora DLMM `8Ve9KtGNtLRxCQNAVfkHEP5GRZHjdj6BjB1RQFZewG6V`
+
+因为 WSOL Mint 是两个 Meteora Pool 共享依赖，本次一个 WSS update 同时映射到两个不同 Token 的 affected pool。路由器没有把两个 Token 混在一起：
+
+- 每个 affected Meteora pool 在对应 3-pool Token 组内产生 4 条相关有向路径。
+- BONK 4 条 + WIF 4 条 = **8 related routes**。
+- 每条 3 个金额 probe，共 **24 OpportunityEvent**。
+- **20 evaluated + 4 insufficient-liquidity = 24/24 accounted**。
+- **0 net-positive**。
+
+4 个流动性不足事件仍是 WIF 的 `Raydium → Meteora` / `Orca → Meteora` 在 0.05 / 0.10 SOL 的第二腿，不会被伪装成普通亏损。
+
+最终日志明确输出：
+
+```text
+V3.5 dependency-triggered opportunity recompute verified:
+2 affected pool(s), 8 related route(s), 24 event(s),
+20 evaluated, 4 insufficient-liquidity, 0 net-positive
+```
+
+> **V3.5.1 已完成的是“事件路由增量化”**：一次账户变化只选择涉及 affected pool 的相关 Token/route，不再对 12 条路径无条件全量重算。当前 `evaluate_live_route_events` 内部仍通过现有 RPC-backed Quote helper 为两腿构建快照，尤其未变化的 counterpart pool 还会重新抓链上状态；这部分属于 V3.5.2，不在 V3.5.1 的完成声明内。
+
 ## 最新实时回归
 
-Run `31763729071` 最后一关：
+Run `31764204176`：
 
-- 订阅 31 个去重后的 Quote 依赖账户。
-- 真实收到 WIF Orca TickArray 更新：`GeBHFDNYpCoCqY8Mv2NREj22rnnRSDvMrNVkEscayyjS`。
-- `slot=439139054`。
-- 正确映射到 WIF Orca Pool `D6NdKrKNQPmRZCCnG1GqXtF7MMoHB7qR6GU5TkG59Qz1`。
-- 更新后重新计算 0.01 WSOL Quote：`5.531793 WIF`。
-- 刷新后的依赖集合完整。
+```text
+Helius WSS account update
+        ↓
+QuoteState 接受 slot=439140377
+        ↓
+共享 WSOL Mint → 2 affected Meteora pools
+        ↓
+按 Token 隔离生成 8 related routes
+        ↓
+24 个结构化 OpportunityEvent
+        ↓
+20 evaluated / 4 insufficient / 0 net-positive
+```
 
-因此 V3.4 没有破坏 V2 的实时状态链路。
+这证明“依赖账户 → reverse index → affected pool → Token/route → gross/net event”的实时链路已经真实打通。
 
 ## CI / 开发基础设施
 
@@ -263,41 +324,43 @@ V3.4 多路径快速 full-account 请求首次触发 429。现已加入有界退
 - Orca 当前真实池未覆盖 Token-2022 transfer fee / Adaptive Fee 的实池分支。
 - 当前所有已观察 V3 快照都没有提供正净利润证据。
 - 6,000 lamports 只是 V3.4 研究成本下界，不能当成未来实盘交易成本。
-- V3 还没有把 WSS 每次账户更新直接接到全路径 Opportunity Engine，也没有持久化长期统计。
+- V3.5.1 已实现 affected-route 选择，但未变化 counterpart pool 当前仍会重新通过 RPC 构建 Quote 快照，延迟与 HTTP 请求量仍可继续下降。
+- 还没有机会持久化与 24–72h 长期统计。
 - 连续 24–72 小时监控不会使用 GitHub Actions 常驻运行；届时迁移 Linux VPS。
 
 ## 下一步
 
-### V3.5 — 实时 Opportunity Engine
+### V3.5.2 — 本地 Quote Context 缓存
+
+目标：把 Quote 所需的已解码 Pool 状态与依赖账户快照保存在本地，让 WSS 更新只刷新 affected pool 的 Quote Context；相关路径中的未变化 counterpart pool 直接复用缓存，不再为了每条 route 重复 HTTP 拉取。
 
 目标链路：
 
 ```text
-Helius WSS account update
+初始 coherent snapshot
         ↓
-QuoteState 更新
+PoolQuoteContext cache
         ↓
-找到 affected pool
+WSS dependency update
         ↓
-只重算该 Pool
+只更新 affected Pool context
         ↓
-找到相关 Token / routes
+affected routes
         ↓
-重新计算多金额 gross / net opportunity
+两腿均从本地 context 计算任意 amount Quote
         ↓
-产生结构化 OpportunityEvent
+OpportunityEvent
 ```
 
 成功标准：
 
-1. 不再每次全量重新请求 6 个 Pool；仅处理受更新影响的 Pool/Token/route。
-2. 旧 slot 更新不覆盖新状态。
-3. Pool 的动态依赖变化时 reverse index 正确更新。
-4. 每个 OpportunityEvent 包含 token、两个 pool/dex、输入金额、两腿输出、gross/net profit、成本、slot 范围、流动性状态。
-5. 有单元测试覆盖 affected-route 计算、去重、旧 slot、依赖刷新。
-6. 用真实 WSS 更新做端到端验证：必须看到某个依赖账户变化后，真正触发相关跨池机会重算。
+1. Raydium / Orca / Meteora 都能从可复用的本地 Context 对任意输入 Mint/amount 报价。
+2. 未变化 pool 在一次 WSS opportunity recompute 中不重新执行 full-account HTTP snapshot。
+3. affected pool 的 WSS 数据与动态依赖刷新后能够重建/更新 Context。
+4. 每个 Context/缓存更新函数有测试；旧 slot 不覆盖新 context。
+5. 真实 WSS E2E 日志能够证明：一个 update → affected pool context refresh → related routes 本地重算。
 
-V3.5 通过后再做持久化与 24–72h 统计。
+V3.5.2 完成后，再进入机会持久化与 24–72h 统计。
 
 ## 开发与安全约定
 
@@ -313,10 +376,9 @@ V3.5 通过后再做持久化与 24–72h 统计。
 **2026-08-14**
 
 - V3.4 `ExecutionCost / NetOpportunity` 接入真实 `round-trip-check`。
-- 成本模型函数级测试完成；总测试数达到 93。
 - 第一轮正式 E2E Run `31763274831` 在后段遭遇 Helius HTTP 429，因此未标记完成。
 - `fetch_accounts` 新增独立、有界 transient HTTP retry；保留原有 `minContextSlot` 一致性策略。
-- 新增 2 组 HTTP retry 测试，总测试数达到 **95 passed / 0 failed**。
-- 最终正式 CI Run `31763729071` 全链路成功：32 evaluated + 4 insufficient liquidity；0 gross-positive；0 net-positive under 6000-lamport cost floor。
-- 最后真实 Orca TickArray WSS 更新成功映射、重算并刷新依赖。
-- **V3.4 完成；下一步进入 V3.5 实时 Opportunity Engine。**
+- V3.4 最终 Run `31763729071`：**95 passed / 0 failed**，32 evaluated + 4 insufficient liquidity，0 gross-positive，0 net-positive under 6000-lamport cost floor。
+- V3.5.1 新增 affected-route 选择、`DirectedPoolRoute`、结构化 `OpportunityEvent` 与显式 liquidity stage。
+- V3.5.1 最终 Run `31764204176`：**100 passed / 0 failed**；真实 WSOL Mint WSS update 同时映射 BONK/WIF 两个 Meteora Pool，生成 8 related routes / 24 events，20 evaluated + 4 insufficient，0 net-positive。
+- **V3.5.1 完成；下一步 V3.5.2 本地 Quote Context 缓存。**
