@@ -280,9 +280,8 @@ pub struct OpportunityStats {
     pub groups: BTreeMap<OpportunityGroupKey, OpportunityGroupStats>,
 }
 
-pub fn summarize_records(records: &[OpportunityRecord]) -> Result<OpportunityStats> {
-    let mut stats = OpportunityStats::default();
-    for record in records {
+impl OpportunityStats {
+    pub fn ingest_record(&mut self, record: &OpportunityRecord) -> Result<()> {
         record.validate()?;
         let key = OpportunityGroupKey {
             token_mint: record.token_mint.clone(),
@@ -292,8 +291,8 @@ pub fn summarize_records(records: &[OpportunityRecord]) -> Result<OpportunitySta
             second_pool: record.second_pool.clone(),
             input_amount: record.input_amount,
         };
-        let group = stats.groups.entry(key).or_default();
-        stats.total += 1;
+        let group = self.groups.entry(key).or_default();
+        self.total += 1;
         group.total += 1;
 
         match record.status {
@@ -304,25 +303,38 @@ pub fn summarize_records(records: &[OpportunityRecord]) -> Result<OpportunitySta
                 let net_profit = record
                     .net_profit_raw
                     .context("validated evaluated record lost net profit")?;
-                stats.evaluated += 1;
+                self.evaluated += 1;
                 group.evaluated += 1;
                 if gross_profit > 0 {
-                    stats.gross_positive += 1;
+                    self.gross_positive += 1;
                     group.gross_positive += 1;
                 }
                 if net_profit > 0 {
-                    stats.net_positive += 1;
+                    self.net_positive += 1;
                     group.net_positive += 1;
                 }
-                update_best(&mut stats.best_net_profit_raw, net_profit);
+                update_best(&mut self.best_net_profit_raw, net_profit);
                 update_best(&mut group.best_net_profit_raw, net_profit);
             }
             OpportunityRecordStatus::InsufficientLiquidity => {
-                stats.insufficient_liquidity += 1;
+                self.insufficient_liquidity += 1;
                 group.insufficient_liquidity += 1;
             }
         }
+        Ok(())
     }
+
+    pub fn ingest_records(&mut self, records: &[OpportunityRecord]) -> Result<()> {
+        for record in records {
+            self.ingest_record(record)?;
+        }
+        Ok(())
+    }
+}
+
+pub fn summarize_records(records: &[OpportunityRecord]) -> Result<OpportunityStats> {
+    let mut stats = OpportunityStats::default();
+    stats.ingest_records(records)?;
     Ok(stats)
 }
 
@@ -453,5 +465,19 @@ mod tests {
         assert_eq!(ten_million.total, 2);
         assert_eq!(ten_million.evaluated, 2);
         assert_eq!(ten_million.net_positive, 1);
+    }
+
+    #[test]
+    fn incremental_statistics_match_batch_summary() {
+        let records = vec![
+            record(&evaluated_event(4_000, 10_000)),
+            record(&insufficient_event()),
+            record(&evaluated_event(-2_000, -1_000)),
+        ];
+        let batch = summarize_records(&records).unwrap();
+        let mut incremental = OpportunityStats::default();
+        incremental.ingest_records(&records[..2]).unwrap();
+        incremental.ingest_records(&records[2..]).unwrap();
+        assert_eq!(incremental, batch);
     }
 }

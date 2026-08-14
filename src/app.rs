@@ -1,7 +1,7 @@
 use std::{
     collections::HashSet,
     str::FromStr,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{bail, Context, Result};
@@ -33,8 +33,15 @@ use crate::{
     discovery::{
         discover_pair, select_monitoring_candidates, MAX_POOLS_PER_DEX, MIN_MONITOR_TVL_USD,
     },
-    helius::{check_http, subscribe_accounts_and_wait_for_update, subscribe_and_wait_for_update},
+    helius::{
+        check_http, subscribe_accounts_and_wait_for_update, subscribe_and_wait_for_update,
+        AccountSubscriptionClient, RawAccountUpdate,
+    },
     model::{Dex, PoolInfo},
+    monitor::{
+        dependency_update_may_change_set, reconnect_delay, subscription_sets_equal,
+        OpportunityMonitorConfig, UpdateNovelty, UpdateWatermark,
+    },
     opportunity::{
         affected_directed_pool_routes, apply_execution_cost, directed_route_indices,
         evaluate_round_trip, evaluate_round_trip_curve, DirectedPoolRoute, ExecutionCost,
@@ -70,6 +77,7 @@ enum AppCommand {
     MeteoraQuoteCheck,
     DependencyWssCheck,
     OpportunityWssCheck,
+    OpportunityMonitor,
     RoundTripCheck,
 }
 
@@ -84,6 +92,7 @@ fn parse_command(value: Option<&str>) -> Result<Option<AppCommand>> {
         Some("meteora-quote-check") => Ok(Some(AppCommand::MeteoraQuoteCheck)),
         Some("dependency-wss-check") => Ok(Some(AppCommand::DependencyWssCheck)),
         Some("opportunity-wss-check") => Ok(Some(AppCommand::OpportunityWssCheck)),
+        Some("opportunity-monitor") => Ok(Some(AppCommand::OpportunityMonitor)),
         Some("round-trip-check") => Ok(Some(AppCommand::RoundTripCheck)),
         Some(other) => bail!("unknown command: {other}"),
     }
@@ -93,7 +102,7 @@ pub async fn run() -> Result<()> {
     let argument = std::env::args().nth(1);
     let Some(command) = parse_command(argument.as_deref())? else {
         println!(
-            "Usage: {APP_NAME} <discover|verify|helius-check|raydium-quote-check|orca-quote-check|meteora-quote-check|dependency-wss-check|opportunity-wss-check|round-trip-check>"
+            "Usage: {APP_NAME} <discover|verify|helius-check|raydium-quote-check|orca-quote-check|meteora-quote-check|dependency-wss-check|opportunity-wss-check|opportunity-monitor|round-trip-check>"
         );
         return Ok(());
     };
@@ -108,6 +117,7 @@ pub async fn run() -> Result<()> {
         AppCommand::MeteoraQuoteCheck => run_meteora_quote_check(&client).await,
         AppCommand::DependencyWssCheck => run_dependency_wss_check(&client).await,
         AppCommand::OpportunityWssCheck => run_opportunity_wss_check(&client).await,
+        AppCommand::OpportunityMonitor => run_opportunity_monitor(&client).await,
         AppCommand::RoundTripCheck => run_round_trip_check(&client).await,
     }
 }
@@ -1232,6 +1242,7 @@ async fn build_pool_dependencies(
     client: &Client,
     config: &HeliusConfig,
     pool: &PoolInfo,
+    min_context_slot: Option<u64>,
 ) -> Result<PoolDependencies> {
     match pool.dex {
         Dex::Raydium => {
@@ -1247,7 +1258,7 @@ async fn build_pool_dependencies(
                 client,
                 config.http_url().as_str(),
                 std::slice::from_ref(&pool.address),
-                None,
+                min_context_slot,
             )
             .await?;
             let account = batch.accounts[0]
@@ -1265,7 +1276,7 @@ async fn build_pool_dependencies(
                 client,
                 config.http_url().as_str(),
                 std::slice::from_ref(&pool.address),
-                None,
+                min_context_slot,
             )
             .await?;
             let account = batch.accounts[0]
@@ -1321,8 +1332,13 @@ async fn build_pool_dependencies(
         Dex::MeteoraDlmm => {
             let bitmap_address = bitmap_extension_address(&pool.address)?;
             let addresses = vec![pool.address.clone(), bitmap_address.clone()];
-            let batch =
-                fetch_accounts(client, config.http_url().as_str(), &addresses, None).await?;
+            let batch = fetch_accounts(
+                client,
+                config.http_url().as_str(),
+                &addresses,
+                min_context_slot,
+            )
+            .await?;
             let account = batch.accounts[0]
                 .as_ref()
                 .context("Meteora dependency LbPair missing")?;
@@ -1373,26 +1389,46 @@ async fn build_quote_state(
     client: &Client,
     config: &HeliusConfig,
 ) -> Result<(QuoteState, Vec<PoolInfo>)> {
-    let mut state = QuoteState::new();
     let mut pools = Vec::new();
     let mut seen = HashSet::new();
 
     for token in tracked_tokens() {
         let (_, candidates) = discover_candidates(client, token).await?;
         for pool in supported_quote_pools(&candidates) {
-            if !seen.insert(pool.address.clone()) {
-                continue;
+            if seen.insert(pool.address.clone()) {
+                pools.push(pool);
             }
-            let dependencies = build_pool_dependencies(client, config, &pool).await?;
-            state.replace_pool_dependencies(dependencies)?;
-            pools.push(pool);
         }
     }
     if pools.is_empty() {
         bail!("V2 quoteable universe is empty");
     }
-    preload_state_accounts(client, config, &mut state, &pools, None).await?;
+    let state = build_quote_state_for_pools(client, config, &pools).await?;
     Ok((state, pools))
+}
+
+async fn build_quote_state_for_pools(
+    client: &Client,
+    config: &HeliusConfig,
+    pools: &[PoolInfo],
+) -> Result<QuoteState> {
+    if pools.is_empty() {
+        bail!("cannot build QuoteState for an empty fixed pool universe");
+    }
+    let mut state = QuoteState::new();
+    let mut seen = HashSet::new();
+    for pool in pools {
+        if !seen.insert(pool.address.as_str()) {
+            bail!(
+                "duplicate pool in fixed QuoteState universe: {}",
+                pool.address
+            );
+        }
+        let dependencies = build_pool_dependencies(client, config, pool, None).await?;
+        state.replace_pool_dependencies(dependencies)?;
+    }
+    preload_state_accounts(client, config, &mut state, pools, None).await?;
+    Ok(state)
 }
 
 async fn preload_state_accounts(
@@ -1445,7 +1481,7 @@ async fn refresh_pool_dependencies(
     pool: &PoolInfo,
     min_context_slot: u64,
 ) -> Result<()> {
-    let refreshed = build_pool_dependencies(client, config, pool).await?;
+    let refreshed = build_pool_dependencies(client, config, pool, Some(min_context_slot)).await?;
     state.replace_pool_dependencies(refreshed)?;
     let missing = state.missing_accounts_for_pool(&pool.address)?;
     if missing.is_empty() {
@@ -1573,21 +1609,243 @@ async fn run_dependency_wss_check(client: &Client) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug)]
+struct OpportunityProcessResult {
+    affected_pool_count: usize,
+    related_route_count: usize,
+    evaluated_count: usize,
+    unavailable_count: usize,
+    net_positive_count: usize,
+    records: Vec<OpportunityRecord>,
+    subscription_set_changed: bool,
+}
+
+fn opportunity_monitor_config_from_env() -> Result<OpportunityMonitorConfig> {
+    let target = std::env::var("OPPORTUNITY_MONITOR_UPDATES").ok();
+    let max_seconds = std::env::var("OPPORTUNITY_MONITOR_MAX_SECONDS").ok();
+    let update_timeout = std::env::var("OPPORTUNITY_MONITOR_UPDATE_TIMEOUT_SECONDS").ok();
+    let max_reconnects = std::env::var("OPPORTUNITY_MONITOR_MAX_RECONNECTS").ok();
+    OpportunityMonitorConfig::parse(
+        target.as_deref(),
+        max_seconds.as_deref(),
+        update_timeout.as_deref(),
+        max_reconnects.as_deref(),
+    )
+}
+
+fn opportunity_log_path(required: bool) -> Result<Option<std::path::PathBuf>> {
+    match std::env::var("OPPORTUNITY_LOG_PATH") {
+        Ok(value) if value.trim().is_empty() => {
+            bail!("OPPORTUNITY_LOG_PATH cannot be empty when configured")
+        }
+        Ok(value) => Ok(Some(value.into())),
+        Err(std::env::VarError::NotPresent) if required => {
+            bail!("OPPORTUNITY_LOG_PATH is required for opportunity-monitor")
+        }
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(error) => Err(error).context("failed to read OPPORTUNITY_LOG_PATH"),
+    }
+}
+
+async fn process_opportunity_update(
+    client: &Client,
+    config: &HeliusConfig,
+    state: &mut QuoteState,
+    cache: &mut QuoteContextCache,
+    pools: &[PoolInfo],
+    update: &RawAccountUpdate,
+) -> Result<Option<OpportunityProcessResult>> {
+    let subscribed_before = state.unique_dependency_addresses();
+    let applied = state.apply_account_update(
+        &update.address,
+        VersionedAccountData {
+            slot: update.slot,
+            owner: update.owner.clone(),
+            data: update.data.clone(),
+        },
+    )?;
+    if !applied.accepted {
+        return Ok(None);
+    }
+    if applied.affected_pools.is_empty() {
+        bail!("opportunity update did not map to any affected pool");
+    }
+
+    let affected_pools = applied.affected_pools.clone();
+    println!(
+        "V3.6 trigger: address={} slot={} subscription={} affected_pools={:?}",
+        update.address, update.slot, update.subscription_id, affected_pools
+    );
+    for pool_address in &affected_pools {
+        let dependencies = state
+            .dependencies_for_pool(pool_address)
+            .context("affected pool disappeared from QuoteState")?
+            .clone();
+        let kind = state
+            .dependency_kind(pool_address, &update.address)
+            .context("updated account missing dependency kind")?;
+        let old_context_slot = cache.snapshot_slot(pool_address)?;
+        let refresh_dependencies = dependency_update_may_change_set(kind);
+        println!(
+            "  affected pool={} dex={} kind={kind:?} refresh_dependencies={refresh_dependencies}",
+            dependencies.pool.address, dependencies.pool.dex
+        );
+        if refresh_dependencies {
+            refresh_pool_dependencies(client, config, state, &dependencies.pool, update.slot)
+                .await?;
+        }
+        if !state.missing_accounts_for_pool(pool_address)?.is_empty() {
+            bail!("affected-pool dependencies are incomplete after update");
+        }
+        cache.refresh_pool(state, &dependencies.pool)?;
+        let new_context_slot = cache.snapshot_slot(pool_address)?;
+        if new_context_slot < old_context_slot || new_context_slot < update.slot {
+            bail!("affected quote context did not advance to the WSS update slot");
+        }
+    }
+
+    let subscribed_after = state.unique_dependency_addresses();
+    let subscription_set_changed = !subscription_sets_equal(&subscribed_before, &subscribed_after);
+    let routes = affected_directed_pool_routes(pools, &affected_pools, WSOL)?;
+    if routes.is_empty() {
+        bail!("affected pools produced no related arbitrage routes");
+    }
+
+    let needs_meteora_clock = routes.iter().any(|route| {
+        route.first_pool.dex == Dex::MeteoraDlmm || route.second_pool.dex == Dex::MeteoraDlmm
+    });
+    let clock = if needs_meteora_clock {
+        let clock_address = clock_sysvar_address();
+        let batch = fetch_accounts(
+            client,
+            config.http_url().as_str(),
+            std::slice::from_ref(&clock_address),
+            Some(update.slot),
+        )
+        .await?;
+        let account = batch.accounts[0]
+            .as_ref()
+            .context("Clock sysvar account missing during opportunity recompute")?;
+        Some(decode_clock(&account.data)?)
+    } else {
+        None
+    };
+    let runtime = QuoteRuntime {
+        unix_timestamp: unix_timestamp()?,
+        meteora_clock: clock.as_ref(),
+    };
+    let cost_floor = v3_cost_floor();
+    let observed_at_unix_ms = unix_timestamp_millis()?;
+    let mut evaluated_count = 0usize;
+    let mut unavailable_count = 0usize;
+    let mut net_positive_count = 0usize;
+    let mut records = Vec::with_capacity(routes.len() * ROUND_TRIP_PROBE_LAMPORTS.len());
+
+    println!(
+        "V3.6 local recompute: {} affected pool(s), {} related route(s), clock_refreshed={needs_meteora_clock}",
+        affected_pools.len(),
+        routes.len()
+    );
+    for route in &routes {
+        let token = tracked_tokens()
+            .iter()
+            .find(|token| token.mint == route.token_mint)
+            .context("route token is outside tracked universe")?;
+        let events = evaluate_cached_route_events(cache, route, cost_floor, runtime)?;
+        for event in &events {
+            match &event.outcome {
+                OpportunityEventOutcome::Evaluated {
+                    gross_profit_raw,
+                    net_profit_raw,
+                    ..
+                } => {
+                    evaluated_count += 1;
+                    if *net_profit_raw > 0 {
+                        net_positive_count += 1;
+                    }
+                    println!(
+                        "{}/WSOL monitor event: {}->{} input={} gross_profit_raw={} net_profit_raw={}",
+                        token.symbol,
+                        event.first_dex,
+                        event.second_dex,
+                        event.input_amount,
+                        gross_profit_raw,
+                        net_profit_raw
+                    );
+                }
+                OpportunityEventOutcome::InsufficientLiquidity { stage } => {
+                    unavailable_count += 1;
+                    println!(
+                        "{}/WSOL monitor event: {}->{} input={} status=insufficient_liquidity stage={stage:?}",
+                        token.symbol,
+                        event.first_dex,
+                        event.second_dex,
+                        event.input_amount
+                    );
+                }
+            }
+            records.push(OpportunityRecord::from_event(
+                event,
+                observed_at_unix_ms,
+                update.slot,
+                &update.address,
+                update.subscription_id,
+            )?);
+        }
+    }
+
+    let expected_records = routes.len() * ROUND_TRIP_PROBE_LAMPORTS.len();
+    if records.len() != expected_records || evaluated_count + unavailable_count != records.len() {
+        bail!("opportunity update event accounting mismatch");
+    }
+    Ok(Some(OpportunityProcessResult {
+        affected_pool_count: affected_pools.len(),
+        related_route_count: routes.len(),
+        evaluated_count,
+        unavailable_count,
+        net_positive_count,
+        records,
+        subscription_set_changed,
+    }))
+}
+
+fn append_and_verify_single_update(
+    path: &std::path::Path,
+    result: &OpportunityProcessResult,
+) -> Result<()> {
+    let before_count = if path.exists() {
+        read_records(path)?.len()
+    } else {
+        0
+    };
+    append_records(path, &result.records)?;
+    let stored = read_records(path)?;
+    if stored.len() != before_count + result.records.len() {
+        bail!("opportunity persistence append count mismatch");
+    }
+    let stats = summarize_records(&stored)?;
+    println!(
+        "V3.6 persistence verified: path={} appended={} total={} evaluated={} insufficient_liquidity={} gross_positive={} net_positive={} groups={}",
+        path.display(),
+        result.records.len(),
+        stats.total,
+        stats.evaluated,
+        stats.insufficient_liquidity,
+        stats.gross_positive,
+        stats.net_positive,
+        stats.groups.len()
+    );
+    Ok(())
+}
+
 async fn run_opportunity_wss_check(client: &Client) -> Result<()> {
     let config = HeliusConfig::from_env()?;
     let (mut state, pools) = build_quote_state(client, &config).await?;
     let mut cache = QuoteContextCache::build(&state, &pools)?;
-    if cache.len() != pools.len() {
-        bail!("V3.5 quote context cache did not cover every pool");
-    }
     let addresses = state.unique_dependency_addresses();
     let accepted_addresses = addresses.iter().cloned().collect::<HashSet<_>>();
-    if accepted_addresses.is_empty() {
-        bail!("V3.5 opportunity universe has no quote dependency accounts");
-    }
-
     println!(
-        "V3.5 opportunity WSS subscribing to {} unique dependencies across {} cached quote contexts",
+        "V3.6 opportunity WSS subscribing to {} unique dependencies across {} cached contexts",
         addresses.len(),
         cache.len()
     );
@@ -1598,207 +1856,213 @@ async fn run_opportunity_wss_check(client: &Client) -> Result<()> {
         Duration::from_secs(DEPENDENCY_WSS_WAIT_SECONDS),
     )
     .await?;
-    let applied = state.apply_account_update(
-        &update.address,
-        VersionedAccountData {
-            slot: update.slot,
-            owner: update.owner.clone(),
-            data: update.data.clone(),
-        },
-    )?;
-    if !applied.accepted {
-        bail!("V3.5 received dependency update older than local QuoteState");
-    }
-    if applied.affected_pools.is_empty() {
-        bail!("V3.5 dependency update did not map to any affected pool");
-    }
-
-    let affected_pools = applied.affected_pools.clone();
+    let result =
+        process_opportunity_update(client, &config, &mut state, &mut cache, &pools, &update)
+            .await?
+            .context("single opportunity WSS update was stale relative to local state")?;
     println!(
-        "V3.5 trigger: address={} slot={} subscription={} affected_pools={:?}",
-        update.address, update.slot, update.subscription_id, affected_pools
+        "V3.6 single-update recompute verified: {} affected pool(s), {} related route(s), {} records, {} evaluated, {} insufficient-liquidity, {} net-positive, subscription_set_changed={}",
+        result.affected_pool_count,
+        result.related_route_count,
+        result.records.len(),
+        result.evaluated_count,
+        result.unavailable_count,
+        result.net_positive_count,
+        result.subscription_set_changed
     );
-    for pool_address in &affected_pools {
-        let dependencies = state
-            .dependencies_for_pool(pool_address)
-            .context("V3.5 affected pool disappeared from QuoteState")?
-            .clone();
-        let kind = state
-            .dependency_kind(pool_address, &update.address)
-            .context("V3.5 updated account missing dependency kind")?;
-        let old_context_slot = cache.snapshot_slot(pool_address)?;
-        println!(
-            "  affected pool={} dex={} kind={kind:?}; refreshing dependencies/context from local QuoteState",
-            dependencies.pool.address, dependencies.pool.dex
-        );
-        refresh_pool_dependencies(client, &config, &mut state, &dependencies.pool, update.slot)
-            .await?;
-        if !state.missing_accounts_for_pool(pool_address)?.is_empty() {
-            bail!("V3.5 refreshed affected-pool dependencies are incomplete");
-        }
-        cache.refresh_pool(&state, &dependencies.pool)?;
-        let new_context_slot = cache.snapshot_slot(pool_address)?;
-        if new_context_slot < old_context_slot || new_context_slot < update.slot {
-            bail!("V3.5 affected quote context did not advance to the WSS update slot");
-        }
+    if let Some(path) = opportunity_log_path(false)? {
+        append_and_verify_single_update(&path, &result)?;
     }
+    Ok(())
+}
 
-    let routes = affected_directed_pool_routes(&pools, &affected_pools, WSOL)?;
-    if routes.is_empty() {
-        bail!("V3.5 affected pools produced no related arbitrage routes");
-    }
-
-    // Meteora 官方本地 Quote 需要 Clock；Clock 不作为 WSS trigger，但每轮机会重算只刷新一次。
-    let clock_address = clock_sysvar_address();
-    let clock_batch = fetch_accounts(
-        client,
-        config.http_url().as_str(),
-        std::slice::from_ref(&clock_address),
-        Some(update.slot),
-    )
-    .await?;
-    let clock_account = clock_batch.accounts[0]
-        .as_ref()
-        .context("V3.5 Clock sysvar account missing")?;
-    let clock = decode_clock(&clock_account.data)?;
-    let runtime = QuoteRuntime {
-        unix_timestamp: unix_timestamp()?,
-        meteora_clock: Some(&clock),
+async fn run_opportunity_monitor(client: &Client) -> Result<()> {
+    let config = HeliusConfig::from_env()?;
+    let monitor_config = opportunity_monitor_config_from_env()?;
+    let log_path =
+        opportunity_log_path(true)?.context("opportunity monitor requires a persistence path")?;
+    let existing_records = if log_path.exists() {
+        read_records(&log_path)?
+    } else {
+        Vec::new()
     };
-    let cost_floor = v3_cost_floor();
-    let mut event_count = 0usize;
-    let mut evaluated_count = 0usize;
-    let mut unavailable_count = 0usize;
-    let mut net_positive_count = 0usize;
-    let mut persistence_events = Vec::new();
+    let initial_record_count = existing_records.len();
+    let mut cumulative_stats = summarize_records(&existing_records)?;
+    let (initial_state, pools) = build_quote_state(client, &config).await?;
+    let mut state = initial_state;
+    let mut cache = QuoteContextCache::build(&state, &pools)?;
+    let mut watermark = UpdateWatermark::default();
+    let started = Instant::now();
+    let mut processed_updates = 0usize;
+    let mut appended_records = 0usize;
+    let mut duplicate_updates = 0usize;
+    let mut stale_updates = 0usize;
+    let mut reconnects = 0usize;
+    let mut subscription_refreshes = 0usize;
+    let mut connected_sessions = 0usize;
+    let mut max_updates_in_single_session = 0usize;
 
-    println!(
-        "V3.5 local context recompute: {} affected pool(s), {} related route(s); route evaluator performs no pool snapshot HTTP requests, Clock refreshed once at slot {}",
-        affected_pools.len(),
-        routes.len(),
-        clock_batch.slot
-    );
-    for route in &routes {
-        let token = tracked_tokens()
-            .iter()
-            .find(|token| token.mint == route.token_mint)
-            .context("V3.5 route token is outside tracked universe")?;
-        let events = evaluate_cached_route_events(&cache, route, cost_floor, runtime)?;
-        persistence_events.extend(events.iter().cloned());
-        for event in &events {
-            match &event.outcome {
-                OpportunityEventOutcome::Evaluated {
-                    intermediate_amount,
-                    final_amount,
-                    gross_profit_raw,
-                    gross_return_ppm,
-                    execution_cost_lamports,
-                    net_profit_raw,
-                    net_return_ppm,
-                    oldest_slot,
-                    newest_slot,
-                } => {
-                    evaluated_count += 1;
-                    if *net_profit_raw > 0 {
-                        net_positive_count += 1;
+    'session: loop {
+        if monitor_config.target_reached(processed_updates) {
+            break;
+        }
+        let Some(connect_timeout) = monitor_config.wait_timeout(started.elapsed()) else {
+            break;
+        };
+        let addresses = state.unique_dependency_addresses();
+        let accepted_addresses = addresses.iter().cloned().collect::<HashSet<_>>();
+        let mut subscription = match AccountSubscriptionClient::connect(
+            &config,
+            &addresses,
+            &accepted_addresses,
+            connect_timeout,
+        )
+        .await
+        {
+            Ok(subscription) => subscription,
+            Err(error) => {
+                if !monitor_config.reconnect_allowed(reconnects) {
+                    return Err(error)
+                        .context("opportunity monitor exhausted WSS reconnect budget");
+                }
+                let delay = reconnect_delay(reconnects);
+                reconnects += 1;
+                println!(
+                    "V3.6 monitor connect failed; reconnect={reconnects} delay_ms={} error={error:#}",
+                    delay.as_millis()
+                );
+                tokio::time::sleep(delay).await;
+                state = build_quote_state_for_pools(client, &config, &pools).await?;
+                cache = QuoteContextCache::build(&state, &pools)?;
+                continue;
+            }
+        };
+        connected_sessions += 1;
+        let session_id = connected_sessions;
+        let subscribed_addresses = addresses;
+        let mut session_processed = 0usize;
+        println!(
+            "V3.6 monitor session={session_id} connected subscriptions={} processed_updates={processed_updates}",
+            subscribed_addresses.len()
+        );
+
+        loop {
+            if monitor_config.target_reached(processed_updates) {
+                break 'session;
+            }
+            let Some(wait_timeout) = monitor_config.wait_timeout(started.elapsed()) else {
+                break 'session;
+            };
+            let update = match subscription.next_update(wait_timeout).await {
+                Ok(update) => update,
+                Err(error) => {
+                    if !monitor_config.reconnect_allowed(reconnects) {
+                        return Err(error)
+                            .context("opportunity monitor exhausted WSS reconnect budget");
                     }
+                    let delay = reconnect_delay(reconnects);
+                    reconnects += 1;
                     println!(
-                        "{}/WSOL V3.5 cached event: {}->{} input={} token_out={} final={} gross_profit_raw={} gross_return_ppm={} execution_cost={} net_profit_raw={} net_return_ppm={} slots={}..{}",
-                        token.symbol,
-                        event.first_dex,
-                        event.second_dex,
-                        event.input_amount,
-                        intermediate_amount,
-                        final_amount,
-                        gross_profit_raw,
-                        gross_return_ppm,
-                        execution_cost_lamports,
-                        net_profit_raw,
-                        net_return_ppm,
-                        oldest_slot,
-                        newest_slot
+                        "V3.6 monitor socket interrupted session={session_id}; reconnect={reconnects} delay_ms={} error={error:#}",
+                        delay.as_millis()
                     );
+                    tokio::time::sleep(delay).await;
+                    state = build_quote_state_for_pools(client, &config, &pools).await?;
+                    cache = QuoteContextCache::build(&state, &pools)?;
+                    continue 'session;
                 }
-                OpportunityEventOutcome::InsufficientLiquidity { stage } => {
-                    unavailable_count += 1;
+            };
+
+            match watermark.classify(&update) {
+                UpdateNovelty::Duplicate => {
+                    duplicate_updates += 1;
                     println!(
-                        "{}/WSOL V3.5 cached event: {}->{} input={} status=insufficient_liquidity stage={stage:?}",
-                        token.symbol,
-                        event.first_dex,
-                        event.second_dex,
-                        event.input_amount
+                        "V3.6 monitor duplicate update skipped: address={} slot={}",
+                        update.address, update.slot
                     );
+                    continue;
                 }
+                UpdateNovelty::Stale => {
+                    stale_updates += 1;
+                    println!(
+                        "V3.6 monitor stale update skipped: address={} slot={}",
+                        update.address, update.slot
+                    );
+                    continue;
+                }
+                UpdateNovelty::New => {}
+            }
+
+            let Some(result) = process_opportunity_update(
+                client, &config, &mut state, &mut cache, &pools, &update,
+            )
+            .await?
+            else {
+                stale_updates += 1;
+                println!(
+                    "V3.6 monitor QuoteState rejected stale update: address={} slot={}",
+                    update.address, update.slot
+                );
+                continue;
+            };
+
+            append_records(&log_path, &result.records)?;
+            cumulative_stats.ingest_records(&result.records)?;
+            appended_records += result.records.len();
+            processed_updates += 1;
+            session_processed += 1;
+            max_updates_in_single_session = max_updates_in_single_session.max(session_processed);
+            println!(
+                "V3.6 monitor progress: session={session_id} session_processed={session_processed} processed_updates={processed_updates} appended_records={appended_records} total_records={} evaluated={} insufficient={} gross_positive={} net_positive={}",
+                cumulative_stats.total,
+                cumulative_stats.evaluated,
+                cumulative_stats.insufficient_liquidity,
+                cumulative_stats.gross_positive,
+                cumulative_stats.net_positive
+            );
+
+            if monitor_config.target_reached(processed_updates) {
+                break 'session;
+            }
+            let current_addresses = state.unique_dependency_addresses();
+            if result.subscription_set_changed
+                || !subscription_sets_equal(&subscribed_addresses, &current_addresses)
+            {
+                subscription_refreshes += 1;
+                println!(
+                    "V3.6 monitor dependency set changed; rebuilding session after {} processed update(s)",
+                    session_processed
+                );
+                state = build_quote_state_for_pools(client, &config, &pools).await?;
+                cache = QuoteContextCache::build(&state, &pools)?;
+                continue 'session;
             }
         }
-        event_count += events.len();
     }
 
-    let expected_events = routes.len() * ROUND_TRIP_PROBE_LAMPORTS.len();
-    if event_count != expected_events || evaluated_count + unavailable_count != event_count {
-        bail!(
-            "V3.5 cached opportunity event accounting mismatch: routes={} expected_events={} events={} evaluated={} unavailable={}",
-            routes.len(),
-            expected_events,
-            event_count,
-            evaluated_count,
-            unavailable_count
-        );
+    if let Some(target) = monitor_config.target_updates {
+        if processed_updates < target {
+            bail!(
+                "opportunity monitor deadline reached before target: processed={processed_updates} target={target}"
+            );
+        }
+    }
+    let stored = read_records(&log_path)?;
+    if stored.len() != initial_record_count + appended_records {
+        bail!("opportunity monitor persisted record count mismatch");
+    }
+    let final_stats = summarize_records(&stored)?;
+    if final_stats != cumulative_stats {
+        bail!("opportunity monitor incremental statistics diverged from JSONL replay");
     }
     println!(
-        "V3.5 local-context opportunity recompute verified: {} affected pool(s), {} related route(s), {} event(s), {} evaluated, {} insufficient-liquidity, {} net-positive",
-        affected_pools.len(),
-        routes.len(),
-        event_count,
-        evaluated_count,
-        unavailable_count,
-        net_positive_count
+        "V3.6 monitor completed: processed_updates={processed_updates} appended_records={appended_records} total_records={} connected_sessions={connected_sessions} reconnects={reconnects} subscription_refreshes={subscription_refreshes} duplicate_updates={duplicate_updates} stale_updates={stale_updates} max_updates_in_single_session={max_updates_in_single_session} evaluated={} insufficient={} gross_positive={} net_positive={}",
+        final_stats.total,
+        final_stats.evaluated,
+        final_stats.insufficient_liquidity,
+        final_stats.gross_positive,
+        final_stats.net_positive
     );
-
-    if let Ok(log_path) = std::env::var("OPPORTUNITY_LOG_PATH") {
-        if log_path.trim().is_empty() {
-            bail!("OPPORTUNITY_LOG_PATH cannot be empty when configured");
-        }
-        let path = std::path::Path::new(&log_path);
-        let before_count = if path.exists() {
-            read_records(path)?.len()
-        } else {
-            0
-        };
-        let observed_at_unix_ms = unix_timestamp_millis()?;
-        let records = persistence_events
-            .iter()
-            .map(|event| {
-                OpportunityRecord::from_event(
-                    event,
-                    observed_at_unix_ms,
-                    update.slot,
-                    &update.address,
-                    update.subscription_id,
-                )
-            })
-            .collect::<Result<Vec<_>>>()?;
-        if records.len() != event_count {
-            bail!("V3.6 persistence record count diverged from opportunity events");
-        }
-        append_records(path, &records)?;
-        let stored = read_records(path)?;
-        if stored.len() != before_count + records.len() {
-            bail!("V3.6 persistence append count mismatch");
-        }
-        let stats = summarize_records(&stored)?;
-        println!(
-            "V3.6 persistence verified: path={} appended={} total={} evaluated={} insufficient_liquidity={} gross_positive={} net_positive={} groups={}",
-            path.display(),
-            records.len(),
-            stats.total,
-            stats.evaluated,
-            stats.insufficient_liquidity,
-            stats.gross_positive,
-            stats.net_positive,
-            stats.groups.len()
-        );
-    }
     Ok(())
 }
 
@@ -1842,6 +2106,10 @@ mod tests {
         assert_eq!(
             parse_command(Some("opportunity-wss-check")).unwrap(),
             Some(AppCommand::OpportunityWssCheck)
+        );
+        assert_eq!(
+            parse_command(Some("opportunity-monitor")).unwrap(),
+            Some(AppCommand::OpportunityMonitor)
         );
         assert_eq!(
             parse_command(Some("round-trip-check")).unwrap(),

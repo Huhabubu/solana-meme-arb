@@ -5,6 +5,7 @@ mod dex;
 mod discovery;
 mod helius;
 mod model;
+mod monitor;
 mod opportunity;
 mod persistence;
 mod quote_context;
