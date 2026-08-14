@@ -1,0 +1,40 @@
+name: v352-workflow-fix-once
+
+on:
+  push:
+    paths:
+      - '.github/workflows/v352-workflow-fix-once.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Patch V3.5.2 generated source type alignment
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+
+          path = Path('.github/workflows/v352-context-cache-once.yml')
+          text = path.read_text()
+          marker = '      - name: Format\n'
+          if text.count(marker) != 1:
+              raise SystemExit(f'format marker count={text.count(marker)}')
+
+          fix_step = '''      - name: Align Orca and Meteora generated types\n        run: |\n          python3 <<'PYFIX'\n          from pathlib import Path\n          path = Path('src/quote_context.rs')\n          text = path.read_text()\n          old_import = "use anchor_client::solana_sdk::{account::Account, clock::Clock, pubkey::Pubkey};"\n          new_import = "use anchor_client::solana_sdk::{account::Account, clock::Clock, pubkey::Pubkey as MeteoraPubkey};\\nuse solana_pubkey::Pubkey as OrcaPubkey;"\n          if text.count(old_import) != 1:\n              raise SystemExit(f'pubkey import anchor count={text.count(old_import)}')\n          text = text.replace(old_import, new_import, 1)\n          text = text.replace('HashMap<Pubkey, BinArray>', 'HashMap<MeteoraPubkey, BinArray>')\n          text = text.replace('Pubkey::from_str(input_mint)', 'OrcaPubkey::from_str(input_mint)')\n          text = text.replace('Pubkey::from_str(ORCA_WHIRLPOOL_PROGRAM_ID)', 'OrcaPubkey::from_str(ORCA_WHIRLPOOL_PROGRAM_ID)')\n          text = text.replace('Pubkey::from_str(&pool.address)', 'OrcaPubkey::from_str(&pool.address)')\n          text = text.replace('quote.token_out', 'quote.token_est_out')\n          path.write_text(text)\n          PYFIX\n\n'''
+          text = text.replace(marker, fix_step + marker, 1)
+          path.write_text(text)
+          PY
+
+      - name: Commit patched generator
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .github/workflows/v352-context-cache-once.yml
+          git diff --cached --quiet && { echo "No generator patch produced"; exit 1; }
+          git commit -m "ci: align V3.5.2 generated Solana types"
+          git push
