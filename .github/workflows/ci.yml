@@ -17,8 +17,9 @@ on:
       - ".github/workflows/**"
 
 # 同一分支快速连续提交时，只保留最新一次 CI，避免旧提交继续消耗 Actions 时间。
+# v2 仅用于脱离 2026-08-14 一次 GitHub Runner 无 step 上报的异常旧 concurrency group。
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  group: ci-v2-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
