@@ -35,7 +35,10 @@ use crate::{
     },
     helius::{check_http, subscribe_accounts_and_wait_for_update, subscribe_and_wait_for_update},
     model::{Dex, PoolInfo},
-    opportunity::{directed_route_indices, evaluate_round_trip_curve, SwapQuote},
+    opportunity::{
+        apply_execution_cost, directed_route_indices, evaluate_round_trip_curve, ExecutionCost,
+        SwapQuote,
+    },
     rpc::{fetch_account_owners, fetch_accounts, verify_pool_accounts, PUBLIC_MAINNET_RPC},
     state::{DependencyKind, PoolDependencies, QuoteState, VersionedAccountData},
     token_account::{decode_spl_token_account, decode_spl_token_mint, SPL_TOKEN_PROGRAM_ID},
@@ -49,6 +52,10 @@ const METEORA_QUOTE_TEST_INPUT_LAMPORTS: u64 = 10_000_000;
 const METEORA_BIN_ARRAY_TAKE_COUNT: u8 = 3;
 const DEPENDENCY_WSS_WAIT_SECONDS: u64 = 45;
 const ROUND_TRIP_PROBE_LAMPORTS: [u64; 3] = [10_000_000, 50_000_000, 100_000_000];
+// V3.4 只用作净利润链路的成本下界：当前假设一笔交易仅 1 个普通签名，
+// 并使用 Jito 文档最低 bundle tip。Priority Fee 在 V4 得到真实 CU 结构后再动态估计。
+const V3_COST_FLOOR_BASE_FEE_LAMPORTS: u64 = 5_000;
+const V3_COST_FLOOR_JITO_TIP_LAMPORTS: u64 = 1_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AppCommand {
@@ -662,9 +669,26 @@ async fn quote_supported_pool_amounts(
 
 async fn run_round_trip_check(client: &Client) -> Result<()> {
     let config = HeliusConfig::from_env()?;
+    let cost_floor = ExecutionCost {
+        base_fee_lamports: V3_COST_FLOOR_BASE_FEE_LAMPORTS,
+        jito_tip_lamports: V3_COST_FLOOR_JITO_TIP_LAMPORTS,
+        ..ExecutionCost::ZERO
+    };
+    let cost_floor_lamports = cost_floor.total_lamports()?;
     let mut verified_routes = 0usize;
     let mut evaluated_points = 0usize;
     let mut unavailable_points = 0usize;
+    let mut gross_profitable_points = 0usize;
+    let mut net_profitable_points = 0usize;
+
+    println!(
+        "V3 execution cost floor: base={} priority={} jito_tip={} other={} total={} lamports; lower-bound research scenario, not a live landing-cost estimate",
+        cost_floor.base_fee_lamports,
+        cost_floor.priority_fee_lamports,
+        cost_floor.jito_tip_lamports,
+        cost_floor.other_lamports,
+        cost_floor_lamports
+    );
 
     for token in tracked_tokens() {
         let (_, candidates) = discover_candidates(client, token).await?;
@@ -787,8 +811,20 @@ async fn run_round_trip_check(client: &Client) -> Result<()> {
                 if opportunity.input_amount != ROUND_TRIP_PROBE_LAMPORTS[index] {
                     bail!("V3 round-trip result no longer matches original probe amount");
                 }
+
+                let net = apply_execution_cost(opportunity, cost_floor)?;
+                if opportunity.gross_profit_raw > 0 {
+                    gross_profitable_points += 1;
+                }
+                if net.is_profitable() {
+                    net_profitable_points += 1;
+                }
+                if net.net_profit_raw > opportunity.gross_profit_raw {
+                    bail!("execution cost unexpectedly improved profit");
+                }
+
                 println!(
-                    "{}/WSOL V3 curve point: {}->{} input={} token_out={} final={} gross_profit_raw={} gross_return_ppm={} slots={}..{}",
+                    "{}/WSOL V3 curve point: {}->{} input={} token_out={} final={} gross_profit_raw={} gross_return_ppm={} execution_cost_floor={} net_profit_floor_raw={} net_return_floor_ppm={} slots={}..{}",
                     token.symbol,
                     first_pool.dex,
                     second_pool.dex,
@@ -797,6 +833,9 @@ async fn run_round_trip_check(client: &Client) -> Result<()> {
                     opportunity.final_amount,
                     opportunity.gross_profit_raw,
                     opportunity.gross_return_ppm,
+                    net.execution_cost_lamports,
+                    net.net_profit_raw,
+                    net.net_return_ppm,
                     opportunity.oldest_slot,
                     opportunity.newest_slot
                 );
@@ -826,8 +865,11 @@ async fn run_round_trip_check(client: &Client) -> Result<()> {
             evaluated_points
         );
     }
+    if net_profitable_points > gross_profitable_points {
+        bail!("net-profitable point count cannot exceed gross-profitable point count");
+    }
     println!(
-        "V3 all-DEX multi-size round-trip verification passed for {verified_routes} routes: {evaluated_points} evaluated, {unavailable_points} insufficient-liquidity points"
+        "V3 all-DEX multi-size round-trip verification passed for {verified_routes} routes: {evaluated_points} evaluated, {unavailable_points} insufficient-liquidity points, {gross_profitable_points} gross-positive, {net_profitable_points} positive under {cost_floor_lamports}-lamport cost floor"
     );
     Ok(())
 }
