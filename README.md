@@ -33,8 +33,8 @@
 | 执行成本 / 净利润模型 | ✅ | `ExecutionCost → NetOpportunity`，已接入真实 12 路多金额检查 |
 | RPC 短暂限流恢复 | ✅ | 429/408/部分 5xx 有界退避；`minContextSlot` 一致性约束不降低 |
 | V3.5.1 affected-route 实时路由 | ✅ | WSS 更新 → affected pool → 相关 Token routes → 结构化 `OpportunityEvent` 已真实验证 |
-| V3.5.2 本地 Quote Context 缓存 | 🔄 下一模块 | 未变化池仍会通过 RPC-backed Quote helper 重新抓状态，待改为缓存复用 |
-| 机会持久化与统计 | ⏳ | 尚未进入 24–72h 连续采样 |
+| V3.5.2 本地 Quote Context 缓存 | ✅ | 只刷新 affected Pool Context；related routes 两腿均从本地 Context Quote，正式 E2E 已验证 |
+| 机会持久化与统计 | 🔄 下一模块 | 需要把 OpportunityEvent 落盘并形成可连续监控的统计数据 |
 
 > 当前仍然是**研究阶段**：没有钱包、没有私钥、没有下单逻辑，也没有证据证明策略已经可盈利。
 
@@ -264,27 +264,92 @@ V3.5 dependency-triggered opportunity recompute verified:
 20 evaluated, 4 insufficient-liquidity, 0 net-positive
 ```
 
-> **V3.5.1 已完成的是“事件路由增量化”**：一次账户变化只选择涉及 affected pool 的相关 Token/route，不再对 12 条路径无条件全量重算。当前 `evaluate_live_route_events` 内部仍通过现有 RPC-backed Quote helper 为两腿构建快照，尤其未变化的 counterpart pool 还会重新抓链上状态；这部分属于 V3.5.2，不在 V3.5.1 的完成声明内。
+### V3.5.2 — 本地 Quote Context 缓存
 
-## 最新实时回归
+最终验收 Run `31765141544`，已人工读取完整 Job 日志核对：
 
-Run `31764204176`：
+- `cargo fmt` ✅
+- `cargo check` ✅
+- `cargo clippy --all-targets -- -D warnings` ✅
+- **104 passed / 0 failed** ✅
+- V0/V1/V2/V3.4 全部真实回归 ✅
+- V3.5 本地 Context WSS E2E ✅
+
+新增 `QuoteContextCache`，为 6 个可报价 Pool 保存可复用本地 Context：
+
+- Raydium：已解码 AMM state + 两个 vault balance。
+- Orca：Whirlpool + 5 个 TickArray facade + 可选 Oracle。
+- Meteora：LbPair + 双方向 BinArray map + 可选 bitmap + 两个 Mint Account。
+
+所有 Context variant 使用 `Box` 间接存储，避免 Orca 5 个完整 TickArray 把 enum 本体膨胀到几十 KB；这个结构问题由 Clippy 在 guarded 开发阶段实际发现后修正，没有关闭 lint。
+
+Context cache 具备：
+
+- 初始从 `QuoteState` 本地账户字节构建；
+- `refresh_pool` 只重建 affected pool；
+- context slot 不允许倒退；
+- 任意输入 Mint / amount 批量本地 Quote；
+- 未变化 counterpart pool 直接复用旧 Context。
+
+Meteora 的依赖集合现在合并两个 swap 方向需要的 BinArray，因此 WSS 去重依赖从 V3.5.1 的 31 个增加到 **32 个**。Clock sysvar 仍不作为 WSS trigger；每轮 opportunity recompute 只刷新一次 Clock，再供全部相关路径复用。
+
+#### 真实 local-context WSS E2E
+
+Run `31765141544` 收到：
+
+- dependency account：`2qJr7TWGCw3qdHXSfez1YftQcyqyfDVdVGbvvJNQZkPz`
+- kind：`TickArray`
+- slot：`439143063`
+- subscription：`583450`
+- affected pool：BONK Orca Whirlpool `5zpyutJu9ee6jFymDGoK7F6S5Kczqtc9FomP3ueKuyA9`
+
+程序先把 WSS 数据写入 `QuoteState`，刷新该 Orca Pool 的动态依赖与 Context；其余 5 个 Pool Context 保持复用。随后：
+
+- **1 affected pool**
+- **4 related directed routes**
+- **12 OpportunityEvent**（4 routes × 3 amounts）
+- **12 evaluated / 0 insufficient-liquidity**
+- **0 net-positive**
+
+日志明确输出：
 
 ```text
-Helius WSS account update
-        ↓
-QuoteState 接受 slot=439140377
-        ↓
-共享 WSOL Mint → 2 affected Meteora pools
-        ↓
-按 Token 隔离生成 8 related routes
-        ↓
-24 个结构化 OpportunityEvent
-        ↓
-20 evaluated / 4 insufficient / 0 net-positive
+V3.5 local context recompute: 1 affected pool(s), 4 related route(s);
+route evaluator performs no pool snapshot HTTP requests,
+Clock refreshed once at slot 439143063
 ```
 
-这证明“依赖账户 → reverse index → affected pool → Token/route → gross/net event”的实时链路已经真实打通。
+以及最终：
+
+```text
+V3.5 local-context opportunity recompute verified:
+1 affected pool(s), 4 related route(s), 12 event(s),
+12 evaluated, 0 insufficient-liquidity, 0 net-positive
+```
+
+因此 V3.5 已完成从“账户更新”到“只刷新受影响 Context，再对相关路径完全本地 Quote”的闭环。
+
+## 最新实时链路
+
+Run `31765141544` 已真实验证：
+
+```text
+Helius WSS dependency update
+        ↓
+QuoteState 接收新 slot
+        ↓
+reverse index → affected Pool
+        ↓
+只刷新 affected Pool dependencies + QuoteContext
+        ↓
+affected routes
+        ↓
+两腿均从 QuoteContextCache 本地 Quote
+        ↓
+OpportunityEvent + gross/net
+```
+
+这一步结束后，实时机会重算不再为每条 route 重复执行 Pool snapshot HTTP 请求；Meteora 所需 Clock 每轮只刷新一次。
 
 ## CI / 开发基础设施
 
@@ -318,49 +383,41 @@ V2 曾出现未知命令只打印 Usage 且退出码为 0，导致假阳性。�
 
 V3.4 多路径快速 full-account 请求首次触发 429。现已加入有界退避并由正式 Run `31763729071` 完整回归通过。
 
+### V3.5.2 Context 类型与内存布局
+
+第一版 Context Cache 在 guarded CI 中暴露两类问题：
+
+- Orca 与 Meteora 依赖的 Solana `Pubkey` 来自不同 crate 版本，不能混用；最终明确使用 Orca `solana_pubkey::Pubkey` 与 Meteora/Anchor SDK Pubkey。
+- Orca Context 内含 5 个完整 TickArray，Clippy `large_enum_variant` 拒绝通过；随后 Meteora Context 也触发同类问题。最终三个 DEX Context variant 全部统一 Box，保持 enum 小而稳定。
+
+这些失败均发生在 guarded workflow 提交源码之前；最终只有通过 fmt/check/clippy/tests 的版本进入 `main`。
+
 ## 当前边界 / 风险
 
 - 当前可报价池只有 6 个；Raydium CLMM、Meteora DAMM v2 尚未接入 Quote Engine。
 - Orca 当前真实池未覆盖 Token-2022 transfer fee / Adaptive Fee 的实池分支。
+- Orca 尚未初始化的 TickArray PDA 按官方空数组语义可用于本地 Quote，但不存在的账户无法直接 WSS 订阅；若该 PDA 后续首次初始化，需要其他已订阅依赖更新触发动态依赖刷新后才能被纳入订阅。这一边界尚未做专门的“新 TickArray 初始化”实时测试。
 - 当前所有已观察 V3 快照都没有提供正净利润证据。
 - 6,000 lamports 只是 V3.4 研究成本下界，不能当成未来实盘交易成本。
-- V3.5.1 已实现 affected-route 选择，但未变化 counterpart pool 当前仍会重新通过 RPC 构建 Quote 快照，延迟与 HTTP 请求量仍可继续下降。
-- 还没有机会持久化与 24–72h 长期统计。
+- 实时机会重算已本地化，但还没有机会持久化与 24–72h 长期统计。
 - 连续 24–72 小时监控不会使用 GitHub Actions 常驻运行；届时迁移 Linux VPS。
 
 ## 下一步
 
-### V3.5.2 — 本地 Quote Context 缓存
+### V3.6 — 机会持久化与监控统计
 
-目标：把 Quote 所需的已解码 Pool 状态与依赖账户快照保存在本地，让 WSS 更新只刷新 affected pool 的 Quote Context；相关路径中的未变化 counterpart pool 直接复用缓存，不再为了每条 route 重复 HTTP 拉取。
+目标：把每次真实 WSS 触发产生的 `OpportunityEvent` 持久化，并形成可用于 24–72h 研究的统计数据。
 
-目标链路：
+首版计划：
 
-```text
-初始 coherent snapshot
-        ↓
-PoolQuoteContext cache
-        ↓
-WSS dependency update
-        ↓
-只更新 affected Pool context
-        ↓
-affected routes
-        ↓
-两腿均从本地 context 计算任意 amount Quote
-        ↓
-OpportunityEvent
-```
+1. 定义稳定的持久化记录格式，包含触发时间/slot/account、Token、两池路径、输入金额、两腿输出、gross/net、成本、流动性状态。
+2. 采用追加写入，程序异常重启时不覆盖历史记录。
+3. 统计总事件数、可完整报价数、流动性不足数、gross-positive / net-positive 数，以及按 Token/路径/金额分组的机会分布。
+4. 写入与读取/汇总函数分别有单元测试，损坏记录要显式报错，不能静默跳过。
+5. GitHub Actions 做短时真实 WSS 持久化 E2E；确认事件确实落盘并可重新读取/汇总。
+6. 完成后再部署 Linux VPS 跑 24–72h，GitHub Actions 不承担长期常驻监控。
 
-成功标准：
-
-1. Raydium / Orca / Meteora 都能从可复用的本地 Context 对任意输入 Mint/amount 报价。
-2. 未变化 pool 在一次 WSS opportunity recompute 中不重新执行 full-account HTTP snapshot。
-3. affected pool 的 WSS 数据与动态依赖刷新后能够重建/更新 Context。
-4. 每个 Context/缓存更新函数有测试；旧 slot 不覆盖新 context。
-5. 真实 WSS E2E 日志能够证明：一个 update → affected pool context refresh → related routes 本地重算。
-
-V3.5.2 完成后，再进入机会持久化与 24–72h 统计。
+V3.6 的短时 E2E 和持久化完成后，再进入服务器连续采样；只有连续数据支持后，V3 才会正式完成并讨论 V4。
 
 ## 开发与安全约定
 
@@ -381,4 +438,6 @@ V3.5.2 完成后，再进入机会持久化与 24–72h 统计。
 - V3.4 最终 Run `31763729071`：**95 passed / 0 failed**，32 evaluated + 4 insufficient liquidity，0 gross-positive，0 net-positive under 6000-lamport cost floor。
 - V3.5.1 新增 affected-route 选择、`DirectedPoolRoute`、结构化 `OpportunityEvent` 与显式 liquidity stage。
 - V3.5.1 最终 Run `31764204176`：**100 passed / 0 failed**；真实 WSOL Mint WSS update 同时映射 BONK/WIF 两个 Meteora Pool，生成 8 related routes / 24 events，20 evaluated + 4 insufficient，0 net-positive。
-- **V3.5.1 完成；下一步 V3.5.2 本地 Quote Context 缓存。**
+- V3.5.2 新增 `QuoteContextCache`；Meteora 依赖缓存扩展到双方向 BinArray，相关 WSS 依赖达到 32 个。
+- V3.5.2 最终 Run `31765141544`：**104 passed / 0 failed**；真实 Orca TickArray update 只刷新一个 affected Context，4 related routes / 12 events 完全本地重算，0 net-positive。
+- **V3.5 整体完成；下一步进入 V3.6 机会持久化与监控统计。**
