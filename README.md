@@ -14,7 +14,7 @@
 | V0 | BONK / WIF 跨 DEX 池发现与链上账户核验 | ✅ 已完成并验证 |
 | V1 | Helius RPC/WSS 实时账户订阅 | ✅ 已完成并验证 |
 | V2 | DEX Pool State、本地 Swap Quote、依赖账户实时触发 | ✅ 已完成并验证 |
-| V3 | 跨池闭环、多金额利润曲线、成本、实时机会统计 | 🔄 当前进行 |
+| V3 | 跨池闭环、多金额利润曲线、成本、实时机会统计 | 🔄 当前进行：代码层监控器已具备常驻条件，等待 24–72 小时连续采样 |
 | V4 | 原子交易构造与 `simulateTransaction` | ⏳ 未开始 |
 | V5 | 小额实盘执行与 Jito 集成 | ⏳ 未开始 |
 
@@ -35,7 +35,8 @@
 | V3.5.1 affected-route 实时路由 | ✅ | WSS 更新 → affected pool → 相关 Token routes → 结构化 `OpportunityEvent` 已真实验证 |
 | V3.5.2 本地 Quote Context 缓存 | ✅ | 只刷新 affected Pool Context；related routes 两腿均从本地 Context Quote，正式 E2E 已验证 |
 | V3.6.1 JSONL 持久化与统计 | ✅ | 真实 OpportunityEvent 追加写盘、严格重读、分组汇总与行数核验均已通过 |
-| V3.6.2 短时连续监控循环 | 🔄 下一模块 | 需要同一 WSS 会话处理多次 update，并持续追加同一 JSONL |
+| V3.6.2 短时连续监控循环 | ✅ | 同一进程、同一 WSS session 连续处理 2 条真实 update，并持续追加同一 JSONL |
+| V3 长时采样 | 🔄 下一步 | Linux VPS 连续运行 24–72 小时，形成真实机会频率/持续时间/利润分布样本 |
 
 > 当前仍然是**研究阶段**：没有钱包、没有私钥、没有下单逻辑，也没有证据证明策略已经可盈利。
 
@@ -390,14 +391,86 @@ V3.6 JSONL line count: 12
 
 因此 V3.6.1 已经验证“真实 WSS OpportunityEvent → 追加写盘 → 严格重读 → 汇总统计”整条链路。
 
-> 当前验收仍是**一次 WSS trigger 的持久化 smoke test**。同一进程连续处理多次 update、断线重连后继续追加、周期性统计输出，属于 V3.6.2，尚未标记完成。
+### V3.6.2 — 短时连续监控循环
+
+最终验收 Run `31769969751`，Job `94673667609`，已人工读取完整日志核对：
+
+- `cargo fmt` ✅
+- `cargo check` ✅
+- `cargo clippy --all-targets -- -D warnings` ✅
+- **114 passed / 0 failed** ✅
+- V0/V1/V2/V3.4/V3.5/V3.6.1 真实回归全部通过 ✅
+- 同一进程、同一 WSS session 连续处理 2 条真实 update ✅
+- 同一 JSONL 持续追加，并在退出时严格重读/汇总一致 ✅
+
+新增 `OpportunityMonitorConfig`、`UpdateWatermark` 与长连接监控控制：
+
+- 可按成功处理 update 数或最大运行时间退出；
+- 每次 `next_update()` 设独立等待上限；
+- 精确重复 update 跳过；旧 slot update 跳过；同 slot 但数据变化仍接受；
+- 可恢复 WSS 中断使用有限重连和 1/2/4/8… 秒退避，上限 30 秒；
+- 依赖集合变化时重建固定 Universe 的 `QuoteState + QuoteContextCache + WSS session`；
+- JSONL 始终使用 append，不因重连覆盖历史；
+- 累计统计使用增量 ingest，退出时再从完整 JSONL replay，二者必须完全一致。
+
+#### 真实连续 WSS E2E
+
+本次监控连接：
+
+```text
+session=1
+subscriptions=32
+```
+
+随后在**同一个 session=1** 内连续收到两条真实 Orca TickArray 更新，二者 slot 都是 `439156697`，但账户地址不同：
+
+1. `8mHWP1h4NnCmWPDw1PvLJwWLiGCDm3waC2HUqRoTqWQh`
+2. `8v3J8ZMXaVyG3fskBYyyr2WDs153X8ermyQfdE1wGPUt`
+
+两条都映射到 WIF Orca Whirlpool `D6NdKrKNQPmRZCCnG1GqXtF7MMoHB7qR6GU5TkG59Qz1`，`kind=TickArray`，不需要重建动态依赖集合。
+
+每条 update 都产生：
+
+- 1 affected pool；
+- 4 related routes；
+- 12 records；
+- 10 evaluated + 2 insufficient-liquidity；
+- 0 gross-positive / 0 net-positive。
+
+两条累计结果：
+
+```text
+processed_updates=2
+appended_records=24
+total_records=24
+connected_sessions=1
+reconnects=0
+subscription_refreshes=0
+duplicate_updates=0
+stale_updates=0
+max_updates_in_single_session=2
+evaluated=20
+insufficient=4
+gross_positive=0
+net_positive=0
+```
+
+CI 还额外 `grep` 强制要求 `processed_updates=2` 和 `max_updates_in_single_session=2`，因此“两次各自重连、每个 session 只处理一条”不能冒充本轮成功。最后 `wc -l` 真实输出：
+
+```text
+V3.6.2 continuous JSONL line count: 24
+```
+
+因此 V3.6.2 已经验证短时常驻监控器的核心循环。**它证明代码具备常驻条件，但两条 update 不是长期稳定性/机会分布样本，所以 V3 整体仍等待 VPS 24–72 小时采样。**
 
 ## 最新实时链路
 
-Run `31765617583` 已真实验证：
+Run `31769969751` 已真实验证：
 
 ```text
-Helius WSS dependency update
+Helius WSS long-lived session
+        ↓
+next_update() → 去重 / stale slot 过滤
         ↓
 QuoteState + affected Context refresh
         ↓
@@ -407,12 +480,16 @@ OpportunityEvent + gross/net
         ↓
 OpportunityRecord
         ↓
-JSONL append
+同一 JSONL append
         ↓
-严格重读 + 分组统计
+增量统计
+        ↓
+next_update() 继续监听
+        ↓
+退出时 JSONL replay 与增量统计一致性核对
 ```
 
-当前一轮实测写入 12 条 JSONL，行数和 Event 数完全一致。
+本轮实测：同一 WSS session 连续 2 条 update，累计 24 条 JSONL，20 evaluated + 4 insufficient，0 gross/net positive。
 
 ## CI / 开发基础设施
 
@@ -420,6 +497,7 @@ JSONL append
 - `actions/cache@v5` 缓存 Cargo registry/git/target，当前归档约 **958 MB**。
 - cache key 绑定 OS、Rust 版本、`Cargo.toml`、`Cargo.lock`。
 - 同一分支快速连续提交时，通过 `concurrency` 自动取消旧 CI。
+- 2026-08-14 一次 GitHub-hosted Runner 出现“Job 显示 in_progress 但 0 steps、updated_at 不再推进”的调度异常；最终把 concurrency group 从旧组轮换为 `ci-v2-*`，保留原有自动取消语义，同时让新 Run 脱离异常旧组。最终 Run `31769969751` 正常执行并完成。
 - README / 纯文档更新不触发完整 Rust CI。
 - 关键真实联网步骤仍会人工读取 Job 日志，不能只看绿色状态。
 - `actions/checkout@v4` 当前存在 Node.js 20 弃用警告；GitHub runner 会以 Node 24 执行，目前不影响业务验证。
@@ -455,6 +533,12 @@ V3.4 多路径快速 full-account 请求首次触发 429。现已加入有界退
 
 这些失败均发生在 guarded workflow 提交源码之前；最终只有通过 fmt/check/clippy/tests 的版本进入 `main`。
 
+### GitHub Runner 0-step 调度异常
+
+V3.6.2 最终验收前，一条清理提交 Run `31769688476` 被 GitHub 标成 `in_progress`，但 Job API 长时间返回 0 steps，Run 的 `updated_at` 也停止推进；后续同 concurrency group 的 Run 因此排队。
+
+这不是 Rust monitor 超时。处理方式是仅轮换正式 CI concurrency group 到 `ci-v2-*`，不修改业务代码、不关闭并发保护。新 Run `31769969751` 随即获得正常 Runner、完整上报 steps 并全部通过。
+
 ## 当前边界 / 风险
 
 - 当前可报价池只有 6 个；Raydium CLMM、Meteora DAMM v2 尚未接入 Quote Engine。
@@ -462,26 +546,26 @@ V3.4 多路径快速 full-account 请求首次触发 429。现已加入有界退
 - Orca 尚未初始化的 TickArray PDA 按官方空数组语义可用于本地 Quote，但不存在的账户无法直接 WSS 订阅；若该 PDA 后续首次初始化，需要其他已订阅依赖更新触发动态依赖刷新后才能被纳入订阅。这一边界尚未做专门的“新 TickArray 初始化”实时测试。
 - 当前所有已观察 V3 快照都没有提供正净利润证据。
 - 6,000 lamports 只是 V3.4 研究成本下界，不能当成未来实盘交易成本。
-- V3.6.1 已验证一次 trigger 的 JSONL append/read/stats，但尚未验证同一进程多事件连续运行与 WSS 断线重连。
-- 连续 24–72 小时监控不会使用 GitHub Actions 常驻运行；届时迁移 Linux VPS。
+- V3.6.2 已验证同一 WSS session 连续两次 update，但尚未用 24–72 小时样本验证长期连接稳定性、断线重连频率与真实机会分布。
+- 连续 24–72 小时监控不会使用 GitHub Actions 常驻运行；下一步迁移 Linux VPS。
 
 ## 下一步
 
-### V3.6.2 — 短时连续监控循环
+### V3 长时真实采样 — Linux VPS
 
-目标：把现在“一次收到更新就退出”的 `opportunity-wss-check` 升级为一个可持续处理多次通知的监控循环，并持续追加同一个 JSONL。
+代码层面的 V3 监控器现在已经具备常驻条件。下一步不继续用 GitHub Actions 人为拉长运行时间，而是部署到 Linux VPS 做 24–72 小时连续采样。
 
-计划：
+采样目标：
 
-1. 同一 WSS 连接保持订阅，连续接收多次 `accountNotification`。
-2. 每次 update 都执行：slot 校验 → affected Context refresh → affected routes → OpportunityEvent → JSONL append。
-3. 提供明确的测试模式边界，例如按持续秒数或成功处理 update 数退出；VPS 正式模式则持续运行。
-4. 处理 Ping/Pong、连接关闭与可恢复 WSS 错误；短时 CI 至少验证同一进程处理多次真实 update。
-5. 周期性输出累计 records/evaluated/insufficient/gross-positive/net-positive 统计。
-6. 断线重连策略必须保持已有 JSONL，不覆盖历史；重连后重新建立订阅/状态时不允许旧 slot 覆盖新状态。
-7. 每个新增循环/退出条件/计数函数有测试，并做真实 Helius 短时 E2E。
+1. 验证 Helius WSS 长连接的实际稳定性、断线次数、重连次数与 subscription refresh 次数。
+2. 持续记录所有 `OpportunityRecord`，而不是只记录正利润事件，避免样本选择偏差。
+3. 统计 BONK/WIF × DEX route × amount 的 evaluated / insufficient / gross-positive / net-positive 次数与比例。
+4. 统计正价差出现后的持续时间、连续 slot 数、最优输入规模和净利润分布。
+5. 对比 0.01 / 0.05 / 0.10 SOL，判断 Price Impact 与池深度对可执行规模的限制。
+6. 记录程序运行中的 RPC 429、`-32016`、WSS reconnect、stale/duplicate update 等系统指标。
+7. 24–72 小时样本结束后，用 Python/pandas 对 JSONL 做离线分析，并据数据决定：继续 BONK/WIF、扩充动态 Universe，还是进入 V4。
 
-V3.6.2 通过后，代码层面的 V3 研究监控器才具备常驻条件；随后部署 Linux VPS 做 24–72 小时真实采样。只有连续样本证明系统能稳定记录并解释机会后，V3 才正式完成并讨论 V4。
+> **只有长时样本证明系统能稳定记录并解释机会后，才把 V3 整体标记完成并讨论 V4 原子交易。**
 
 ## 开发与安全约定
 
@@ -506,4 +590,7 @@ V3.6.2 通过后，代码层面的 V3 研究监控器才具备常驻条件；随
 - V3.5.2 最终 Run `31765141544`：**104 passed / 0 failed**；真实 Orca TickArray update 只刷新一个 affected Context，4 related routes / 12 events 完全本地重算，0 net-positive。
 - V3.6.1 新增稳定 JSONL schema、append/read 与分组统计。
 - V3.6.1 最终 Run `31765617583`：**108 passed / 0 failed**；真实 WSS trigger 产生 12 Event，追加 12 JSONL、重读 12、Shell 核验 12 行，0 gross/net positive。
-- **V3.6.1 完成；下一步进入 V3.6.2 短时连续监控循环。**
+- V3.6.2 新增长连接 monitor、去重/stale watermark、有限 WSS 重连、依赖集合变化后 session rebuild、增量统计与最终 JSONL replay 一致性检查。
+- V3.6.2 最终 Run `31769969751`：**114 passed / 0 failed**；同一 session 连续处理 2 条真实 TickArray update，累计 24 JSONL，20 evaluated + 4 insufficient，0 gross/net positive；`reconnects=0`、`subscription_refreshes=0`、`max_updates_in_single_session=2`。
+- 清理所有 V3.6.2 one-shot workflow；正式仓库只保留 `ci.yml`。
+- **V3.6.2 完成；下一步进入 Linux VPS 24–72 小时真实采样。**
