@@ -38,7 +38,6 @@ jobs:
         run: echo "version=$(rustc --version | awk '{print $2}')" >> "$GITHUB_OUTPUT"
 
       # 不同 CPU 架构使用独立 release target cache，避免 x86 与 ARM 编译产物混用。
-      # x86_64 首次迁移到新 key 时可从旧 release cache 恢复；ARM64 首次构建从空 target 开始。
       - name: Restore release Cargo cache
         uses: actions/cache@v5
         with:
@@ -56,6 +55,31 @@ jobs:
 
       - name: Release tests
         run: cargo test --release --locked --all-targets
+
+      # 直接运行最终 release 二进制，而不是 cargo/debug 包装层。
+      # 同时记录一轮真实监控的峰值 RSS，给 VPS 规格选择提供实测依据。
+      - name: Live release monitor smoke and memory measurement
+        timeout-minutes: 3
+        env:
+          HELIUS_API_KEY: ${{ secrets.HELIUS_API_KEY }}
+          OPPORTUNITY_LOG_PATH: ${{ runner.temp }}/release-monitor-${{ matrix.arch }}.jsonl
+          OPPORTUNITY_MONITOR_UPDATES: "1"
+          OPPORTUNITY_MONITOR_MAX_SECONDS: "90"
+          OPPORTUNITY_MONITOR_UPDATE_TIMEOUT_SECONDS: "45"
+          OPPORTUNITY_MONITOR_MAX_RECONNECTS: "1"
+        run: |
+          set -o pipefail
+          if [ -z "$HELIUS_API_KEY" ]; then
+            echo "HELIUS_API_KEY secret is required for release deployment verification."
+            exit 1
+          fi
+          rm -f "$OPPORTUNITY_LOG_PATH"
+          /usr/bin/time -v target/release/solana-meme-arb opportunity-monitor \
+            2>&1 | tee "$RUNNER_TEMP/release-monitor-${{ matrix.arch }}.log"
+          test -s "$OPPORTUNITY_LOG_PATH"
+          grep -q 'processed_updates=1' "$RUNNER_TEMP/release-monitor-${{ matrix.arch }}.log"
+          grep 'Maximum resident set size' "$RUNNER_TEMP/release-monitor-${{ matrix.arch }}.log"
+          echo "Release monitor JSONL line count: $(wc -l < "$OPPORTUNITY_LOG_PATH")"
 
       - name: Package deployment bundle
         env:
