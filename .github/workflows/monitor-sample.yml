@@ -1,0 +1,109 @@
+name: monitor-sample-2h
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/monitor-sample.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  sample:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 135
+
+    env:
+      HELIUS_API_KEY: ${{ secrets.HELIUS_API_KEY }}
+      OPPORTUNITY_LOG_PATH: ${{ runner.temp }}/opportunities-2h.jsonl
+      OPPORTUNITY_MONITOR_MAX_SECONDS: "7200"
+      OPPORTUNITY_MONITOR_UPDATE_TIMEOUT_SECONDS: "45"
+      OPPORTUNITY_MONITOR_MAX_RECONNECTS: "20"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install stable Rust
+        run: |
+          rustup update stable
+          rustup default stable
+
+      - name: Resolve Rust cache key
+        id: rust-version
+        run: echo "version=$(rustc --version | awk '{print $2}')" >> "$GITHUB_OUTPUT"
+
+      - name: Restore release Cargo cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-release-x86_64-cargo-${{ steps.rust-version.outputs.version }}-${{ hashFiles('Cargo.toml', 'Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-release-x86_64-cargo-${{ steps.rust-version.outputs.version }}-
+            ${{ runner.os }}-release-cargo-${{ steps.rust-version.outputs.version }}-
+
+      - name: Build verified release binary
+        run: cargo build --release --locked
+
+      - name: Run two-hour monitor sample
+        shell: bash
+        run: |
+          set -u
+          if [ -z "$HELIUS_API_KEY" ]; then
+            echo "HELIUS_API_KEY secret is required."
+            exit 1
+          fi
+
+          rm -f "$OPPORTUNITY_LOG_PATH" "$RUNNER_TEMP/monitor-2h.log"
+          start_epoch=$(date +%s)
+
+          (
+            /usr/bin/time -v target/release/solana-meme-arb opportunity-monitor
+          ) > "$RUNNER_TEMP/monitor-2h.log" 2>&1 &
+          monitor_pid=$!
+
+          while kill -0 "$monitor_pid" 2>/dev/null; do
+            sleep 60
+            now_epoch=$(date +%s)
+            elapsed=$((now_epoch - start_epoch))
+            if [ -f "$OPPORTUNITY_LOG_PATH" ]; then
+              records=$(wc -l < "$OPPORTUNITY_LOG_PATH")
+              bytes=$(stat -c%s "$OPPORTUNITY_LOG_PATH")
+            else
+              records=0
+              bytes=0
+            fi
+            printf '2h sample heartbeat: elapsed=%ss records=%s jsonl_bytes=%s\n' "$elapsed" "$records" "$bytes"
+          done
+
+          set +e
+          wait "$monitor_pid"
+          status=$?
+          set -e
+
+          echo "----- monitor final log tail -----"
+          tail -n 120 "$RUNNER_TEMP/monitor-2h.log" || true
+          echo "----- sample files -----"
+          if [ -f "$OPPORTUNITY_LOG_PATH" ]; then
+            wc -l "$OPPORTUNITY_LOG_PATH"
+            du -h "$OPPORTUNITY_LOG_PATH"
+          fi
+          grep 'V3.6 monitor completed:' "$RUNNER_TEMP/monitor-2h.log" || true
+          grep 'Maximum resident set size' "$RUNNER_TEMP/monitor-2h.log" || true
+
+          exit "$status"
+
+      - name: Upload two-hour sample
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: solana-meme-arb-monitor-2h-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/opportunities-2h.jsonl
+            ${{ runner.temp }}/monitor-2h.log
+          if-no-files-found: warn
+          retention-days: 7
