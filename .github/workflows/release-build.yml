@@ -54,7 +54,7 @@ jobs:
           cp deploy/monitor.env.example dist/monitor.env.example
           cp deploy/README.md dist/DEPLOY.md
           printf 'commit=%s\nrustc=%s\n' "$GITHUB_SHA" "$(rustc --version)" > dist/BUILD-INFO.txt
-          sha256sum dist/solana-meme-arb > dist/SHA256SUMS
+          (cd dist && sha256sum solana-meme-arb > SHA256SUMS)
           ls -lh dist
           cat dist/BUILD-INFO.txt
           cat dist/SHA256SUMS
