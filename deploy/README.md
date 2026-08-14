@@ -11,6 +11,64 @@
 /etc/systemd/system/solana-meme-arb.service  # systemd 服务
 ```
 
+## 0. 从 GitHub Actions 获取已验证 release bundle
+
+仓库永久保留 `.github/workflows/release-build.yml`。真正准备部署时，在 GitHub Actions 手动运行 `release-build`；它会执行：
+
+```text
+cargo build --release --locked
+        ↓
+cargo test --release --locked --all-targets
+        ↓
+打包二进制 + systemd + env 模板 + 本部署说明
+        ↓
+生成 SHA256SUMS
+        ↓
+上传 Actions artifact
+```
+
+不要把普通 `cargo build` 的 debug 二进制拿到 VPS 长时运行。
+
+下载 artifact 并解压后，目录应至少包含：
+
+```text
+solana-meme-arb
+solana-meme-arb.service
+monitor.env.example
+DEPLOY.md
+BUILD-INFO.txt
+SHA256SUMS
+```
+
+安装前先在解压目录验证二进制哈希：
+
+```bash
+sha256sum -c SHA256SUMS
+```
+
+只有看到：
+
+```text
+solana-meme-arb: OK
+```
+
+才继续部署。
+
+`BUILD-INFO.txt` 会记录构建对应的 Git commit 与 Rust 版本，便于以后把服务器正在运行的二进制追溯到仓库版本。
+
+### 已验证的 release 流程样本
+
+2026-08-14 的 Run `31770886583` 已真实验证：
+
+- release cache 命中；
+- `cargo build --release --locked` 成功；
+- release tests：**114 passed / 0 failed**；
+- Linux x86_64 二进制约 **9.4 MB**；
+- artifact ID：`9208092741`；
+- artifact 解压后实际执行 `sha256sum -c SHA256SUMS`，结果为 `solana-meme-arb: OK`。
+
+这只是发布链路验收样本。以后部署应重新对当前目标 commit 运行 `release-build`，不要长期复用过期 artifact。
+
 ## 1. 创建专用系统用户和目录
 
 ```bash
@@ -24,7 +82,7 @@ sudo install -d -m 0750 /etc/solana-meme-arb
 
 ## 2. 安装 release 二进制
 
-部署时使用已经通过 GitHub Actions `cargo build --release --locked` 的版本。把二进制上传到服务器后：
+部署时使用已经通过 GitHub Actions `cargo build --release --locked` 和 release tests 的版本。把 artifact 中的二进制上传到服务器后：
 
 ```bash
 sudo install -m 0755 solana-meme-arb /opt/solana-meme-arb/solana-meme-arb
@@ -34,10 +92,10 @@ sudo install -m 0755 solana-meme-arb /opt/solana-meme-arb/solana-meme-arb
 
 ## 3. 配置 Helius Key
 
-把 `deploy/monitor.env.example` 复制为服务器配置：
+如果使用 release artifact，直接以其中的 `monitor.env.example` 为模板；如果从仓库操作，则使用 `deploy/monitor.env.example`。
 
 ```bash
-sudo cp deploy/monitor.env.example /etc/solana-meme-arb/monitor.env
+sudo cp monitor.env.example /etc/solana-meme-arb/monitor.env
 sudo chmod 600 /etc/solana-meme-arb/monitor.env
 sudo editor /etc/solana-meme-arb/monitor.env
 ```
@@ -54,11 +112,15 @@ HELIUS_API_KEY=REPLACE_WITH_HELIUS_API_KEY
 
 ## 4. 安装 systemd 服务
 
+如果使用 release artifact：
+
 ```bash
-sudo cp deploy/solana-meme-arb.service /etc/systemd/system/solana-meme-arb.service
+sudo cp solana-meme-arb.service /etc/systemd/system/solana-meme-arb.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now solana-meme-arb
 ```
+
+如果直接从仓库部署，对应源文件是 `deploy/solana-meme-arb.service`。
 
 检查状态：
 
@@ -115,7 +177,13 @@ sudo systemctl start solana-meme-arb
 
 ## 7. 更新二进制
 
-先在 GitHub Actions 验证新 commit。服务器更新时：
+先针对目标 commit 重新运行 GitHub Actions `release-build`，下载新 artifact 并执行：
+
+```bash
+sha256sum -c SHA256SUMS
+```
+
+确认 `OK` 后再更新服务器：
 
 ```bash
 sudo systemctl stop solana-meme-arb
