@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
@@ -7,8 +7,8 @@ use futures_util::{SinkExt, StreamExt};
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tokio::time::timeout;
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio::{net::TcpStream, time::timeout};
+use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
 
 use crate::config::HeliusConfig;
 use crate::model::PoolInfo;
@@ -243,14 +243,10 @@ fn parse_server_event(text: &str) -> Result<ServerEvent> {
     Ok(ServerEvent::Other)
 }
 
-/// 通用账户订阅：全部订阅确认后，等待 accepted_addresses 中任意账户出现真实更新。
-/// accepted_addresses 为空时接受任意已订阅地址。
-pub async fn subscribe_accounts_and_wait_for_update(
-    config: &HeliusConfig,
+fn validate_subscription_scope(
     addresses: &[String],
     accepted_addresses: &HashSet<String>,
-    wait_timeout: Duration,
-) -> Result<RawAccountUpdate> {
+) -> Result<()> {
     if addresses.is_empty() {
         bail!("cannot subscribe to an empty account list");
     }
@@ -261,87 +257,148 @@ pub async fn subscribe_accounts_and_wait_for_update(
     {
         bail!("accepted account set contains an address that is not subscribed");
     }
+    Ok(())
+}
 
-    let wss_url = config.wss_url();
-    let (mut socket, _) = connect_async(wss_url.as_str())
-        .await
-        .map_err(|_| anyhow::anyhow!("Helius WSS connection failed"))?;
-    let mut tracker = AddressSubscriptionTracker::new(addresses)?;
+/// 可复用的 Helius accountSubscribe 长连接。连接成功后全部 request id 都必须收到 ACK；
+/// 之后调用方可以在同一 socket 上连续 `next_update`，不会为每条通知重新建连接。
+pub struct AccountSubscriptionClient {
+    socket: WebSocketStream<MaybeTlsStream<TcpStream>>,
+    tracker: AddressSubscriptionTracker,
+    accepted_addresses: HashSet<String>,
+    buffered_updates: VecDeque<RawAccountUpdate>,
+}
 
-    for (index, address) in addresses.iter().enumerate() {
-        let request_id = (index + 1) as u64;
-        let request = build_account_subscribe_request(request_id, address);
-        socket
-            .send(Message::Text(request.into()))
+impl AccountSubscriptionClient {
+    pub async fn connect(
+        config: &HeliusConfig,
+        addresses: &[String],
+        accepted_addresses: &HashSet<String>,
+        acknowledge_timeout: Duration,
+    ) -> Result<Self> {
+        validate_subscription_scope(addresses, accepted_addresses)?;
+        let wss_url = config.wss_url();
+        let (socket, _) = connect_async(wss_url.as_str())
             .await
-            .map_err(|_| anyhow::anyhow!("failed to send Helius subscription request"))?;
+            .map_err(|_| anyhow::anyhow!("Helius WSS connection failed"))?;
+        let mut client = Self {
+            socket,
+            tracker: AddressSubscriptionTracker::new(addresses)?,
+            accepted_addresses: accepted_addresses.clone(),
+            buffered_updates: VecDeque::new(),
+        };
+
+        for (index, address) in addresses.iter().enumerate() {
+            let request_id = (index + 1) as u64;
+            let request = build_account_subscribe_request(request_id, address);
+            client
+                .socket
+                .send(Message::Text(request.into()))
+                .await
+                .map_err(|_| anyhow::anyhow!("failed to send Helius subscription request"))?;
+        }
+
+        timeout(acknowledge_timeout, client.wait_for_acknowledgements())
+            .await
+            .context("timed out waiting for Helius subscription acknowledgements")??;
+        Ok(client)
     }
 
-    timeout(wait_timeout, async {
-        let mut first_accepted_update: Option<RawAccountUpdate> = None;
-
-        loop {
-            if tracker.all_acknowledged() {
-                if let Some(update) = first_accepted_update.take() {
+    pub async fn next_update(&mut self, wait_timeout: Duration) -> Result<RawAccountUpdate> {
+        if let Some(update) = self.buffered_updates.pop_front() {
+            return Ok(update);
+        }
+        timeout(wait_timeout, async {
+            loop {
+                if let Some(update) = self.receive_message().await? {
                     return Ok(update);
                 }
             }
+        })
+        .await
+        .context("timed out waiting for Helius accepted account update")?
+    }
 
-            let message = socket
-                .next()
-                .await
-                .context("Helius WSS closed before account subscription verification completed")?
-                .map_err(|_| anyhow::anyhow!("Helius WSS receive error"))?;
-
-            match message {
-                Message::Text(text) => match parse_server_event(text.as_ref())? {
-                    ServerEvent::SubscriptionAck {
-                        request_id,
-                        subscription_id,
-                    } => tracker.acknowledge(request_id, subscription_id)?,
-                    ServerEvent::AccountNotification {
-                        subscription_id,
-                        slot,
-                        owner,
-                        data,
-                    } => {
-                        let address = tracker.resolve(subscription_id)?.to_owned();
-                        let accepted =
-                            accepted_addresses.is_empty() || accepted_addresses.contains(&address);
-                        if accepted {
-                            first_accepted_update.get_or_insert(RawAccountUpdate {
-                                address,
-                                subscription_id,
-                                slot,
-                                owner,
-                                data,
-                            });
-                        }
-                    }
-                    ServerEvent::RpcError {
-                        request_id,
-                        code,
-                        message,
-                    } => {
-                        bail!("Helius WSS RPC error request={request_id:?} code={code}: {message}");
-                    }
-                    ServerEvent::Other => {}
-                },
-                Message::Close(_) => {
-                    bail!("Helius WSS closed before account subscription verification completed")
-                }
-                Message::Ping(payload) => {
-                    socket
-                        .send(Message::Pong(payload))
-                        .await
-                        .map_err(|_| anyhow::anyhow!("failed to reply to Helius WSS ping"))?;
-                }
-                Message::Binary(_) | Message::Pong(_) | Message::Frame(_) => {}
+    async fn wait_for_acknowledgements(&mut self) -> Result<()> {
+        while !self.tracker.all_acknowledged() {
+            if let Some(update) = self.receive_message().await? {
+                self.buffered_updates.push_back(update);
             }
         }
-    })
-    .await
-    .context("timed out waiting for Helius subscriptions and accepted account update")?
+        Ok(())
+    }
+
+    async fn receive_message(&mut self) -> Result<Option<RawAccountUpdate>> {
+        let message = self
+            .socket
+            .next()
+            .await
+            .context("Helius WSS connection closed")?
+            .map_err(|_| anyhow::anyhow!("Helius WSS receive error"))?;
+
+        match message {
+            Message::Text(text) => match parse_server_event(text.as_ref())? {
+                ServerEvent::SubscriptionAck {
+                    request_id,
+                    subscription_id,
+                } => {
+                    self.tracker.acknowledge(request_id, subscription_id)?;
+                    Ok(None)
+                }
+                ServerEvent::AccountNotification {
+                    subscription_id,
+                    slot,
+                    owner,
+                    data,
+                } => {
+                    let address = self.tracker.resolve(subscription_id)?.to_owned();
+                    if self.accepted_addresses.is_empty()
+                        || self.accepted_addresses.contains(&address)
+                    {
+                        Ok(Some(RawAccountUpdate {
+                            address,
+                            subscription_id,
+                            slot,
+                            owner,
+                            data,
+                        }))
+                    } else {
+                        Ok(None)
+                    }
+                }
+                ServerEvent::RpcError {
+                    request_id,
+                    code,
+                    message,
+                } => {
+                    bail!("Helius WSS RPC error request={request_id:?} code={code}: {message}")
+                }
+                ServerEvent::Other => Ok(None),
+            },
+            Message::Close(_) => bail!("Helius WSS connection closed"),
+            Message::Ping(payload) => {
+                self.socket
+                    .send(Message::Pong(payload))
+                    .await
+                    .map_err(|_| anyhow::anyhow!("failed to reply to Helius WSS ping"))?;
+                Ok(None)
+            }
+            Message::Binary(_) | Message::Pong(_) | Message::Frame(_) => Ok(None),
+        }
+    }
+}
+
+/// 兼容单次验收接口：底层使用可复用长连接，拿到第一条 accepted update 后返回。
+pub async fn subscribe_accounts_and_wait_for_update(
+    config: &HeliusConfig,
+    addresses: &[String],
+    accepted_addresses: &HashSet<String>,
+    wait_timeout: Duration,
+) -> Result<RawAccountUpdate> {
+    let mut client =
+        AccountSubscriptionClient::connect(config, addresses, accepted_addresses, wait_timeout)
+            .await?;
+    client.next_update(wait_timeout).await
 }
 
 /// V1 回归包装：继续保持“Pool Account → PoolInfo”的旧接口和验收语义。
@@ -477,6 +534,18 @@ mod tests {
                 code: -32602,
                 message: "bad params".into()
             }
+        );
+    }
+
+    #[test]
+    fn subscription_scope_requires_nonempty_subscriptions_and_subset_filter() {
+        let addresses = vec!["a".to_owned(), "b".to_owned()];
+        assert!(validate_subscription_scope(&[], &HashSet::new()).is_err());
+        assert!(validate_subscription_scope(&addresses, &HashSet::new()).is_ok());
+        assert!(validate_subscription_scope(&addresses, &HashSet::from(["a".to_owned()])).is_ok());
+        assert!(
+            validate_subscription_scope(&addresses, &HashSet::from(["missing".to_owned()]))
+                .is_err()
         );
     }
 
