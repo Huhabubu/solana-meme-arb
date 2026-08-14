@@ -35,13 +35,22 @@ jobs:
         run: |
           python - <<'PY'
           from pathlib import Path
+          import re
+
+          def replace_once(text, old, new, label):
+              count = text.count(old)
+              if count != 1:
+                  raise RuntimeError(f'{label}: expected 1 match, got {count}')
+              return text.replace(old, new, 1)
 
           rpc = Path('src/rpc.rs')
           text = rpc.read_text()
-          old = 'use std::time::Duration;'
-          new = 'use std::{error::Error as StdError, fmt, time::Duration};'
-          assert old in text
-          text = text.replace(old, new, 1)
+          text = replace_once(
+              text,
+              'use std::time::Duration;',
+              'use std::{error::Error as StdError, fmt, time::Duration};',
+              'rpc import',
+          )
 
           marker = '''#[derive(Debug, Deserialize)]
           struct RpcError {
@@ -79,30 +88,22 @@ jobs:
               })
           }
           '''
-          assert marker in text
-          text = text.replace(marker, insert, 1)
+          text = replace_once(text, marker, insert, 'RpcError insertion')
 
-          old = '''    if let Some(error) = envelope.error {
+          start = text.index('fn parse_full_accounts_response')
+          end = text.index('\n/// 校验候选池', start)
+          segment = text[start:end]
+          old_error = '''    if let Some(error) = envelope.error {
               bail!("Solana RPC error {}: {}", error.code, error.message);
-          }
-
-              let result = envelope
-                  .result
-                  .context("Solana full-account RPC response missing result")?;
-          '''
-          new = '''    if let Some(error) = envelope.error {
+          }'''
+          new_error = '''    if let Some(error) = envelope.error {
               return Err(anyhow::Error::new(RpcResponseError {
                   code: error.code,
                   message: error.message,
               }));
-          }
-
-              let result = envelope
-                  .result
-                  .context("Solana full-account RPC response missing result")?;
-          '''
-          assert old in text
-          text = text.replace(old, new, 1)
+          }'''
+          segment = replace_once(segment, old_error, new_error, 'full-account typed error')
+          text = text[:start] + segment + text[end:]
 
           test_marker = '''    #[test]
               fn parses_full_accounts_base64_and_preserves_order() {
@@ -126,41 +127,28 @@ jobs:
               #[test]
               fn parses_full_accounts_base64_and_preserves_order() {
           '''
-          assert test_marker in text
-          text = text.replace(test_marker, test_insert, 1)
+          text = replace_once(text, test_marker, test_insert, 'rpc detector test')
           rpc.write_text(text)
 
           app = Path('src/app.rs')
           text = app.read_text()
-          old = '    rpc::{fetch_account_owners, fetch_accounts, verify_pool_accounts, PUBLIC_MAINNET_RPC},'
-          new = '    rpc::{\n        fetch_account_owners, fetch_accounts, is_min_context_slot_not_reached,\n        verify_pool_accounts, PUBLIC_MAINNET_RPC,\n    },'
-          assert old in text
-          text = text.replace(old, new, 1)
+          text = replace_once(
+              text,
+              '    rpc::{fetch_account_owners, fetch_accounts, verify_pool_accounts, PUBLIC_MAINNET_RPC},',
+              '    rpc::{\n        fetch_account_owners, fetch_accounts, is_min_context_slot_not_reached,\n        verify_pool_accounts, PUBLIC_MAINNET_RPC,\n    },',
+              'app rpc import',
+          )
+          text = replace_once(
+              text,
+              '    let mut reconnects = 0usize;\n    let mut subscription_refreshes = 0usize;',
+              '    let mut reconnects = 0usize;\n    let mut context_slot_recoveries = 0usize;\n    let mut subscription_refreshes = 0usize;',
+              'monitor recovery counter',
+          )
 
-          old = '''    let mut reconnects = 0usize;
-              let mut subscription_refreshes = 0usize;
-          '''
-          new = '''    let mut reconnects = 0usize;
-              let mut context_slot_recoveries = 0usize;
-              let mut subscription_refreshes = 0usize;
-          '''
-          assert old in text
-          text = text.replace(old, new, 1)
-
-          old = '''            let Some(result) = process_opportunity_update(
-                  client, &config, &mut state, &mut cache, &pools, &update,
-              )
-              .await?
-              else {
-                  stale_updates += 1;
-                  println!(
-                      "V3.6 monitor QuoteState rejected stale update: address={} slot={}",
-                      update.address, update.slot
-                  );
-                  continue;
-              };
-          '''
-          new = '''            let result = match process_opportunity_update(
+          monitor_start = text.index('async fn run_opportunity_monitor')
+          block_start = text.index('            let Some(result) = process_opportunity_update(', monitor_start)
+          block_end = text.index('\n\n            append_records(&log_path, &result.records)?;', block_start)
+          replacement = '''            let result = match process_opportunity_update(
                   client, &config, &mut state, &mut cache, &pools, &update,
               )
               .await
@@ -187,17 +175,15 @@ jobs:
                       update.address, update.slot
                   );
                   continue;
-              };
-          '''
-          assert old in text
-          text = text.replace(old, new, 1)
+              };'''
+          text = text[:block_start] + replacement + text[block_end:]
 
-          old = '''        "V3.6 monitor completed: processed_updates={processed_updates} appended_records={appended_records} total_records={} connected_sessions={connected_sessions} reconnects={reconnects} subscription_refreshes={subscription_refreshes} duplicate_updates={duplicate_updates} stale_updates={stale_updates} max_updates_in_single_session={max_updates_in_single_session} evaluated={} insufficient={} gross_positive={} net_positive={}",
-          '''
-          new = '''        "V3.6 monitor completed: processed_updates={processed_updates} appended_records={appended_records} total_records={} connected_sessions={connected_sessions} reconnects={reconnects} context_slot_recoveries={context_slot_recoveries} subscription_refreshes={subscription_refreshes} duplicate_updates={duplicate_updates} stale_updates={stale_updates} max_updates_in_single_session={max_updates_in_single_session} evaluated={} insufficient={} gross_positive={} net_positive={}",
-          '''
-          assert old in text
-          text = text.replace(old, new, 1)
+          text = replace_once(
+              text,
+              'reconnects={reconnects} subscription_refreshes={subscription_refreshes}',
+              'reconnects={reconnects} context_slot_recoveries={context_slot_recoveries} subscription_refreshes={subscription_refreshes}',
+              'monitor final recovery metric',
+          )
           app.write_text(text)
           PY
       - name: Guarded verification
