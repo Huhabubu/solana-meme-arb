@@ -16,7 +16,7 @@ jobs:
 
     env:
       HELIUS_API_KEY: ${{ secrets.HELIUS_API_KEY }}
-      OPPORTUNITY_LOG_PATH: ${{ runner.temp }}/opportunities-2h.jsonl
+      OPPORTUNITY_LOG_PATH: /tmp/opportunities-2h.jsonl
       OPPORTUNITY_MONITOR_MAX_SECONDS: "7200"
       OPPORTUNITY_MONITOR_UPDATE_TIMEOUT_SECONDS: "45"
       OPPORTUNITY_MONITOR_MAX_RECONNECTS: "20"
@@ -58,12 +58,12 @@ jobs:
             exit 1
           fi
 
-          rm -f "$OPPORTUNITY_LOG_PATH" "$RUNNER_TEMP/monitor-2h.log"
+          rm -f "$OPPORTUNITY_LOG_PATH" /tmp/monitor-2h.log
           start_epoch=$(date +%s)
 
           (
             /usr/bin/time -v target/release/solana-meme-arb opportunity-monitor
-          ) > "$RUNNER_TEMP/monitor-2h.log" 2>&1 &
+          ) > /tmp/monitor-2h.log 2>&1 &
           monitor_pid=$!
 
           while kill -0 "$monitor_pid" 2>/dev/null; do
@@ -86,14 +86,14 @@ jobs:
           set -e
 
           echo "----- monitor final log tail -----"
-          tail -n 120 "$RUNNER_TEMP/monitor-2h.log" || true
+          tail -n 120 /tmp/monitor-2h.log || true
           echo "----- sample files -----"
           if [ -f "$OPPORTUNITY_LOG_PATH" ]; then
             wc -l "$OPPORTUNITY_LOG_PATH"
             du -h "$OPPORTUNITY_LOG_PATH"
           fi
-          grep 'V3.6 monitor completed:' "$RUNNER_TEMP/monitor-2h.log" || true
-          grep 'Maximum resident set size' "$RUNNER_TEMP/monitor-2h.log" || true
+          grep 'V3.6 monitor completed:' /tmp/monitor-2h.log || true
+          grep 'Maximum resident set size' /tmp/monitor-2h.log || true
 
           exit "$status"
 
@@ -103,7 +103,7 @@ jobs:
         with:
           name: solana-meme-arb-monitor-2h-${{ github.sha }}
           path: |
-            ${{ runner.temp }}/opportunities-2h.jsonl
-            ${{ runner.temp }}/monitor-2h.log
+            /tmp/opportunities-2h.jsonl
+            /tmp/monitor-2h.log
           if-no-files-found: warn
           retention-days: 7
