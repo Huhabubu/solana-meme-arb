@@ -1,0 +1,1097 @@
+name: v362-monitor-once
+
+on:
+  push:
+    paths:
+      - '.github/workflows/v362-monitor-once.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  integrate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        run: |
+          rustup update stable
+          rustup default stable
+          rustup component add rustfmt clippy
+
+      - name: Resolve Rust cache key
+        id: rust-version
+        run: echo "version=$(rustc --version | awk '{print $2}')" >> "$GITHUB_OUTPUT"
+
+      - name: Restore Cargo cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ steps.rust-version.outputs.version }}-${{ hashFiles('Cargo.toml', 'Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-${{ steps.rust-version.outputs.version }}-
+
+      - name: Add monitor control and update watermark
+        run: |
+          cat > src/monitor.rs <<'RS'
+          use std::{
+              collections::{HashMap, HashSet},
+              time::Duration,
+          };
+
+          use anyhow::{bail, Context, Result};
+
+          use crate::{helius::RawAccountUpdate, state::DependencyKind};
+
+          #[derive(Debug, Clone, PartialEq, Eq)]
+          pub struct OpportunityMonitorConfig {
+              pub target_updates: Option<usize>,
+              pub max_duration: Option<Duration>,
+              pub update_timeout: Duration,
+              pub max_reconnects: Option<usize>,
+          }
+
+          impl OpportunityMonitorConfig {
+              pub fn parse(
+                  target_updates: Option<&str>,
+                  max_seconds: Option<&str>,
+                  update_timeout_seconds: Option<&str>,
+                  max_reconnects: Option<&str>,
+              ) -> Result<Self> {
+                  let target_updates = parse_optional_positive_usize(
+                      "OPPORTUNITY_MONITOR_UPDATES",
+                      target_updates,
+                  )?;
+                  let max_duration = parse_optional_positive_u64(
+                      "OPPORTUNITY_MONITOR_MAX_SECONDS",
+                      max_seconds,
+                  )?
+                  .map(Duration::from_secs);
+                  let update_timeout = Duration::from_secs(
+                      parse_optional_positive_u64(
+                          "OPPORTUNITY_MONITOR_UPDATE_TIMEOUT_SECONDS",
+                          update_timeout_seconds,
+                      )?
+                      .unwrap_or(45),
+                  );
+                  let max_reconnects = parse_optional_nonnegative_usize(
+                      "OPPORTUNITY_MONITOR_MAX_RECONNECTS",
+                      max_reconnects,
+                  )?;
+                  Ok(Self {
+                      target_updates,
+                      max_duration,
+                      update_timeout,
+                      max_reconnects,
+                  })
+              }
+
+              pub fn target_reached(&self, processed_updates: usize) -> bool {
+                  self.target_updates
+                      .is_some_and(|target| processed_updates >= target)
+              }
+
+              pub fn wait_timeout(&self, elapsed: Duration) -> Option<Duration> {
+                  match self.max_duration {
+                      Some(max_duration) => {
+                          let remaining = max_duration.checked_sub(elapsed)?;
+                          if remaining.is_zero() {
+                              None
+                          } else {
+                              Some(self.update_timeout.min(remaining))
+                          }
+                      }
+                      None => Some(self.update_timeout),
+                  }
+              }
+
+              pub fn reconnect_allowed(&self, reconnects_used: usize) -> bool {
+                  self.max_reconnects
+                      .is_none_or(|limit| reconnects_used < limit)
+              }
+          }
+
+          fn parse_optional_positive_usize(name: &str, value: Option<&str>) -> Result<Option<usize>> {
+              match value {
+                  None => Ok(None),
+                  Some(value) => {
+                      let parsed = value
+                          .parse::<usize>()
+                          .with_context(|| format!("{name} must be a positive integer"))?;
+                      if parsed == 0 {
+                          bail!("{name} must be greater than zero");
+                      }
+                      Ok(Some(parsed))
+                  }
+              }
+          }
+
+          fn parse_optional_nonnegative_usize(
+              name: &str,
+              value: Option<&str>,
+          ) -> Result<Option<usize>> {
+              value
+                  .map(|value| {
+                      value
+                          .parse::<usize>()
+                          .with_context(|| format!("{name} must be a non-negative integer"))
+                  })
+                  .transpose()
+          }
+
+          fn parse_optional_positive_u64(name: &str, value: Option<&str>) -> Result<Option<u64>> {
+              match value {
+                  None => Ok(None),
+                  Some(value) => {
+                      let parsed = value
+                          .parse::<u64>()
+                          .with_context(|| format!("{name} must be a positive integer"))?;
+                      if parsed == 0 {
+                          bail!("{name} must be greater than zero");
+                      }
+                      Ok(Some(parsed))
+                  }
+              }
+          }
+
+          #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+          pub enum UpdateNovelty {
+              New,
+              Duplicate,
+              Stale,
+          }
+
+          #[derive(Debug, Clone, PartialEq, Eq)]
+          struct SeenUpdate {
+              slot: u64,
+              owner: String,
+              data: Vec<u8>,
+          }
+
+          #[derive(Debug, Default)]
+          pub struct UpdateWatermark {
+              latest: HashMap<String, SeenUpdate>,
+          }
+
+          impl UpdateWatermark {
+              pub fn classify(&mut self, update: &RawAccountUpdate) -> UpdateNovelty {
+                  let Some(previous) = self.latest.get(&update.address) else {
+                      self.remember(update);
+                      return UpdateNovelty::New;
+                  };
+                  if update.slot < previous.slot {
+                      return UpdateNovelty::Stale;
+                  }
+                  if update.slot == previous.slot
+                      && update.owner == previous.owner
+                      && update.data == previous.data
+                  {
+                      return UpdateNovelty::Duplicate;
+                  }
+                  self.remember(update);
+                  UpdateNovelty::New
+              }
+
+              fn remember(&mut self, update: &RawAccountUpdate) {
+                  self.latest.insert(
+                      update.address.clone(),
+                      SeenUpdate {
+                          slot: update.slot,
+                          owner: update.owner.clone(),
+                          data: update.data.clone(),
+                      },
+                  );
+              }
+          }
+
+          pub fn subscription_sets_equal(left: &[String], right: &[String]) -> bool {
+              if left.len() != right.len() {
+                  return false;
+              }
+              let left = left.iter().map(String::as_str).collect::<HashSet<_>>();
+              let right = right.iter().map(String::as_str).collect::<HashSet<_>>();
+              left == right
+          }
+
+          pub fn dependency_update_may_change_set(kind: DependencyKind) -> bool {
+              matches!(kind, DependencyKind::PoolState | DependencyKind::BitmapExtension)
+          }
+
+          pub fn reconnect_delay(reconnects_used: usize) -> Duration {
+              Duration::from_secs((1_u64 << reconnects_used.min(5)).min(30))
+          }
+
+          #[cfg(test)]
+          mod tests {
+              use super::*;
+
+              fn update(address: &str, slot: u64, byte: u8) -> RawAccountUpdate {
+                  RawAccountUpdate {
+                      address: address.into(),
+                      subscription_id: 1,
+                      slot,
+                      owner: "owner".into(),
+                      data: vec![byte],
+                  }
+              }
+
+              #[test]
+              fn monitor_config_parses_bounds_and_deadline_wait() {
+                  let config = OpportunityMonitorConfig::parse(
+                      Some("2"),
+                      Some("90"),
+                      Some("45"),
+                      Some("3"),
+                  )
+                  .unwrap();
+                  assert_eq!(config.target_updates, Some(2));
+                  assert_eq!(config.max_duration, Some(Duration::from_secs(90)));
+                  assert_eq!(config.wait_timeout(Duration::from_secs(10)), Some(Duration::from_secs(45)));
+                  assert_eq!(config.wait_timeout(Duration::from_secs(80)), Some(Duration::from_secs(10)));
+                  assert_eq!(config.wait_timeout(Duration::from_secs(90)), None);
+                  assert!(!config.target_reached(1));
+                  assert!(config.target_reached(2));
+                  assert!(config.reconnect_allowed(2));
+                  assert!(!config.reconnect_allowed(3));
+                  assert!(OpportunityMonitorConfig::parse(Some("0"), None, None, None).is_err());
+                  assert!(OpportunityMonitorConfig::parse(None, Some("0"), None, None).is_err());
+                  assert!(OpportunityMonitorConfig::parse(None, None, Some("0"), None).is_err());
+              }
+
+              #[test]
+              fn watermark_rejects_exact_duplicates_and_stale_but_accepts_same_slot_changes() {
+                  let mut watermark = UpdateWatermark::default();
+                  assert_eq!(watermark.classify(&update("a", 10, 1)), UpdateNovelty::New);
+                  assert_eq!(watermark.classify(&update("a", 10, 1)), UpdateNovelty::Duplicate);
+                  assert_eq!(watermark.classify(&update("a", 9, 2)), UpdateNovelty::Stale);
+                  assert_eq!(watermark.classify(&update("a", 10, 2)), UpdateNovelty::New);
+                  assert_eq!(watermark.classify(&update("a", 11, 2)), UpdateNovelty::New);
+                  assert_eq!(watermark.classify(&update("b", 1, 9)), UpdateNovelty::New);
+              }
+
+              #[test]
+              fn subscription_set_comparison_ignores_order_but_not_membership() {
+                  assert!(subscription_sets_equal(
+                      &["a".into(), "b".into()],
+                      &["b".into(), "a".into()]
+                  ));
+                  assert!(!subscription_sets_equal(
+                      &["a".into(), "b".into()],
+                      &["a".into(), "c".into()]
+                  ));
+                  assert!(!subscription_sets_equal(&["a".into()], &["a".into(), "b".into()]));
+              }
+
+              #[test]
+              fn dependency_refresh_and_reconnect_backoff_are_narrow() {
+                  assert!(dependency_update_may_change_set(DependencyKind::PoolState));
+                  assert!(dependency_update_may_change_set(DependencyKind::BitmapExtension));
+                  assert!(!dependency_update_may_change_set(DependencyKind::TokenVault));
+                  assert!(!dependency_update_may_change_set(DependencyKind::TickArray));
+                  assert!(!dependency_update_may_change_set(DependencyKind::Oracle));
+                  assert!(!dependency_update_may_change_set(DependencyKind::BinArray));
+                  assert!(!dependency_update_may_change_set(DependencyKind::TokenMint));
+                  assert_eq!(reconnect_delay(0), Duration::from_secs(1));
+                  assert_eq!(reconnect_delay(3), Duration::from_secs(8));
+                  assert_eq!(reconnect_delay(10), Duration::from_secs(30));
+              }
+          }
+          RS
+
+      - name: Add incremental statistics ingestion
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+
+          path = Path('src/persistence.rs')
+          text = path.read_text()
+          start = text.find('pub fn summarize_records(records: &[OpportunityRecord]) -> Result<OpportunityStats> {')
+          end = text.find('\nfn update_best(', start)
+          if start < 0 or end < 0:
+              raise SystemExit(f'summary boundary missing: {start}/{end}')
+          replacement = r'''impl OpportunityStats {
+              pub fn ingest_record(&mut self, record: &OpportunityRecord) -> Result<()> {
+                  record.validate()?;
+                  let key = OpportunityGroupKey {
+                      token_mint: record.token_mint.clone(),
+                      first_dex: record.first_dex.clone(),
+                      first_pool: record.first_pool.clone(),
+                      second_dex: record.second_dex.clone(),
+                      second_pool: record.second_pool.clone(),
+                      input_amount: record.input_amount,
+                  };
+                  let group = self.groups.entry(key).or_default();
+                  self.total += 1;
+                  group.total += 1;
+
+                  match record.status {
+                      OpportunityRecordStatus::Evaluated => {
+                          let gross_profit = record
+                              .gross_profit_raw
+                              .context("validated evaluated record lost gross profit")?;
+                          let net_profit = record
+                              .net_profit_raw
+                              .context("validated evaluated record lost net profit")?;
+                          self.evaluated += 1;
+                          group.evaluated += 1;
+                          if gross_profit > 0 {
+                              self.gross_positive += 1;
+                              group.gross_positive += 1;
+                          }
+                          if net_profit > 0 {
+                              self.net_positive += 1;
+                              group.net_positive += 1;
+                          }
+                          update_best(&mut self.best_net_profit_raw, net_profit);
+                          update_best(&mut group.best_net_profit_raw, net_profit);
+                      }
+                      OpportunityRecordStatus::InsufficientLiquidity => {
+                          self.insufficient_liquidity += 1;
+                          group.insufficient_liquidity += 1;
+                      }
+                  }
+                  Ok(())
+              }
+
+              pub fn ingest_records(&mut self, records: &[OpportunityRecord]) -> Result<()> {
+                  for record in records {
+                      self.ingest_record(record)?;
+                  }
+                  Ok(())
+              }
+          }
+
+          pub fn summarize_records(records: &[OpportunityRecord]) -> Result<OpportunityStats> {
+              let mut stats = OpportunityStats::default();
+              stats.ingest_records(records)?;
+              Ok(stats)
+          }
+          '''
+          text = text[:start] + replacement + text[end:]
+
+          test_insert = text.rfind('\n}')
+          if test_insert < 0:
+              raise SystemExit('persistence test module closing brace missing')
+          test = r'''
+
+              #[test]
+              fn incremental_statistics_match_batch_summary() {
+                  let records = vec![
+                      record(&evaluated_event(4_000, 10_000)),
+                      record(&insufficient_event()),
+                      record(&evaluated_event(-2_000, -1_000)),
+                  ];
+                  let batch = summarize_records(&records).unwrap();
+                  let mut incremental = OpportunityStats::default();
+                  incremental.ingest_records(&records[..2]).unwrap();
+                  incremental.ingest_records(&records[2..]).unwrap();
+                  assert_eq!(incremental, batch);
+              }
+          '''
+          text = text[:test_insert] + test + text[test_insert:]
+          path.write_text(text)
+          PY
+
+      - name: Register monitor module and enforce minContextSlot during dependency refresh
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+
+          path = Path('src/main.rs')
+          text = path.read_text()
+          anchor = 'mod model;\n'
+          if text.count(anchor) != 1:
+              raise SystemExit(f'main monitor module anchor count={text.count(anchor)}')
+          text = text.replace(anchor, anchor + 'mod monitor;\n', 1)
+          path.write_text(text)
+
+          path = Path('src/app.rs')
+          text = path.read_text()
+          old_signature = '''async fn build_pool_dependencies(
+              client: &Client,
+              config: &HeliusConfig,
+              pool: &PoolInfo,
+          ) -> Result<PoolDependencies> {'''
+          new_signature = '''async fn build_pool_dependencies(
+              client: &Client,
+              config: &HeliusConfig,
+              pool: &PoolInfo,
+              min_context_slot: Option<u64>,
+          ) -> Result<PoolDependencies> {'''
+          if text.count(old_signature) != 1:
+              raise SystemExit(f'build_pool_dependencies signature count={text.count(old_signature)}')
+          text = text.replace(old_signature, new_signature, 1)
+
+          # 该函数三种 DEX 的第一批 Pool/bitmap 读取都必须使用调用方给出的 minContextSlot。
+          function_start = text.find(new_signature)
+          function_end = text.find('\nasync fn build_quote_state(', function_start)
+          segment = text[function_start:function_end]
+          segment = segment.replace(
+              'std::slice::from_ref(&pool.address),\n                None,',
+              'std::slice::from_ref(&pool.address),\n                min_context_slot,',
+              2,
+          )
+          segment = segment.replace(
+              'fetch_accounts(client, config.http_url().as_str(), &addresses, None).await?;',
+              'fetch_accounts(client, config.http_url().as_str(), &addresses, min_context_slot).await?;',
+              1,
+          )
+          text = text[:function_start] + segment + text[function_end:]
+
+          text = text.replace(
+              'let dependencies = build_pool_dependencies(client, config, &pool).await?;',
+              'let dependencies = build_pool_dependencies(client, config, &pool, None).await?;',
+              1,
+          )
+          text = text.replace(
+              'let refreshed = build_pool_dependencies(client, config, pool).await?;',
+              'let refreshed = build_pool_dependencies(client, config, pool, Some(min_context_slot)).await?;',
+              1,
+          )
+          path.write_text(text)
+          PY
+
+      - name: Add reusable fixed-universe state rebuild
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+          path = Path('src/app.rs')
+          text = path.read_text()
+          start = text.find('async fn build_quote_state(\n')
+          end = text.find('\nasync fn preload_state_accounts(', start)
+          if start < 0 or end < 0:
+              raise SystemExit(f'build_quote_state boundary missing: {start}/{end}')
+          replacement = r'''async fn build_quote_state(
+              client: &Client,
+              config: &HeliusConfig,
+          ) -> Result<(QuoteState, Vec<PoolInfo>)> {
+              let mut pools = Vec::new();
+              let mut seen = HashSet::new();
+
+              for token in tracked_tokens() {
+                  let (_, candidates) = discover_candidates(client, token).await?;
+                  for pool in supported_quote_pools(&candidates) {
+                      if seen.insert(pool.address.clone()) {
+                          pools.push(pool);
+                      }
+                  }
+              }
+              if pools.is_empty() {
+                  bail!("V2 quoteable universe is empty");
+              }
+              let state = build_quote_state_for_pools(client, config, &pools).await?;
+              Ok((state, pools))
+          }
+
+          async fn build_quote_state_for_pools(
+              client: &Client,
+              config: &HeliusConfig,
+              pools: &[PoolInfo],
+          ) -> Result<QuoteState> {
+              if pools.is_empty() {
+                  bail!("cannot build QuoteState for an empty fixed pool universe");
+              }
+              let mut state = QuoteState::new();
+              let mut seen = HashSet::new();
+              for pool in pools {
+                  if !seen.insert(pool.address.as_str()) {
+                      bail!("duplicate pool in fixed QuoteState universe: {}", pool.address);
+                  }
+                  let dependencies = build_pool_dependencies(client, config, pool, None).await?;
+                  state.replace_pool_dependencies(dependencies)?;
+              }
+              preload_state_accounts(client, config, &mut state, pools, None).await?;
+              Ok(state)
+          }
+          '''
+          text = text[:start] + replacement + text[end:]
+          path.write_text(text)
+          PY
+
+      - name: Add continuous opportunity monitor and shared update processor
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+
+          path = Path('src/app.rs')
+          text = path.read_text()
+          text = text.replace(
+              'collections::HashSet,\n    str::FromStr,\n    time::{Duration, SystemTime, UNIX_EPOCH},',
+              'collections::HashSet,\n    str::FromStr,\n    time::{Duration, Instant, SystemTime, UNIX_EPOCH},',
+              1,
+          )
+          old_helius = '    helius::{check_http, subscribe_accounts_and_wait_for_update, subscribe_and_wait_for_update},'
+          new_helius = '''    helius::{
+                  check_http, subscribe_accounts_and_wait_for_update, subscribe_and_wait_for_update,
+                  AccountSubscriptionClient, RawAccountUpdate,
+              },'''
+          if text.count(old_helius) != 1:
+              raise SystemExit(f'helius import anchor count={text.count(old_helius)}')
+          text = text.replace(old_helius, new_helius, 1)
+          model_anchor = '    model::{Dex, PoolInfo},\n'
+          monitor_import = '''    monitor::{
+                  dependency_update_may_change_set, reconnect_delay, subscription_sets_equal,
+                  OpportunityMonitorConfig, UpdateNovelty, UpdateWatermark,
+              },
+          '''
+          if text.count(model_anchor) != 1:
+              raise SystemExit(f'monitor import anchor count={text.count(model_anchor)}')
+          text = text.replace(model_anchor, model_anchor + monitor_import, 1)
+          old_persist = '    persistence::{append_records, read_records, summarize_records, OpportunityRecord},'
+          new_persist = '''    persistence::{
+                  append_records, read_records, summarize_records, OpportunityRecord, OpportunityStats,
+              },'''
+          if text.count(old_persist) != 1:
+              raise SystemExit(f'persistence import anchor count={text.count(old_persist)}')
+          text = text.replace(old_persist, new_persist, 1)
+
+          # 命令路由。
+          text = text.replace(
+              '    OpportunityWssCheck,\n    RoundTripCheck,',
+              '    OpportunityWssCheck,\n    OpportunityMonitor,\n    RoundTripCheck,',
+              1,
+          )
+          text = text.replace(
+              '        Some("opportunity-wss-check") => Ok(Some(AppCommand::OpportunityWssCheck)),\n        Some("round-trip-check") => Ok(Some(AppCommand::RoundTripCheck)),',
+              '        Some("opportunity-wss-check") => Ok(Some(AppCommand::OpportunityWssCheck)),\n        Some("opportunity-monitor") => Ok(Some(AppCommand::OpportunityMonitor)),\n        Some("round-trip-check") => Ok(Some(AppCommand::RoundTripCheck)),',
+              1,
+          )
+          text = text.replace(
+              'dependency-wss-check|opportunity-wss-check|round-trip-check>',
+              'dependency-wss-check|opportunity-wss-check|opportunity-monitor|round-trip-check>',
+              1,
+          )
+          text = text.replace(
+              '        AppCommand::OpportunityWssCheck => run_opportunity_wss_check(&client).await,\n        AppCommand::RoundTripCheck => run_round_trip_check(&client).await,',
+              '        AppCommand::OpportunityWssCheck => run_opportunity_wss_check(&client).await,\n        AppCommand::OpportunityMonitor => run_opportunity_monitor(&client).await,\n        AppCommand::RoundTripCheck => run_round_trip_check(&client).await,',
+              1,
+          )
+
+          start = text.find('async fn run_opportunity_wss_check(client: &Client) -> Result<()> {')
+          end = text.find('\nfn unix_timestamp() -> Result<u64> {', start)
+          if start < 0 or end < 0:
+              raise SystemExit(f'opportunity function boundary missing: {start}/{end}')
+
+          replacement = r'''#[derive(Debug)]
+          struct OpportunityProcessResult {
+              affected_pool_count: usize,
+              related_route_count: usize,
+              evaluated_count: usize,
+              unavailable_count: usize,
+              net_positive_count: usize,
+              records: Vec<OpportunityRecord>,
+              subscription_set_changed: bool,
+          }
+
+          fn opportunity_monitor_config_from_env() -> Result<OpportunityMonitorConfig> {
+              let target = std::env::var("OPPORTUNITY_MONITOR_UPDATES").ok();
+              let max_seconds = std::env::var("OPPORTUNITY_MONITOR_MAX_SECONDS").ok();
+              let update_timeout =
+                  std::env::var("OPPORTUNITY_MONITOR_UPDATE_TIMEOUT_SECONDS").ok();
+              let max_reconnects = std::env::var("OPPORTUNITY_MONITOR_MAX_RECONNECTS").ok();
+              OpportunityMonitorConfig::parse(
+                  target.as_deref(),
+                  max_seconds.as_deref(),
+                  update_timeout.as_deref(),
+                  max_reconnects.as_deref(),
+              )
+          }
+
+          fn opportunity_log_path(required: bool) -> Result<Option<std::path::PathBuf>> {
+              match std::env::var("OPPORTUNITY_LOG_PATH") {
+                  Ok(value) if value.trim().is_empty() => {
+                      bail!("OPPORTUNITY_LOG_PATH cannot be empty when configured")
+                  }
+                  Ok(value) => Ok(Some(value.into())),
+                  Err(std::env::VarError::NotPresent) if required => {
+                      bail!("OPPORTUNITY_LOG_PATH is required for opportunity-monitor")
+                  }
+                  Err(std::env::VarError::NotPresent) => Ok(None),
+                  Err(error) => Err(error).context("failed to read OPPORTUNITY_LOG_PATH"),
+              }
+          }
+
+          async fn process_opportunity_update(
+              client: &Client,
+              config: &HeliusConfig,
+              state: &mut QuoteState,
+              cache: &mut QuoteContextCache,
+              pools: &[PoolInfo],
+              update: &RawAccountUpdate,
+          ) -> Result<Option<OpportunityProcessResult>> {
+              let subscribed_before = state.unique_dependency_addresses();
+              let applied = state.apply_account_update(
+                  &update.address,
+                  VersionedAccountData {
+                      slot: update.slot,
+                      owner: update.owner.clone(),
+                      data: update.data.clone(),
+                  },
+              )?;
+              if !applied.accepted {
+                  return Ok(None);
+              }
+              if applied.affected_pools.is_empty() {
+                  bail!("opportunity update did not map to any affected pool");
+              }
+
+              let affected_pools = applied.affected_pools.clone();
+              println!(
+                  "V3.6 trigger: address={} slot={} subscription={} affected_pools={:?}",
+                  update.address, update.slot, update.subscription_id, affected_pools
+              );
+              for pool_address in &affected_pools {
+                  let dependencies = state
+                      .dependencies_for_pool(pool_address)
+                      .context("affected pool disappeared from QuoteState")?
+                      .clone();
+                  let kind = state
+                      .dependency_kind(pool_address, &update.address)
+                      .context("updated account missing dependency kind")?;
+                  let old_context_slot = cache.snapshot_slot(pool_address)?;
+                  let refresh_dependencies = dependency_update_may_change_set(kind);
+                  println!(
+                      "  affected pool={} dex={} kind={kind:?} refresh_dependencies={refresh_dependencies}",
+                      dependencies.pool.address, dependencies.pool.dex
+                  );
+                  if refresh_dependencies {
+                      refresh_pool_dependencies(
+                          client,
+                          config,
+                          state,
+                          &dependencies.pool,
+                          update.slot,
+                      )
+                      .await?;
+                  }
+                  if !state.missing_accounts_for_pool(pool_address)?.is_empty() {
+                      bail!("affected-pool dependencies are incomplete after update");
+                  }
+                  cache.refresh_pool(state, &dependencies.pool)?;
+                  let new_context_slot = cache.snapshot_slot(pool_address)?;
+                  if new_context_slot < old_context_slot || new_context_slot < update.slot {
+                      bail!("affected quote context did not advance to the WSS update slot");
+                  }
+              }
+
+              let subscribed_after = state.unique_dependency_addresses();
+              let subscription_set_changed =
+                  !subscription_sets_equal(&subscribed_before, &subscribed_after);
+              let routes = affected_directed_pool_routes(pools, &affected_pools, WSOL)?;
+              if routes.is_empty() {
+                  bail!("affected pools produced no related arbitrage routes");
+              }
+
+              let needs_meteora_clock = routes.iter().any(|route| {
+                  route.first_pool.dex == Dex::MeteoraDlmm
+                      || route.second_pool.dex == Dex::MeteoraDlmm
+              });
+              let clock = if needs_meteora_clock {
+                  let clock_address = clock_sysvar_address();
+                  let batch = fetch_accounts(
+                      client,
+                      config.http_url().as_str(),
+                      std::slice::from_ref(&clock_address),
+                      Some(update.slot),
+                  )
+                  .await?;
+                  let account = batch.accounts[0]
+                      .as_ref()
+                      .context("Clock sysvar account missing during opportunity recompute")?;
+                  Some(decode_clock(&account.data)?)
+              } else {
+                  None
+              };
+              let runtime = QuoteRuntime {
+                  unix_timestamp: unix_timestamp()?,
+                  meteora_clock: clock.as_ref(),
+              };
+              let cost_floor = v3_cost_floor();
+              let observed_at_unix_ms = unix_timestamp_millis()?;
+              let mut evaluated_count = 0usize;
+              let mut unavailable_count = 0usize;
+              let mut net_positive_count = 0usize;
+              let mut records = Vec::with_capacity(routes.len() * ROUND_TRIP_PROBE_LAMPORTS.len());
+
+              println!(
+                  "V3.6 local recompute: {} affected pool(s), {} related route(s), clock_refreshed={needs_meteora_clock}",
+                  affected_pools.len(),
+                  routes.len()
+              );
+              for route in &routes {
+                  let token = tracked_tokens()
+                      .iter()
+                      .find(|token| token.mint == route.token_mint)
+                      .context("route token is outside tracked universe")?;
+                  let events = evaluate_cached_route_events(cache, route, cost_floor, runtime)?;
+                  for event in &events {
+                      match &event.outcome {
+                          OpportunityEventOutcome::Evaluated {
+                              gross_profit_raw,
+                              net_profit_raw,
+                              ..
+                          } => {
+                              evaluated_count += 1;
+                              if *net_profit_raw > 0 {
+                                  net_positive_count += 1;
+                              }
+                              println!(
+                                  "{}/WSOL monitor event: {}->{} input={} gross_profit_raw={} net_profit_raw={}",
+                                  token.symbol,
+                                  event.first_dex,
+                                  event.second_dex,
+                                  event.input_amount,
+                                  gross_profit_raw,
+                                  net_profit_raw
+                              );
+                          }
+                          OpportunityEventOutcome::InsufficientLiquidity { stage } => {
+                              unavailable_count += 1;
+                              println!(
+                                  "{}/WSOL monitor event: {}->{} input={} status=insufficient_liquidity stage={stage:?}",
+                                  token.symbol,
+                                  event.first_dex,
+                                  event.second_dex,
+                                  event.input_amount
+                              );
+                          }
+                      }
+                      records.push(OpportunityRecord::from_event(
+                          event,
+                          observed_at_unix_ms,
+                          update.slot,
+                          &update.address,
+                          update.subscription_id,
+                      )?);
+                  }
+              }
+
+              let expected_records = routes.len() * ROUND_TRIP_PROBE_LAMPORTS.len();
+              if records.len() != expected_records
+                  || evaluated_count + unavailable_count != records.len()
+              {
+                  bail!("opportunity update event accounting mismatch");
+              }
+              Ok(Some(OpportunityProcessResult {
+                  affected_pool_count: affected_pools.len(),
+                  related_route_count: routes.len(),
+                  evaluated_count,
+                  unavailable_count,
+                  net_positive_count,
+                  records,
+                  subscription_set_changed,
+              }))
+          }
+
+          fn append_and_verify_single_update(
+              path: &std::path::Path,
+              result: &OpportunityProcessResult,
+          ) -> Result<()> {
+              let before_count = if path.exists() {
+                  read_records(path)?.len()
+              } else {
+                  0
+              };
+              append_records(path, &result.records)?;
+              let stored = read_records(path)?;
+              if stored.len() != before_count + result.records.len() {
+                  bail!("opportunity persistence append count mismatch");
+              }
+              let stats = summarize_records(&stored)?;
+              println!(
+                  "V3.6 persistence verified: path={} appended={} total={} evaluated={} insufficient_liquidity={} gross_positive={} net_positive={} groups={}",
+                  path.display(),
+                  result.records.len(),
+                  stats.total,
+                  stats.evaluated,
+                  stats.insufficient_liquidity,
+                  stats.gross_positive,
+                  stats.net_positive,
+                  stats.groups.len()
+              );
+              Ok(())
+          }
+
+          async fn run_opportunity_wss_check(client: &Client) -> Result<()> {
+              let config = HeliusConfig::from_env()?;
+              let (mut state, pools) = build_quote_state(client, &config).await?;
+              let mut cache = QuoteContextCache::build(&state, &pools)?;
+              let addresses = state.unique_dependency_addresses();
+              let accepted_addresses = addresses.iter().cloned().collect::<HashSet<_>>();
+              println!(
+                  "V3.6 opportunity WSS subscribing to {} unique dependencies across {} cached contexts",
+                  addresses.len(),
+                  cache.len()
+              );
+              let update = subscribe_accounts_and_wait_for_update(
+                  &config,
+                  &addresses,
+                  &accepted_addresses,
+                  Duration::from_secs(DEPENDENCY_WSS_WAIT_SECONDS),
+              )
+              .await?;
+              let result = process_opportunity_update(
+                  client,
+                  &config,
+                  &mut state,
+                  &mut cache,
+                  &pools,
+                  &update,
+              )
+              .await?
+              .context("single opportunity WSS update was stale relative to local state")?;
+              println!(
+                  "V3.6 single-update recompute verified: {} affected pool(s), {} related route(s), {} records, {} evaluated, {} insufficient-liquidity, {} net-positive, subscription_set_changed={}",
+                  result.affected_pool_count,
+                  result.related_route_count,
+                  result.records.len(),
+                  result.evaluated_count,
+                  result.unavailable_count,
+                  result.net_positive_count,
+                  result.subscription_set_changed
+              );
+              if let Some(path) = opportunity_log_path(false)? {
+                  append_and_verify_single_update(&path, &result)?;
+              }
+              Ok(())
+          }
+
+          async fn run_opportunity_monitor(client: &Client) -> Result<()> {
+              let config = HeliusConfig::from_env()?;
+              let monitor_config = opportunity_monitor_config_from_env()?;
+              let log_path = opportunity_log_path(true)?
+                  .context("opportunity monitor requires a persistence path")?;
+              let existing_records = if log_path.exists() {
+                  read_records(&log_path)?
+              } else {
+                  Vec::new()
+              };
+              let initial_record_count = existing_records.len();
+              let mut cumulative_stats = summarize_records(&existing_records)?;
+              let (initial_state, pools) = build_quote_state(client, &config).await?;
+              let mut state = initial_state;
+              let mut cache = QuoteContextCache::build(&state, &pools)?;
+              let mut watermark = UpdateWatermark::default();
+              let started = Instant::now();
+              let mut processed_updates = 0usize;
+              let mut appended_records = 0usize;
+              let mut duplicate_updates = 0usize;
+              let mut stale_updates = 0usize;
+              let mut reconnects = 0usize;
+              let mut subscription_refreshes = 0usize;
+              let mut connected_sessions = 0usize;
+              let mut max_updates_in_single_session = 0usize;
+
+              'session: loop {
+                  if monitor_config.target_reached(processed_updates) {
+                      break;
+                  }
+                  let Some(connect_timeout) = monitor_config.wait_timeout(started.elapsed()) else {
+                      break;
+                  };
+                  let addresses = state.unique_dependency_addresses();
+                  let accepted_addresses = addresses.iter().cloned().collect::<HashSet<_>>();
+                  let mut subscription = match AccountSubscriptionClient::connect(
+                      &config,
+                      &addresses,
+                      &accepted_addresses,
+                      connect_timeout,
+                  )
+                  .await
+                  {
+                      Ok(subscription) => subscription,
+                      Err(error) => {
+                          if !monitor_config.reconnect_allowed(reconnects) {
+                              return Err(error).context("opportunity monitor exhausted WSS reconnect budget");
+                          }
+                          let delay = reconnect_delay(reconnects);
+                          reconnects += 1;
+                          println!(
+                              "V3.6 monitor connect failed; reconnect={reconnects} delay_ms={} error={error:#}",
+                              delay.as_millis()
+                          );
+                          tokio::time::sleep(delay).await;
+                          state = build_quote_state_for_pools(client, &config, &pools).await?;
+                          cache = QuoteContextCache::build(&state, &pools)?;
+                          continue;
+                      }
+                  };
+                  connected_sessions += 1;
+                  let session_id = connected_sessions;
+                  let subscribed_addresses = addresses;
+                  let mut session_processed = 0usize;
+                  println!(
+                      "V3.6 monitor session={session_id} connected subscriptions={} processed_updates={processed_updates}",
+                      subscribed_addresses.len()
+                  );
+
+                  loop {
+                      if monitor_config.target_reached(processed_updates) {
+                          break 'session;
+                      }
+                      let Some(wait_timeout) = monitor_config.wait_timeout(started.elapsed()) else {
+                          break 'session;
+                      };
+                      let update = match subscription.next_update(wait_timeout).await {
+                          Ok(update) => update,
+                          Err(error) => {
+                              if !monitor_config.reconnect_allowed(reconnects) {
+                                  return Err(error)
+                                      .context("opportunity monitor exhausted WSS reconnect budget");
+                              }
+                              let delay = reconnect_delay(reconnects);
+                              reconnects += 1;
+                              println!(
+                                  "V3.6 monitor socket interrupted session={session_id}; reconnect={reconnects} delay_ms={} error={error:#}",
+                                  delay.as_millis()
+                              );
+                              tokio::time::sleep(delay).await;
+                              state = build_quote_state_for_pools(client, &config, &pools).await?;
+                              cache = QuoteContextCache::build(&state, &pools)?;
+                              continue 'session;
+                          }
+                      };
+
+                      match watermark.classify(&update) {
+                          UpdateNovelty::Duplicate => {
+                              duplicate_updates += 1;
+                              println!(
+                                  "V3.6 monitor duplicate update skipped: address={} slot={}",
+                                  update.address, update.slot
+                              );
+                              continue;
+                          }
+                          UpdateNovelty::Stale => {
+                              stale_updates += 1;
+                              println!(
+                                  "V3.6 monitor stale update skipped: address={} slot={}",
+                                  update.address, update.slot
+                              );
+                              continue;
+                          }
+                          UpdateNovelty::New => {}
+                      }
+
+                      let Some(result) = process_opportunity_update(
+                          client,
+                          &config,
+                          &mut state,
+                          &mut cache,
+                          &pools,
+                          &update,
+                      )
+                      .await?
+                      else {
+                          stale_updates += 1;
+                          println!(
+                              "V3.6 monitor QuoteState rejected stale update: address={} slot={}",
+                              update.address, update.slot
+                          );
+                          continue;
+                      };
+
+                      append_records(&log_path, &result.records)?;
+                      cumulative_stats.ingest_records(&result.records)?;
+                      appended_records += result.records.len();
+                      processed_updates += 1;
+                      session_processed += 1;
+                      max_updates_in_single_session =
+                          max_updates_in_single_session.max(session_processed);
+                      println!(
+                          "V3.6 monitor progress: session={session_id} session_processed={session_processed} processed_updates={processed_updates} appended_records={appended_records} total_records={} evaluated={} insufficient={} gross_positive={} net_positive={}",
+                          cumulative_stats.total,
+                          cumulative_stats.evaluated,
+                          cumulative_stats.insufficient_liquidity,
+                          cumulative_stats.gross_positive,
+                          cumulative_stats.net_positive
+                      );
+
+                      if monitor_config.target_reached(processed_updates) {
+                          break 'session;
+                      }
+                      let current_addresses = state.unique_dependency_addresses();
+                      if result.subscription_set_changed
+                          || !subscription_sets_equal(&subscribed_addresses, &current_addresses)
+                      {
+                          subscription_refreshes += 1;
+                          println!(
+                              "V3.6 monitor dependency set changed; rebuilding session after {} processed update(s)",
+                              session_processed
+                          );
+                          state = build_quote_state_for_pools(client, &config, &pools).await?;
+                          cache = QuoteContextCache::build(&state, &pools)?;
+                          continue 'session;
+                      }
+                  }
+              }
+
+              if let Some(target) = monitor_config.target_updates {
+                  if processed_updates < target {
+                      bail!(
+                          "opportunity monitor deadline reached before target: processed={processed_updates} target={target}"
+                      );
+                  }
+              }
+              let stored = read_records(&log_path)?;
+              if stored.len() != initial_record_count + appended_records {
+                  bail!("opportunity monitor persisted record count mismatch");
+              }
+              let final_stats = summarize_records(&stored)?;
+              if final_stats != cumulative_stats {
+                  bail!("opportunity monitor incremental statistics diverged from JSONL replay");
+              }
+              println!(
+                  "V3.6 monitor completed: processed_updates={processed_updates} appended_records={appended_records} total_records={} connected_sessions={connected_sessions} reconnects={reconnects} subscription_refreshes={subscription_refreshes} duplicate_updates={duplicate_updates} stale_updates={stale_updates} max_updates_in_single_session={max_updates_in_single_session} evaluated={} insufficient={} gross_positive={} net_positive={}",
+                  final_stats.total,
+                  final_stats.evaluated,
+                  final_stats.insufficient_liquidity,
+                  final_stats.gross_positive,
+                  final_stats.net_positive
+              );
+              Ok(())
+          }
+          '''
+          text = text[:start] + replacement + text[end:]
+
+          # command parser regression now includes monitor.
+          test_anchor = '''        assert_eq!(
+                      parse_command(Some("opportunity-wss-check")).unwrap(),
+                      Some(AppCommand::OpportunityWssCheck)
+                  );
+          '''
+          test_replacement = test_anchor + '''        assert_eq!(
+                      parse_command(Some("opportunity-monitor")).unwrap(),
+                      Some(AppCommand::OpportunityMonitor)
+                  );
+          '''
+          if text.count(test_anchor) != 1:
+              raise SystemExit(f'command parser test anchor count={text.count(test_anchor)}')
+          text = text.replace(test_anchor, test_replacement, 1)
+          path.write_text(text)
+          PY
+
+      - name: Format
+        run: cargo fmt --all
+
+      - name: Compile check
+        run: cargo check --all-targets
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Tests
+        run: cargo test --all-targets
+
+      - name: Commit source integration
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/monitor.rs src/persistence.rs src/main.rs src/app.rs
+          git diff --cached --quiet && { echo "No V3.6.2 monitor changes produced"; exit 1; }
+          git commit -m "feat: run continuous opportunity monitor"
+          git push
