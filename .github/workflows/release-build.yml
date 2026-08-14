@@ -11,7 +11,19 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: x86_64
+            expected_machine: x86-64
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+            expected_machine: ARM aarch64
+
+    runs-on: ${{ matrix.runner }}
+
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -25,8 +37,8 @@ jobs:
         id: rust-version
         run: echo "version=$(rustc --version | awk '{print $2}')" >> "$GITHUB_OUTPUT"
 
-      # release 使用独立 primary key；第一次可从普通 CI 的 Cargo cache 恢复，
-      # 完成后保存包含 release profile 产物的新缓存，避免以后每次部署都冷编译。
+      # 不同 CPU 架构使用独立 release target cache，避免 x86 与 ARM 编译产物混用。
+      # x86_64 首次迁移到新 key 时可从旧 release cache 恢复；ARM64 首次构建从空 target 开始。
       - name: Restore release Cargo cache
         uses: actions/cache@v5
         with:
@@ -34,10 +46,10 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-release-cargo-${{ steps.rust-version.outputs.version }}-${{ hashFiles('Cargo.toml', 'Cargo.lock') }}
+          key: ${{ runner.os }}-release-${{ matrix.arch }}-cargo-${{ steps.rust-version.outputs.version }}-${{ hashFiles('Cargo.toml', 'Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-release-cargo-${{ steps.rust-version.outputs.version }}-
-            ${{ runner.os }}-cargo-${{ steps.rust-version.outputs.version }}-
+            ${{ runner.os }}-release-${{ matrix.arch }}-cargo-${{ steps.rust-version.outputs.version }}-
+            ${{ matrix.arch == 'x86_64' && format('{0}-release-cargo-{1}-', runner.os, steps.rust-version.outputs.version) || '' }}
 
       - name: Release build
         run: cargo build --release --locked
@@ -46,6 +58,9 @@ jobs:
         run: cargo test --release --locked --all-targets
 
       - name: Package deployment bundle
+        env:
+          EXPECTED_MACHINE: ${{ matrix.expected_machine }}
+          RELEASE_ARCH: ${{ matrix.arch }}
         run: |
           rm -rf dist
           mkdir -p dist
@@ -53,16 +68,20 @@ jobs:
           cp deploy/solana-meme-arb.service dist/solana-meme-arb.service
           cp deploy/monitor.env.example dist/monitor.env.example
           cp deploy/README.md dist/DEPLOY.md
-          printf 'commit=%s\nrustc=%s\n' "$GITHUB_SHA" "$(rustc --version)" > dist/BUILD-INFO.txt
+          printf 'commit=%s\nrustc=%s\narch=%s\nuname_machine=%s\n' \
+            "$GITHUB_SHA" "$(rustc --version)" "$RELEASE_ARCH" "$(uname -m)" > dist/BUILD-INFO.txt
+          file dist/solana-meme-arb | tee dist/BINARY-FILE.txt
+          grep -Fq "$EXPECTED_MACHINE" dist/BINARY-FILE.txt
           (cd dist && sha256sum solana-meme-arb > SHA256SUMS)
           ls -lh dist
           cat dist/BUILD-INFO.txt
+          cat dist/BINARY-FILE.txt
           cat dist/SHA256SUMS
 
       - name: Upload deployment artifact
         uses: actions/upload-artifact@v7
         with:
-          name: solana-meme-arb-linux-x86_64-${{ github.sha }}
+          name: solana-meme-arb-linux-${{ matrix.arch }}-${{ github.sha }}
           path: dist/
           if-no-files-found: error
           retention-days: 7
