@@ -35,7 +35,6 @@ jobs:
         run: |
           python - <<'PY'
           from pathlib import Path
-          import re
 
           def replace_once(text, old, new, label):
               count = text.count(old)
@@ -93,16 +92,15 @@ jobs:
           start = text.index('fn parse_full_accounts_response')
           end = text.index('\n/// 校验候选池', start)
           segment = text[start:end]
-          old_error = '''    if let Some(error) = envelope.error {
-              bail!("Solana RPC error {}: {}", error.code, error.message);
-          }'''
-          new_error = '''    if let Some(error) = envelope.error {
-              return Err(anyhow::Error::new(RpcResponseError {
+          segment = replace_once(
+              segment,
+              'bail!("Solana RPC error {}: {}", error.code, error.message);',
+              '''return Err(anyhow::Error::new(RpcResponseError {
                   code: error.code,
                   message: error.message,
-              }));
-          }'''
-          segment = replace_once(segment, old_error, new_error, 'full-account typed error')
+              }));''',
+              'full-account typed error',
+          )
           text = text[:start] + segment + text[end:]
 
           test_marker = '''    #[test]
