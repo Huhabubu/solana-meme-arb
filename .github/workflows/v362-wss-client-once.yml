@@ -1,0 +1,279 @@
+name: v362-wss-client-once
+
+on:
+  push:
+    paths:
+      - '.github/workflows/v362-wss-client-once.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  integrate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        run: |
+          rustup update stable
+          rustup default stable
+          rustup component add rustfmt clippy
+
+      - name: Resolve Rust cache key
+        id: rust-version
+        run: echo "version=$(rustc --version | awk '{print $2}')" >> "$GITHUB_OUTPUT"
+
+      - name: Restore Cargo cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ steps.rust-version.outputs.version }}-${{ hashFiles('Cargo.toml', 'Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-${{ steps.rust-version.outputs.version }}-
+
+      - name: Add reusable Helius account subscription client
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+
+          path = Path('src/helius.rs')
+          text = path.read_text()
+          text = text.replace(
+              'use std::collections::{HashMap, HashSet};',
+              'use std::collections::{HashMap, HashSet, VecDeque};',
+              1,
+          )
+          text = text.replace(
+              'use tokio::time::timeout;',
+              'use tokio::{net::TcpStream, time::timeout};',
+              1,
+          )
+          text = text.replace(
+              'use tokio_tungstenite::{connect_async, tungstenite::Message};',
+              'use tokio_tungstenite::{\n    connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream,\n};',
+              1,
+          )
+
+          start = text.find('/// 通用账户订阅：全部订阅确认后，等待 accepted_addresses 中任意账户出现真实更新。')
+          end = text.find('\n/// V1 回归包装：', start)
+          if start < 0 or end < 0:
+              raise SystemExit(f'subscription function boundary missing: {start}/{end}')
+
+          replacement = r'''fn validate_subscription_scope(
+              addresses: &[String],
+              accepted_addresses: &HashSet<String>,
+          ) -> Result<()> {
+              if addresses.is_empty() {
+                  bail!("cannot subscribe to an empty account list");
+              }
+              if !accepted_addresses.is_empty()
+                  && accepted_addresses
+                      .iter()
+                      .any(|address| !addresses.contains(address))
+              {
+                  bail!("accepted account set contains an address that is not subscribed");
+              }
+              Ok(())
+          }
+
+          /// 可复用的 Helius accountSubscribe 长连接。连接成功后全部 request id 都必须收到 ACK；
+          /// 之后调用方可以在同一 socket 上连续 `next_update`，不会为每条通知重新建连接。
+          pub struct AccountSubscriptionClient {
+              socket: WebSocketStream<MaybeTlsStream<TcpStream>>,
+              tracker: AddressSubscriptionTracker,
+              accepted_addresses: HashSet<String>,
+              buffered_updates: VecDeque<RawAccountUpdate>,
+          }
+
+          impl AccountSubscriptionClient {
+              pub async fn connect(
+                  config: &HeliusConfig,
+                  addresses: &[String],
+                  accepted_addresses: &HashSet<String>,
+                  acknowledge_timeout: Duration,
+              ) -> Result<Self> {
+                  validate_subscription_scope(addresses, accepted_addresses)?;
+                  let wss_url = config.wss_url();
+                  let (socket, _) = connect_async(wss_url.as_str())
+                      .await
+                      .map_err(|_| anyhow::anyhow!("Helius WSS connection failed"))?;
+                  let mut client = Self {
+                      socket,
+                      tracker: AddressSubscriptionTracker::new(addresses)?,
+                      accepted_addresses: accepted_addresses.clone(),
+                      buffered_updates: VecDeque::new(),
+                  };
+
+                  for (index, address) in addresses.iter().enumerate() {
+                      let request_id = (index + 1) as u64;
+                      let request = build_account_subscribe_request(request_id, address);
+                      client
+                          .socket
+                          .send(Message::Text(request.into()))
+                          .await
+                          .map_err(|_| anyhow::anyhow!("failed to send Helius subscription request"))?;
+                  }
+
+                  timeout(acknowledge_timeout, client.wait_for_acknowledgements())
+                      .await
+                      .context("timed out waiting for Helius subscription acknowledgements")??;
+                  Ok(client)
+              }
+
+              pub async fn next_update(&mut self, wait_timeout: Duration) -> Result<RawAccountUpdate> {
+                  if let Some(update) = self.buffered_updates.pop_front() {
+                      return Ok(update);
+                  }
+                  timeout(wait_timeout, async {
+                      loop {
+                          if let Some(update) = self.receive_message().await? {
+                              return Ok(update);
+                          }
+                      }
+                  })
+                  .await
+                  .context("timed out waiting for Helius accepted account update")?
+              }
+
+              async fn wait_for_acknowledgements(&mut self) -> Result<()> {
+                  while !self.tracker.all_acknowledged() {
+                      if let Some(update) = self.receive_message().await? {
+                          self.buffered_updates.push_back(update);
+                      }
+                  }
+                  Ok(())
+              }
+
+              async fn receive_message(&mut self) -> Result<Option<RawAccountUpdate>> {
+                  let message = self
+                      .socket
+                      .next()
+                      .await
+                      .context("Helius WSS connection closed")?
+                      .map_err(|_| anyhow::anyhow!("Helius WSS receive error"))?;
+
+                  match message {
+                      Message::Text(text) => match parse_server_event(text.as_ref())? {
+                          ServerEvent::SubscriptionAck {
+                              request_id,
+                              subscription_id,
+                          } => {
+                              self.tracker.acknowledge(request_id, subscription_id)?;
+                              Ok(None)
+                          }
+                          ServerEvent::AccountNotification {
+                              subscription_id,
+                              slot,
+                              owner,
+                              data,
+                          } => {
+                              let address = self.tracker.resolve(subscription_id)?.to_owned();
+                              if self.accepted_addresses.is_empty()
+                                  || self.accepted_addresses.contains(&address)
+                              {
+                                  Ok(Some(RawAccountUpdate {
+                                      address,
+                                      subscription_id,
+                                      slot,
+                                      owner,
+                                      data,
+                                  }))
+                              } else {
+                                  Ok(None)
+                              }
+                          }
+                          ServerEvent::RpcError {
+                              request_id,
+                              code,
+                              message,
+                          } => {
+                              bail!(
+                                  "Helius WSS RPC error request={request_id:?} code={code}: {message}"
+                              )
+                          }
+                          ServerEvent::Other => Ok(None),
+                      },
+                      Message::Close(_) => bail!("Helius WSS connection closed"),
+                      Message::Ping(payload) => {
+                          self.socket
+                              .send(Message::Pong(payload))
+                              .await
+                              .map_err(|_| anyhow::anyhow!("failed to reply to Helius WSS ping"))?;
+                          Ok(None)
+                      }
+                      Message::Binary(_) | Message::Pong(_) | Message::Frame(_) => Ok(None),
+                  }
+              }
+          }
+
+          /// 兼容单次验收接口：底层使用可复用长连接，拿到第一条 accepted update 后返回。
+          pub async fn subscribe_accounts_and_wait_for_update(
+              config: &HeliusConfig,
+              addresses: &[String],
+              accepted_addresses: &HashSet<String>,
+              wait_timeout: Duration,
+          ) -> Result<RawAccountUpdate> {
+              let mut client = AccountSubscriptionClient::connect(
+                  config,
+                  addresses,
+                  accepted_addresses,
+                  wait_timeout,
+              )
+              .await?;
+              client.next_update(wait_timeout).await
+          }
+          '''
+          text = text[:start] + replacement + text[end:]
+
+          test_marker = '''    #[test]
+              fn address_tracker_maps_request_to_subscription_and_address() {
+          '''
+          if text.count(test_marker) != 1:
+              raise SystemExit(f'helius test marker count={text.count(test_marker)}')
+          extra_test = r'''    #[test]
+              fn subscription_scope_requires_nonempty_subscriptions_and_subset_filter() {
+                  let addresses = vec!["a".to_owned(), "b".to_owned()];
+                  assert!(validate_subscription_scope(&[], &HashSet::new()).is_err());
+                  assert!(validate_subscription_scope(&addresses, &HashSet::new()).is_ok());
+                  assert!(validate_subscription_scope(
+                      &addresses,
+                      &HashSet::from(["a".to_owned()])
+                  )
+                  .is_ok());
+                  assert!(validate_subscription_scope(
+                      &addresses,
+                      &HashSet::from(["missing".to_owned()])
+                  )
+                  .is_err());
+              }
+
+          '''
+          text = text.replace(test_marker, extra_test + test_marker, 1)
+          path.write_text(text)
+          PY
+
+      - name: Format
+        run: cargo fmt --all
+
+      - name: Compile check
+        run: cargo check --all-targets
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Tests
+        run: cargo test --all-targets
+
+      - name: Commit source integration
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/helius.rs
+          git diff --cached --quiet && { echo "No reusable WSS client changes produced"; exit 1; }
+          git commit -m "refactor: keep Helius account subscriptions reusable"
+          git push
