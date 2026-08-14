@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-use reqwest::Client;
+use reqwest::{header::RETRY_AFTER, Client, StatusCode};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::time::sleep;
@@ -12,8 +12,11 @@ use crate::model::PoolInfo;
 pub const PUBLIC_MAINNET_RPC: &str = "https://api.mainnet-beta.solana.com";
 
 const MIN_CONTEXT_SLOT_NOT_REACHED_CODE: i64 = -32016;
-const FULL_ACCOUNT_MAX_ATTEMPTS: usize = 3;
+const MIN_CONTEXT_SLOT_MAX_RETRIES: usize = 2;
 const MIN_CONTEXT_SLOT_RETRY_BASE_MS: u64 = 200;
+const TRANSIENT_HTTP_MAX_RETRIES: usize = 4;
+const TRANSIENT_HTTP_RETRY_BASE_MS: u64 = 1_000;
+const TRANSIENT_HTTP_RETRY_MAX_MS: u64 = 30_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccountData {
@@ -129,7 +132,10 @@ pub async fn fetch_accounts(
     }
 
     let request = build_full_accounts_request(addresses, min_context_slot)?;
-    for attempt in 0..FULL_ACCOUNT_MAX_ATTEMPTS {
+    let mut min_context_retries = 0usize;
+    let mut transient_http_retries = 0usize;
+
+    loop {
         let response = client
             .post(rpc_url)
             .json(&request)
@@ -137,25 +143,43 @@ pub async fn fetch_accounts(
             .await
             .map_err(|_| anyhow::anyhow!("Solana RPC full-account request failed"))?;
         let status = response.status();
+
         if !status.is_success() {
+            if should_retry_http_status(status, transient_http_retries) {
+                let retry_after = response
+                    .headers()
+                    .get(RETRY_AFTER)
+                    .and_then(|value| value.to_str().ok());
+                let delay_ms = transient_http_retry_delay_ms(transient_http_retries, retry_after);
+                transient_http_retries += 1;
+                sleep(Duration::from_millis(delay_ms)).await;
+                continue;
+            }
             bail!("Solana RPC full-account request returned status {status}");
         }
+
         let body = response
             .text()
             .await
             .map_err(|_| anyhow::anyhow!("failed to read Solana RPC full-account response"))?;
 
         if let Some(code) = full_accounts_rpc_error_code(&body) {
-            if should_retry_min_context_slot_error(code, attempt, min_context_slot.is_some()) {
-                sleep(Duration::from_millis(retry_delay_ms(attempt))).await;
+            if should_retry_min_context_slot_error(
+                code,
+                min_context_retries,
+                min_context_slot.is_some(),
+            ) {
+                sleep(Duration::from_millis(min_context_retry_delay_ms(
+                    min_context_retries,
+                )))
+                .await;
+                min_context_retries += 1;
                 continue;
             }
         }
 
         return parse_full_accounts_response(&body);
     }
-
-    unreachable!("the final fetch_accounts attempt always returns instead of retrying")
 }
 
 fn build_full_accounts_request(
@@ -191,16 +215,33 @@ fn full_accounts_rpc_error_code(body: &str) -> Option<i64> {
 
 fn should_retry_min_context_slot_error(
     code: i64,
-    attempt: usize,
+    retry_count: usize,
     has_min_context_slot: bool,
 ) -> bool {
     has_min_context_slot
         && code == MIN_CONTEXT_SLOT_NOT_REACHED_CODE
-        && attempt + 1 < FULL_ACCOUNT_MAX_ATTEMPTS
+        && retry_count < MIN_CONTEXT_SLOT_MAX_RETRIES
 }
 
-fn retry_delay_ms(attempt: usize) -> u64 {
-    MIN_CONTEXT_SLOT_RETRY_BASE_MS * (attempt as u64 + 1)
+fn min_context_retry_delay_ms(retry_count: usize) -> u64 {
+    MIN_CONTEXT_SLOT_RETRY_BASE_MS * (retry_count as u64 + 1)
+}
+
+fn should_retry_http_status(status: StatusCode, retry_count: usize) -> bool {
+    retry_count < TRANSIENT_HTTP_MAX_RETRIES
+        && matches!(status.as_u16(), 408 | 429 | 500 | 502 | 503 | 504)
+}
+
+fn transient_http_retry_delay_ms(retry_count: usize, retry_after: Option<&str>) -> u64 {
+    if let Some(seconds) = retry_after.and_then(|value| value.parse::<u64>().ok()) {
+        return seconds
+            .saturating_mul(1_000)
+            .min(TRANSIENT_HTTP_RETRY_MAX_MS);
+    }
+
+    TRANSIENT_HTTP_RETRY_BASE_MS
+        .saturating_mul(1_u64 << retry_count.min(5))
+        .min(TRANSIENT_HTTP_RETRY_MAX_MS)
 }
 
 fn parse_account_owners(body: &str) -> Result<Vec<Option<String>>> {
@@ -353,8 +394,34 @@ mod tests {
         assert!(!should_retry_min_context_slot_error(-32016, 2, true));
         assert!(!should_retry_min_context_slot_error(-32016, 0, false));
         assert!(!should_retry_min_context_slot_error(-32602, 0, true));
-        assert_eq!(retry_delay_ms(0), 200);
-        assert_eq!(retry_delay_ms(1), 400);
+        assert_eq!(min_context_retry_delay_ms(0), 200);
+        assert_eq!(min_context_retry_delay_ms(1), 400);
+    }
+
+    #[test]
+    fn transient_http_retry_policy_is_bounded_and_selective() {
+        for code in [408, 429, 500, 502, 503, 504] {
+            let status = StatusCode::from_u16(code).unwrap();
+            assert!(should_retry_http_status(status, 0));
+            assert!(should_retry_http_status(status, 3));
+            assert!(!should_retry_http_status(status, 4));
+        }
+        for code in [400, 401, 403, 404, 409, 422] {
+            assert!(!should_retry_http_status(
+                StatusCode::from_u16(code).unwrap(),
+                0
+            ));
+        }
+    }
+
+    #[test]
+    fn transient_http_backoff_prefers_retry_after_and_caps_delay() {
+        assert_eq!(transient_http_retry_delay_ms(0, None), 1_000);
+        assert_eq!(transient_http_retry_delay_ms(1, None), 2_000);
+        assert_eq!(transient_http_retry_delay_ms(3, None), 8_000);
+        assert_eq!(transient_http_retry_delay_ms(0, Some("2")), 2_000);
+        assert_eq!(transient_http_retry_delay_ms(0, Some("999")), 30_000);
+        assert_eq!(transient_http_retry_delay_ms(2, Some("invalid")), 4_000);
     }
 
     #[test]
