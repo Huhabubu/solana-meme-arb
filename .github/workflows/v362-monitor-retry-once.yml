@@ -1,0 +1,198 @@
+name: v362-monitor-retry-once
+
+on:
+  push:
+    paths:
+      - '.github/workflows/v362-monitor-retry-once.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  integrate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        run: |
+          rustup update stable
+          rustup default stable
+          rustup component add rustfmt clippy
+
+      - name: Resolve Rust cache key
+        id: rust-version
+        run: echo "version=$(rustc --version | awk '{print $2}')" >> "$GITHUB_OUTPUT"
+
+      - name: Restore Cargo cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ steps.rust-version.outputs.version }}-${{ hashFiles('Cargo.toml', 'Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-${{ steps.rust-version.outputs.version }}-
+
+      - name: Replay V3.6.2 source-generation steps
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+          import subprocess
+
+          workflow = Path('.github/workflows/v362-monitor-once.yml').read_text().splitlines()
+          wanted = [
+              'Add monitor control and update watermark',
+              'Add incremental statistics ingestion',
+              'Register monitor module and enforce minContextSlot during dependency refresh',
+              'Add reusable fixed-universe state rebuild',
+              'Add continuous opportunity monitor and shared update processor',
+          ]
+
+          def run_body(name):
+              marker = f'      - name: {name}'
+              try:
+                  start = workflow.index(marker)
+              except ValueError:
+                  raise SystemExit(f'missing source-generation step: {name}')
+              run_line = start + 1
+              while run_line < len(workflow) and workflow[run_line] != '        run: |':
+                  run_line += 1
+              if run_line >= len(workflow):
+                  raise SystemExit(f'missing run body for: {name}')
+              body = []
+              i = run_line + 1
+              while i < len(workflow) and not workflow[i].startswith('      - name: '):
+                  line = workflow[i]
+                  body.append(line[10:] if line.startswith('          ') else line)
+                  i += 1
+              subprocess.run(['bash', '-e', '-c', '\n'.join(body).rstrip() + '\n'], check=True)
+
+          for name in wanted:
+              run_body(name)
+          PY
+
+      - name: Make monitor helpers Clippy-clean
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+
+          path = Path('src/monitor.rs')
+          text = path.read_text()
+
+          text = text.replace(
+              'collections::{HashMap, HashSet},',
+              'collections::{hash_map::Entry, HashMap},',
+              1,
+          )
+
+          start = text.find('fn parse_optional_positive_usize(')
+          end = text.find('\nfn parse_optional_nonnegative_usize(', start)
+          if start < 0 or end < 0:
+              raise SystemExit(f'positive usize helper boundary missing: {start}/{end}')
+          text = text[:start] + r'''fn parse_optional_positive_usize(name: &str, value: Option<&str>) -> Result<Option<usize>> {
+              value
+                  .map(|value| {
+                      let parsed = value
+                          .parse::<usize>()
+                          .with_context(|| format!("{name} must be a positive integer"))?;
+                      if parsed == 0 {
+                          bail!("{name} must be greater than zero");
+                      }
+                      Ok(parsed)
+                  })
+                  .transpose()
+          }
+          ''' + text[end:]
+
+          start = text.find('fn parse_optional_positive_u64(')
+          end = text.find('\n#[derive(Debug, Clone, Copy, PartialEq, Eq)]', start)
+          if start < 0 or end < 0:
+              raise SystemExit(f'positive u64 helper boundary missing: {start}/{end}')
+          text = text[:start] + r'''fn parse_optional_positive_u64(name: &str, value: Option<&str>) -> Result<Option<u64>> {
+              value
+                  .map(|value| {
+                      let parsed = value
+                          .parse::<u64>()
+                          .with_context(|| format!("{name} must be a positive integer"))?;
+                      if parsed == 0 {
+                          bail!("{name} must be greater than zero");
+                      }
+                      Ok(parsed)
+                  })
+                  .transpose()
+          }
+          ''' + text[end:]
+
+          start = text.find('impl UpdateWatermark {')
+          end = text.find('\npub fn subscription_sets_equal(', start)
+          if start < 0 or end < 0:
+              raise SystemExit(f'watermark boundary missing: {start}/{end}')
+          text = text[:start] + r'''impl UpdateWatermark {
+              pub fn classify(&mut self, update: &RawAccountUpdate) -> UpdateNovelty {
+                  match self.latest.entry(update.address.clone()) {
+                      Entry::Vacant(entry) => {
+                          entry.insert(seen_update(update));
+                          UpdateNovelty::New
+                      }
+                      Entry::Occupied(mut entry) => {
+                          let previous = entry.get();
+                          if update.slot < previous.slot {
+                              return UpdateNovelty::Stale;
+                          }
+                          if update.slot == previous.slot
+                              && update.owner == previous.owner
+                              && update.data == previous.data
+                          {
+                              return UpdateNovelty::Duplicate;
+                          }
+                          entry.insert(seen_update(update));
+                          UpdateNovelty::New
+                      }
+                  }
+              }
+          }
+
+          fn seen_update(update: &RawAccountUpdate) -> SeenUpdate {
+              SeenUpdate {
+                  slot: update.slot,
+                  owner: update.owner.clone(),
+                  data: update.data.clone(),
+              }
+          }
+          ''' + text[end:]
+
+          start = text.find('pub fn subscription_sets_equal(')
+          end = text.find('\npub fn dependency_update_may_change_set(', start)
+          if start < 0 or end < 0:
+              raise SystemExit(f'subscription set helper boundary missing: {start}/{end}')
+          text = text[:start] + r'''pub fn subscription_sets_equal(left: &[String], right: &[String]) -> bool {
+              left.len() == right.len() && left.iter().all(|address| right.contains(address))
+          }
+          ''' + text[end:]
+
+          path.write_text(text)
+          PY
+
+      - name: Format
+        run: cargo fmt --all
+
+      - name: Compile check
+        run: cargo check --all-targets
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Tests
+        run: cargo test --all-targets
+
+      - name: Commit source integration
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/monitor.rs src/persistence.rs src/main.rs src/app.rs
+          git diff --cached --quiet && { echo "No V3.6.2 monitor changes produced"; exit 1; }
+          git commit -m "feat: run continuous opportunity monitor"
+          git push
