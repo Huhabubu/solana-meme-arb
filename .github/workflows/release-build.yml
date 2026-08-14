@@ -2,6 +2,9 @@ name: release-build
 
 on:
   workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/release-build.yml"
 
 permissions:
   contents: read
