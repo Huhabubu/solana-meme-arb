@@ -1,6 +1,8 @@
+use std::collections::HashSet;
+
 use anyhow::{bail, Context, Result};
 
-use crate::model::Dex;
+use crate::model::{Dex, PoolInfo};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SwapQuote {
@@ -107,6 +109,180 @@ pub struct NetOpportunity {
 impl NetOpportunity {
     pub fn is_profitable(&self) -> bool {
         self.net_profit_raw > 0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DirectedPoolRoute {
+    pub token_mint: String,
+    pub first_pool: PoolInfo,
+    pub second_pool: PoolInfo,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LiquidityStage {
+    FirstLeg,
+    SecondLeg,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OpportunityEventOutcome {
+    Evaluated {
+        intermediate_amount: u64,
+        final_amount: u64,
+        gross_profit_raw: i128,
+        gross_return_ppm: i128,
+        execution_cost_lamports: u64,
+        net_profit_raw: i128,
+        net_return_ppm: i128,
+        oldest_slot: u64,
+        newest_slot: u64,
+    },
+    InsufficientLiquidity {
+        stage: LiquidityStage,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpportunityEvent {
+    pub token_mint: String,
+    pub first_dex: Dex,
+    pub first_pool: String,
+    pub second_dex: Dex,
+    pub second_pool: String,
+    pub input_amount: u64,
+    pub outcome: OpportunityEventOutcome,
+}
+
+impl OpportunityEvent {
+    pub fn evaluated(route: &DirectedPoolRoute, net: &NetOpportunity) -> Result<Self> {
+        let round_trip = &net.round_trip;
+        if route.token_mint != round_trip.intermediate_mint {
+            bail!("opportunity event token mint does not match round trip");
+        }
+        if route.first_pool.address != round_trip.first_leg.pool_address
+            || route.first_pool.dex != round_trip.first_leg.dex
+            || route.second_pool.address != round_trip.second_leg.pool_address
+            || route.second_pool.dex != round_trip.second_leg.dex
+        {
+            bail!("opportunity event route does not match round trip legs");
+        }
+
+        Ok(Self {
+            token_mint: route.token_mint.clone(),
+            first_dex: route.first_pool.dex,
+            first_pool: route.first_pool.address.clone(),
+            second_dex: route.second_pool.dex,
+            second_pool: route.second_pool.address.clone(),
+            input_amount: round_trip.input_amount,
+            outcome: OpportunityEventOutcome::Evaluated {
+                intermediate_amount: round_trip.intermediate_amount,
+                final_amount: round_trip.final_amount,
+                gross_profit_raw: round_trip.gross_profit_raw,
+                gross_return_ppm: round_trip.gross_return_ppm,
+                execution_cost_lamports: net.execution_cost_lamports,
+                net_profit_raw: net.net_profit_raw,
+                net_return_ppm: net.net_return_ppm,
+                oldest_slot: round_trip.oldest_slot,
+                newest_slot: round_trip.newest_slot,
+            },
+        })
+    }
+
+    pub fn insufficient_liquidity(
+        route: &DirectedPoolRoute,
+        input_amount: u64,
+        stage: LiquidityStage,
+    ) -> Result<Self> {
+        if input_amount == 0 {
+            bail!("opportunity event input amount must be positive");
+        }
+        Ok(Self {
+            token_mint: route.token_mint.clone(),
+            first_dex: route.first_pool.dex,
+            first_pool: route.first_pool.address.clone(),
+            second_dex: route.second_pool.dex,
+            second_pool: route.second_pool.address.clone(),
+            input_amount,
+            outcome: OpportunityEventOutcome::InsufficientLiquidity { stage },
+        })
+    }
+}
+
+/// 只生成与本次受影响 Pool 有关的有向两池路径，同时严格限制在同一个 Token/WSOL 交易对内。
+/// 一个依赖账户若同时影响多个池，最终路径仍按 (first_pool, second_pool) 去重。
+pub fn affected_directed_pool_routes(
+    pools: &[PoolInfo],
+    affected_pool_addresses: &[String],
+    base_mint: &str,
+) -> Result<Vec<DirectedPoolRoute>> {
+    if base_mint.trim().is_empty() {
+        bail!("affected-route base mint cannot be empty");
+    }
+    if affected_pool_addresses.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut pool_addresses = HashSet::new();
+    for pool in pools {
+        if !pool_addresses.insert(pool.address.as_str()) {
+            bail!(
+                "duplicate pool address in opportunity universe: {}",
+                pool.address
+            );
+        }
+    }
+
+    let affected = affected_pool_addresses
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    for address in &affected {
+        if !pool_addresses.contains(address) {
+            bail!("affected pool is outside opportunity universe: {address}");
+        }
+    }
+
+    let token_mints = pools
+        .iter()
+        .map(|pool| token_mint_for_base(pool, base_mint))
+        .collect::<Result<Vec<_>>>()?;
+    let mut routes = Vec::new();
+    let mut seen = HashSet::new();
+    for first in 0..pools.len() {
+        for second in 0..pools.len() {
+            if first == second || token_mints[first] != token_mints[second] {
+                continue;
+            }
+            if !affected.contains(pools[first].address.as_str())
+                && !affected.contains(pools[second].address.as_str())
+            {
+                continue;
+            }
+            let key = (
+                pools[first].address.as_str(),
+                pools[second].address.as_str(),
+            );
+            if seen.insert(key) {
+                routes.push(DirectedPoolRoute {
+                    token_mint: token_mints[first].to_owned(),
+                    first_pool: pools[first].clone(),
+                    second_pool: pools[second].clone(),
+                });
+            }
+        }
+    }
+    Ok(routes)
+}
+
+fn token_mint_for_base<'a>(pool: &'a PoolInfo, base_mint: &str) -> Result<&'a str> {
+    match (pool.mint_a == base_mint, pool.mint_b == base_mint) {
+        (true, false) => Ok(pool.mint_b.as_str()),
+        (false, true) => Ok(pool.mint_a.as_str()),
+        _ => bail!(
+            "pool is not a valid single-base pair for affected-route engine: {}",
+            pool.address
+        ),
     }
 }
 
@@ -417,5 +593,140 @@ mod tests {
 
         let wrong_amount = quote(Dex::Orca, "b", "TOKEN", "SOL", 199, 101, 1);
         assert!(evaluate_round_trip(&first, &wrong_amount).is_err());
+    }
+
+    fn route_pool(dex: Dex, address: &str, token: &str) -> PoolInfo {
+        PoolInfo {
+            dex,
+            address: address.into(),
+            pool_type: "test".into(),
+            program_id: Some("program".into()),
+            mint_a: token.into(),
+            mint_b: "SOL".into(),
+            tvl_usd: 1_000.0,
+        }
+    }
+
+    #[test]
+    fn affected_routes_only_cover_the_updated_tokens_group() {
+        let pools = vec![
+            route_pool(Dex::Raydium, "a", "TOKEN1"),
+            route_pool(Dex::Orca, "b", "TOKEN1"),
+            route_pool(Dex::MeteoraDlmm, "c", "TOKEN1"),
+            route_pool(Dex::Raydium, "d", "TOKEN2"),
+            route_pool(Dex::Orca, "e", "TOKEN2"),
+            route_pool(Dex::MeteoraDlmm, "f", "TOKEN2"),
+        ];
+        let routes = affected_directed_pool_routes(&pools, &["b".into()], "SOL").unwrap();
+        let pairs = routes
+            .iter()
+            .map(|route| {
+                (
+                    route.first_pool.address.as_str(),
+                    route.second_pool.address.as_str(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(pairs, vec![("a", "b"), ("b", "a"), ("b", "c"), ("c", "b")]);
+        assert!(routes.iter().all(|route| route.token_mint == "TOKEN1"));
+    }
+
+    #[test]
+    fn multiple_affected_pools_expand_to_all_related_routes_without_duplicates() {
+        let pools = vec![
+            route_pool(Dex::Raydium, "a", "TOKEN1"),
+            route_pool(Dex::Orca, "b", "TOKEN1"),
+            route_pool(Dex::MeteoraDlmm, "c", "TOKEN1"),
+        ];
+        let routes =
+            affected_directed_pool_routes(&pools, &["b".into(), "c".into(), "b".into()], "SOL")
+                .unwrap();
+        assert_eq!(routes.len(), 6);
+        let pairs = routes
+            .iter()
+            .map(|route| {
+                (
+                    route.first_pool.address.clone(),
+                    route.second_pool.address.clone(),
+                )
+            })
+            .collect::<HashSet<_>>();
+        assert_eq!(pairs.len(), 6);
+    }
+
+    #[test]
+    fn affected_routes_reject_unknown_pool_and_invalid_base_universe() {
+        let pools = vec![
+            route_pool(Dex::Raydium, "a", "TOKEN1"),
+            route_pool(Dex::Orca, "b", "TOKEN1"),
+        ];
+        assert!(affected_directed_pool_routes(&pools, &["missing".into()], "SOL").is_err());
+
+        let mut invalid = pools;
+        invalid[1].mint_b = "OTHER".into();
+        assert!(affected_directed_pool_routes(&invalid, &["a".into()], "SOL").is_err());
+    }
+
+    #[test]
+    fn opportunity_event_preserves_evaluated_net_result() {
+        let gross = profitable_round_trip();
+        let net = apply_execution_cost(
+            &gross,
+            ExecutionCost {
+                base_fee_lamports: 5_000,
+                priority_fee_lamports: 0,
+                jito_tip_lamports: 1_000,
+                other_lamports: 0,
+            },
+        )
+        .unwrap();
+        let route = DirectedPoolRoute {
+            token_mint: "TOKEN".into(),
+            first_pool: route_pool(Dex::Orca, "orca", "TOKEN"),
+            second_pool: route_pool(Dex::Raydium, "raydium", "TOKEN"),
+        };
+        let event = OpportunityEvent::evaluated(&route, &net).unwrap();
+        assert_eq!(event.input_amount, 1_000_000);
+        assert_eq!(event.first_pool, "orca");
+        assert_eq!(event.second_pool, "raydium");
+        assert_eq!(
+            event.outcome,
+            OpportunityEventOutcome::Evaluated {
+                intermediate_amount: 2_000_000,
+                final_amount: 1_010_000,
+                gross_profit_raw: 10_000,
+                gross_return_ppm: 10_000,
+                execution_cost_lamports: 6_000,
+                net_profit_raw: 4_000,
+                net_return_ppm: 4_000,
+                oldest_slot: 100,
+                newest_slot: 103,
+            }
+        );
+    }
+
+    #[test]
+    fn opportunity_event_keeps_liquidity_failure_as_explicit_state() {
+        let route = DirectedPoolRoute {
+            token_mint: "TOKEN".into(),
+            first_pool: route_pool(Dex::Orca, "orca", "TOKEN"),
+            second_pool: route_pool(Dex::Raydium, "raydium", "TOKEN"),
+        };
+        let event = OpportunityEvent::insufficient_liquidity(
+            &route,
+            100_000_000,
+            LiquidityStage::SecondLeg,
+        )
+        .unwrap();
+        assert_eq!(event.input_amount, 100_000_000);
+        assert_eq!(
+            event.outcome,
+            OpportunityEventOutcome::InsufficientLiquidity {
+                stage: LiquidityStage::SecondLeg
+            }
+        );
+        assert!(
+            OpportunityEvent::insufficient_liquidity(&route, 0, LiquidityStage::FirstLeg).is_err()
+        );
     }
 }

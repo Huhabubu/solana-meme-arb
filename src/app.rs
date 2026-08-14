@@ -36,8 +36,9 @@ use crate::{
     helius::{check_http, subscribe_accounts_and_wait_for_update, subscribe_and_wait_for_update},
     model::{Dex, PoolInfo},
     opportunity::{
-        apply_execution_cost, directed_route_indices, evaluate_round_trip_curve, ExecutionCost,
-        SwapQuote,
+        affected_directed_pool_routes, apply_execution_cost, directed_route_indices,
+        evaluate_round_trip, evaluate_round_trip_curve, DirectedPoolRoute, ExecutionCost,
+        LiquidityStage, OpportunityEvent, OpportunityEventOutcome, SwapQuote,
     },
     rpc::{fetch_account_owners, fetch_accounts, verify_pool_accounts, PUBLIC_MAINNET_RPC},
     state::{DependencyKind, PoolDependencies, QuoteState, VersionedAccountData},
@@ -66,6 +67,7 @@ enum AppCommand {
     OrcaQuoteCheck,
     MeteoraQuoteCheck,
     DependencyWssCheck,
+    OpportunityWssCheck,
     RoundTripCheck,
 }
 
@@ -79,6 +81,7 @@ fn parse_command(value: Option<&str>) -> Result<Option<AppCommand>> {
         Some("orca-quote-check") => Ok(Some(AppCommand::OrcaQuoteCheck)),
         Some("meteora-quote-check") => Ok(Some(AppCommand::MeteoraQuoteCheck)),
         Some("dependency-wss-check") => Ok(Some(AppCommand::DependencyWssCheck)),
+        Some("opportunity-wss-check") => Ok(Some(AppCommand::OpportunityWssCheck)),
         Some("round-trip-check") => Ok(Some(AppCommand::RoundTripCheck)),
         Some(other) => bail!("unknown command: {other}"),
     }
@@ -88,7 +91,7 @@ pub async fn run() -> Result<()> {
     let argument = std::env::args().nth(1);
     let Some(command) = parse_command(argument.as_deref())? else {
         println!(
-            "Usage: {APP_NAME} <discover|verify|helius-check|raydium-quote-check|orca-quote-check|meteora-quote-check|dependency-wss-check|round-trip-check>"
+            "Usage: {APP_NAME} <discover|verify|helius-check|raydium-quote-check|orca-quote-check|meteora-quote-check|dependency-wss-check|opportunity-wss-check|round-trip-check>"
         );
         return Ok(());
     };
@@ -102,6 +105,7 @@ pub async fn run() -> Result<()> {
         AppCommand::OrcaQuoteCheck => run_orca_quote_check(&client).await,
         AppCommand::MeteoraQuoteCheck => run_meteora_quote_check(&client).await,
         AppCommand::DependencyWssCheck => run_dependency_wss_check(&client).await,
+        AppCommand::OpportunityWssCheck => run_opportunity_wss_check(&client).await,
         AppCommand::RoundTripCheck => run_round_trip_check(&client).await,
     }
 }
@@ -665,6 +669,85 @@ async fn quote_supported_pool_amounts(
             bail!("Meteora DAMM v2 is not part of the V3 quoteable universe")
         }
     }
+}
+
+fn v3_cost_floor() -> ExecutionCost {
+    ExecutionCost {
+        base_fee_lamports: V3_COST_FLOOR_BASE_FEE_LAMPORTS,
+        jito_tip_lamports: V3_COST_FLOOR_JITO_TIP_LAMPORTS,
+        ..ExecutionCost::ZERO
+    }
+}
+
+async fn evaluate_live_route_events(
+    client: &Client,
+    config: &HeliusConfig,
+    route: &DirectedPoolRoute,
+    execution_cost: ExecutionCost,
+) -> Result<Vec<OpportunityEvent>> {
+    let first_points = quote_supported_pool_amounts(
+        client,
+        config,
+        &route.first_pool,
+        WSOL,
+        &ROUND_TRIP_PROBE_LAMPORTS,
+    )
+    .await?;
+    if first_points.len() != ROUND_TRIP_PROBE_LAMPORTS.len() {
+        bail!("V3.5 first-leg quote point count mismatch");
+    }
+
+    let mut events = Vec::with_capacity(ROUND_TRIP_PROBE_LAMPORTS.len());
+    let mut available_first = Vec::new();
+    for (index, point) in first_points.into_iter().enumerate() {
+        if let Some(quote) = point {
+            available_first.push((index, quote));
+        } else {
+            events.push(OpportunityEvent::insufficient_liquidity(
+                route,
+                ROUND_TRIP_PROBE_LAMPORTS[index],
+                LiquidityStage::FirstLeg,
+            )?);
+        }
+    }
+
+    if !available_first.is_empty() {
+        let second_inputs = available_first
+            .iter()
+            .map(|(_, quote)| quote.amount_out)
+            .collect::<Vec<_>>();
+        let second_points = quote_supported_pool_amounts(
+            client,
+            config,
+            &route.second_pool,
+            &route.token_mint,
+            &second_inputs,
+        )
+        .await?;
+        if second_points.len() != available_first.len() {
+            bail!("V3.5 second-leg quote point count mismatch");
+        }
+
+        for ((index, first_quote), second_point) in available_first.into_iter().zip(second_points) {
+            if let Some(second_quote) = second_point {
+                let gross = evaluate_round_trip(&first_quote, &second_quote)?;
+                let net = apply_execution_cost(&gross, execution_cost)?;
+                events.push(OpportunityEvent::evaluated(route, &net)?);
+            } else {
+                events.push(OpportunityEvent::insufficient_liquidity(
+                    route,
+                    ROUND_TRIP_PROBE_LAMPORTS[index],
+                    LiquidityStage::SecondLeg,
+                )?);
+            }
+        }
+    }
+
+    events.sort_by_key(|event| event.input_amount);
+    if events.len() != ROUND_TRIP_PROBE_LAMPORTS.len() {
+        bail!("V3.5 route did not account for every probe amount");
+    }
+    Ok(events)
 }
 
 async fn run_round_trip_check(client: &Client) -> Result<()> {
@@ -1483,6 +1566,154 @@ async fn run_dependency_wss_check(client: &Client) -> Result<()> {
     Ok(())
 }
 
+async fn run_opportunity_wss_check(client: &Client) -> Result<()> {
+    let config = HeliusConfig::from_env()?;
+    let (mut state, pools) = build_quote_state(client, &config).await?;
+    let addresses = state.unique_dependency_addresses();
+    let accepted_addresses = addresses.iter().cloned().collect::<HashSet<_>>();
+    if accepted_addresses.is_empty() {
+        bail!("V3.5 opportunity universe has no quote dependency accounts");
+    }
+
+    println!(
+        "V3.5 opportunity WSS subscribing to {} unique dependencies across {} quoteable pools",
+        addresses.len(),
+        pools.len()
+    );
+    let update = subscribe_accounts_and_wait_for_update(
+        &config,
+        &addresses,
+        &accepted_addresses,
+        Duration::from_secs(DEPENDENCY_WSS_WAIT_SECONDS),
+    )
+    .await?;
+    let applied = state.apply_account_update(
+        &update.address,
+        VersionedAccountData {
+            slot: update.slot,
+            owner: update.owner.clone(),
+            data: update.data.clone(),
+        },
+    )?;
+    if !applied.accepted {
+        bail!("V3.5 received dependency update older than local QuoteState");
+    }
+    if applied.affected_pools.is_empty() {
+        bail!("V3.5 dependency update did not map to any affected pool");
+    }
+
+    let affected_pools = applied.affected_pools.clone();
+    println!(
+        "V3.5 trigger: address={} slot={} subscription={} affected_pools={:?}",
+        update.address, update.slot, update.subscription_id, affected_pools
+    );
+    for pool_address in &affected_pools {
+        let dependencies = state
+            .dependencies_for_pool(pool_address)
+            .context("V3.5 affected pool disappeared from QuoteState")?
+            .clone();
+        let kind = state
+            .dependency_kind(pool_address, &update.address)
+            .context("V3.5 updated account missing dependency kind")?;
+        println!(
+            "  affected pool={} dex={} kind={kind:?}; refreshing dynamic dependencies",
+            dependencies.pool.address, dependencies.pool.dex
+        );
+        refresh_pool_dependencies(client, &config, &mut state, &dependencies.pool, update.slot)
+            .await?;
+        if !state.missing_accounts_for_pool(pool_address)?.is_empty() {
+            bail!("V3.5 refreshed affected-pool dependencies are incomplete");
+        }
+    }
+
+    let routes = affected_directed_pool_routes(&pools, &affected_pools, WSOL)?;
+    if routes.is_empty() {
+        bail!("V3.5 affected pools produced no related arbitrage routes");
+    }
+    let cost_floor = v3_cost_floor();
+    let mut event_count = 0usize;
+    let mut evaluated_count = 0usize;
+    let mut unavailable_count = 0usize;
+    let mut net_positive_count = 0usize;
+
+    for route in &routes {
+        let token = tracked_tokens()
+            .iter()
+            .find(|token| token.mint == route.token_mint)
+            .context("V3.5 route token is outside tracked universe")?;
+        let events = evaluate_live_route_events(client, &config, route, cost_floor).await?;
+        for event in &events {
+            match &event.outcome {
+                OpportunityEventOutcome::Evaluated {
+                    intermediate_amount,
+                    final_amount,
+                    gross_profit_raw,
+                    gross_return_ppm,
+                    execution_cost_lamports,
+                    net_profit_raw,
+                    net_return_ppm,
+                    oldest_slot,
+                    newest_slot,
+                } => {
+                    evaluated_count += 1;
+                    if *net_profit_raw > 0 {
+                        net_positive_count += 1;
+                    }
+                    println!(
+                        "{}/WSOL V3.5 event: {}->{} input={} token_out={} final={} gross_profit_raw={} gross_return_ppm={} execution_cost={} net_profit_raw={} net_return_ppm={} slots={}..{}",
+                        token.symbol,
+                        event.first_dex,
+                        event.second_dex,
+                        event.input_amount,
+                        intermediate_amount,
+                        final_amount,
+                        gross_profit_raw,
+                        gross_return_ppm,
+                        execution_cost_lamports,
+                        net_profit_raw,
+                        net_return_ppm,
+                        oldest_slot,
+                        newest_slot
+                    );
+                }
+                OpportunityEventOutcome::InsufficientLiquidity { stage } => {
+                    unavailable_count += 1;
+                    println!(
+                        "{}/WSOL V3.5 event: {}->{} input={} status=insufficient_liquidity stage={stage:?}",
+                        token.symbol,
+                        event.first_dex,
+                        event.second_dex,
+                        event.input_amount
+                    );
+                }
+            }
+        }
+        event_count += events.len();
+    }
+
+    let expected_events = routes.len() * ROUND_TRIP_PROBE_LAMPORTS.len();
+    if event_count != expected_events || evaluated_count + unavailable_count != event_count {
+        bail!(
+            "V3.5 opportunity event accounting mismatch: routes={} expected_events={} events={} evaluated={} unavailable={}",
+            routes.len(),
+            expected_events,
+            event_count,
+            evaluated_count,
+            unavailable_count
+        );
+    }
+    println!(
+        "V3.5 dependency-triggered opportunity recompute verified: {} affected pool(s), {} related route(s), {} event(s), {} evaluated, {} insufficient-liquidity, {} net-positive",
+        affected_pools.len(),
+        routes.len(),
+        event_count,
+        evaluated_count,
+        unavailable_count,
+        net_positive_count
+    );
+    Ok(())
+}
+
 fn unix_timestamp() -> Result<u64> {
     Ok(SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1511,6 +1742,10 @@ mod tests {
         assert_eq!(
             parse_command(Some("dependency-wss-check")).unwrap(),
             Some(AppCommand::DependencyWssCheck)
+        );
+        assert_eq!(
+            parse_command(Some("opportunity-wss-check")).unwrap(),
+            Some(AppCommand::OpportunityWssCheck)
         );
         assert_eq!(
             parse_command(Some("round-trip-check")).unwrap(),
