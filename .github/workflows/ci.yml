@@ -128,7 +128,7 @@ jobs:
           fi
           cargo run -- meteora-quote-check
 
-      # V3：三个已支持 DEX 的全部有向两池路径；每条路径用同一腿快照测试多个输入金额。
+      # V3：三个已支持 DEX 的全部有向两池路径；每条路径用同一腿快照测试多个输入金额并应用成本模型。
       - name: Live V3 all-DEX multi-size round-trip verification
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         timeout-minutes: 3
@@ -141,16 +141,17 @@ jobs:
           fi
           cargo run -- round-trip-check
 
-      # V2 最后一层：订阅真正参与报价的 Pool/Vault/TickArray/BinArray 等依赖账户，
-      # 收到真实变更后必须能映射回受影响 Pool 并触发对应报价重算。
-      - name: Live quote dependency WSS routing verification
+      # V3.5：真实订阅全部 Quote 依赖。收到更新后必须完成：反向索引 → affected Pool →
+      # 动态依赖刷新 → 仅相关 Token 的 affected routes → 结构化 OpportunityEvent。
+      # 该步骤同时覆盖原 V2 dependency WSS routing 回归。
+      - name: Live V3 dependency-triggered opportunity verification
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        timeout-minutes: 3
+        timeout-minutes: 4
         env:
           HELIUS_API_KEY: ${{ secrets.HELIUS_API_KEY }}
         run: |
           if [ -z "$HELIUS_API_KEY" ]; then
-            echo "HELIUS_API_KEY secret is not configured; V2 dependency WSS verification skipped."
+            echo "HELIUS_API_KEY secret is not configured; V3.5 opportunity WSS verification skipped."
             exit 0
           fi
-          cargo run -- dependency-wss-check
+          cargo run -- opportunity-wss-check
