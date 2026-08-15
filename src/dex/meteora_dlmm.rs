@@ -9,6 +9,8 @@ use commons::{
     pod_read_unaligned_skip_disc, quote_exact_in as meteora_quote_exact_in, SwapExactInQuote,
 };
 
+pub const BIN_ARRAY_TAKE_COUNT: u8 = 3;
+
 /// Meteora 官方 Rust SDK 的账户类型是 zero-copy POD；这里额外校验 Anchor discriminator，
 /// 防止“长度正确但账户类型错误”的字节被当成 LbPair。
 pub fn decode_lb_pair(data: &[u8]) -> Result<LbPair> {

@@ -2,7 +2,7 @@ use std::{
     collections::BTreeMap,
     fs::{self, File, OpenOptions},
     io::{BufRead, BufReader, BufWriter, Seek, SeekFrom, Write},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 use anyhow::{bail, Context, Result};
@@ -11,6 +11,48 @@ use serde::{Deserialize, Serialize};
 use crate::opportunity::{LiquidityStage, OpportunityEvent, OpportunityEventOutcome};
 
 pub const OPPORTUNITY_RECORD_SCHEMA_VERSION: u32 = 1;
+
+pub struct OpportunityLogWriter {
+    path: PathBuf,
+    writer: BufWriter<File>,
+}
+
+impl OpportunityLogWriter {
+    pub fn open(path: &Path) -> Result<Self> {
+        ensure_parent_directory(path)?;
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .with_context(|| format!("failed to open opportunity log: {}", path.display()))?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            writer: BufWriter::new(file),
+        })
+    }
+
+    pub fn append_records(&mut self, records: &[OpportunityRecord]) -> Result<()> {
+        if records.is_empty() {
+            bail!("cannot append an empty opportunity record batch");
+        }
+        for record in records {
+            record.validate()?;
+            serde_json::to_writer(&mut self.writer, record)
+                .context("failed to serialize opportunity record")?;
+            self.writer
+                .write_all(b"\n")
+                .context("failed to terminate opportunity JSONL record")?;
+        }
+        self.writer
+            .flush()
+            .with_context(|| format!("failed to flush opportunity log: {}", self.path.display()))?;
+        self.writer
+            .get_ref()
+            .sync_data()
+            .with_context(|| format!("failed to sync opportunity log: {}", self.path.display()))?;
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -197,6 +239,10 @@ pub fn append_records(path: &Path, records: &[OpportunityRecord]) -> Result<()> 
     if records.is_empty() {
         bail!("cannot append an empty opportunity record batch");
     }
+    OpportunityLogWriter::open(path)?.append_records(records)
+}
+
+fn ensure_parent_directory(path: &Path) -> Result<()> {
     if let Some(parent) = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -208,27 +254,6 @@ pub fn append_records(path: &Path, records: &[OpportunityRecord]) -> Result<()> 
             )
         })?;
     }
-    let file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .with_context(|| format!("failed to open opportunity log: {}", path.display()))?;
-    let mut writer = BufWriter::new(file);
-    for record in records {
-        record.validate()?;
-        serde_json::to_writer(&mut writer, record)
-            .context("failed to serialize opportunity record")?;
-        writer
-            .write_all(b"\n")
-            .context("failed to terminate opportunity JSONL record")?;
-    }
-    writer
-        .flush()
-        .context("failed to flush opportunity JSONL log")?;
-    writer
-        .get_ref()
-        .sync_data()
-        .context("failed to sync opportunity JSONL log")?;
     Ok(())
 }
 
@@ -520,6 +545,22 @@ mod tests {
         append_records(&path, std::slice::from_ref(&second)).unwrap();
         let loaded = read_records(&path).unwrap();
         assert_eq!(loaded, vec![first, second]);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn persistent_writer_reuses_one_file_handle_for_multiple_batches() {
+        let path = temp_path("persistent-writer");
+        let first = record(&evaluated_event(4_000, 10_000));
+        let second = record(&insufficient_event());
+        let mut writer = OpportunityLogWriter::open(&path).unwrap();
+        writer.append_records(std::slice::from_ref(&first)).unwrap();
+        writer
+            .append_records(std::slice::from_ref(&second))
+            .unwrap();
+        drop(writer);
+
+        assert_eq!(read_records(&path).unwrap(), vec![first, second]);
         fs::remove_file(path).unwrap();
     }
 

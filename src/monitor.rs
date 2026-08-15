@@ -117,8 +117,7 @@ pub enum UpdateNovelty {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SeenUpdate {
     slot: u64,
-    owner: String,
-    data: Vec<u8>,
+    fingerprint: [u8; 32],
 }
 
 #[derive(Debug, Default)]
@@ -127,6 +126,15 @@ pub struct UpdateWatermark {
 }
 
 impl UpdateWatermark {
+    pub fn retain_addresses(&mut self, accepted_addresses: &std::collections::HashSet<String>) {
+        self.latest
+            .retain(|address, _| accepted_addresses.contains(address));
+    }
+
+    pub fn forget(&mut self, address: &str) {
+        self.latest.remove(address);
+    }
+
     pub fn classify(&mut self, update: &RawAccountUpdate) -> UpdateNovelty {
         match self.latest.entry(update.address.clone()) {
             Entry::Vacant(entry) => {
@@ -138,13 +146,14 @@ impl UpdateWatermark {
                 if update.slot < previous.slot {
                     return UpdateNovelty::Stale;
                 }
-                if update.slot == previous.slot
-                    && update.owner == previous.owner
-                    && update.data == previous.data
-                {
+                let fingerprint = update_fingerprint(update);
+                if update.slot == previous.slot && fingerprint == previous.fingerprint {
                     return UpdateNovelty::Duplicate;
                 }
-                entry.insert(seen_update(update));
+                entry.insert(SeenUpdate {
+                    slot: update.slot,
+                    fingerprint,
+                });
                 UpdateNovelty::New
             }
         }
@@ -154,13 +163,16 @@ impl UpdateWatermark {
 fn seen_update(update: &RawAccountUpdate) -> SeenUpdate {
     SeenUpdate {
         slot: update.slot,
-        owner: update.owner.clone(),
-        data: update.data.clone(),
+        fingerprint: update_fingerprint(update),
     }
 }
 
-pub fn subscription_sets_equal(left: &[String], right: &[String]) -> bool {
-    left.len() == right.len() && left.iter().all(|address| right.contains(address))
+fn update_fingerprint(update: &RawAccountUpdate) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&(update.owner.len() as u64).to_le_bytes());
+    hasher.update(update.owner.as_bytes());
+    hasher.update(&update.data);
+    *hasher.finalize().as_bytes()
 }
 
 pub fn dependency_update_may_change_set(kind: DependencyKind) -> bool {
@@ -227,19 +239,34 @@ mod tests {
     }
 
     #[test]
-    fn subscription_set_comparison_ignores_order_but_not_membership() {
-        assert!(subscription_sets_equal(
-            &["a".into(), "b".into()],
-            &["b".into(), "a".into()]
-        ));
-        assert!(!subscription_sets_equal(
-            &["a".into(), "b".into()],
-            &["a".into(), "c".into()]
-        ));
-        assert!(!subscription_sets_equal(
-            &["a".into()],
-            &["a".into(), "b".into()]
-        ));
+    fn watermark_prunes_addresses_outside_the_current_subscription_set() {
+        let mut watermark = UpdateWatermark::default();
+        assert_eq!(
+            watermark.classify(&update("old", 10, 1)),
+            UpdateNovelty::New
+        );
+        assert_eq!(
+            watermark.classify(&update("kept", 10, 2)),
+            UpdateNovelty::New
+        );
+
+        let accepted = ["kept".to_owned()].into_iter().collect();
+        watermark.retain_addresses(&accepted);
+
+        assert_eq!(watermark.classify(&update("old", 9, 1)), UpdateNovelty::New);
+        assert_eq!(
+            watermark.classify(&update("kept", 10, 2)),
+            UpdateNovelty::Duplicate
+        );
+    }
+
+    #[test]
+    fn watermark_can_retry_an_update_after_processing_recovery() {
+        let mut watermark = UpdateWatermark::default();
+        let candidate = update("retry", 10, 1);
+        assert_eq!(watermark.classify(&candidate), UpdateNovelty::New);
+        watermark.forget("retry");
+        assert_eq!(watermark.classify(&candidate), UpdateNovelty::New);
     }
 
     #[test]

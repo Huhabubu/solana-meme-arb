@@ -5700,6 +5700,7 @@ dependencies = [
  "anyhow",
  "base64 0.22.1",
  "bincode",
+ "blake3",
  "bs58",
  "commons",
  "futures-util",

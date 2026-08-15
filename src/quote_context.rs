@@ -11,9 +11,11 @@ use crate::{
     dex::{
         meteora::DLMM_PROGRAM_ID,
         meteora_dlmm::{
-            build_bin_array_map, decode_bin_array, decode_bitmap_extension, decode_lb_pair,
+            bin_array_addresses_for_swap, build_bin_array_map, decode_bin_array,
+            decode_bitmap_extension, decode_lb_pair,
             is_pool_out_of_liquidity as is_meteora_pool_out_of_liquidity,
             quote_exact_in as quote_meteora_exact_in, quote_mint_account, swap_for_y_for_input,
+            BIN_ARRAY_TAKE_COUNT,
         },
         orca_whirlpool::{
             decode_oracle, decode_tick_array_or_default, decode_whirlpool, needs_oracle,
@@ -260,6 +262,24 @@ impl MeteoraQuoteContext {
         } else {
             self.lb_pair.token_x_mint.to_string()
         };
+        let directional_bin_arrays = bin_array_addresses_for_swap(
+            &self.pool.address,
+            &self.lb_pair,
+            self.bitmap.as_ref(),
+            swap_for_y,
+            BIN_ARRAY_TAKE_COUNT,
+        )?
+        .into_iter()
+        .map(|address| {
+            let pubkey = MeteoraPubkey::from_str(&address)
+                .context("invalid Meteora directional BinArray address")?;
+            let bin_array = self
+                .bin_arrays
+                .get(&pubkey)
+                .with_context(|| format!("Meteora directional BinArray missing: {address}"))?;
+            Ok((pubkey, *bin_array))
+        })
+        .collect::<Result<HashMap<_, _>>>()?;
 
         let mut results = Vec::with_capacity(amounts_in.len());
         for &amount_in in amounts_in {
@@ -268,7 +288,7 @@ impl MeteoraQuoteContext {
                 &self.lb_pair,
                 amount_in,
                 swap_for_y,
-                self.bin_arrays.clone(),
+                directional_bin_arrays.clone(),
                 self.bitmap.as_ref(),
                 clock,
                 &self.mint_x_account,
