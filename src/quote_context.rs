@@ -306,7 +306,7 @@ fn build_pool_quote_context(state: &QuoteState, pool: &PoolInfo) -> Result<PoolQ
             pool.address
         );
     }
-    let snapshot_slot = newest_dependency_slot(state, pool)?;
+    let snapshot_slot = coherent_dependency_slot(state, pool)?;
 
     match pool.dex {
         Dex::Raydium => build_raydium_context(state, pool, snapshot_slot),
@@ -316,11 +316,11 @@ fn build_pool_quote_context(state: &QuoteState, pool: &PoolInfo) -> Result<PoolQ
     }
 }
 
-fn newest_dependency_slot(state: &QuoteState, pool: &PoolInfo) -> Result<u64> {
+fn coherent_dependency_slot(state: &QuoteState, pool: &PoolInfo) -> Result<u64> {
     let dependencies = state
         .dependencies_for_pool(&pool.address)
         .with_context(|| format!("missing dependency metadata for pool: {}", pool.address))?;
-    dependencies
+    let slots = dependencies
         .accounts
         .iter()
         .map(|dependency| {
@@ -334,10 +334,17 @@ fn newest_dependency_slot(state: &QuoteState, pool: &PoolInfo) -> Result<u64> {
                     )
                 })
         })
-        .collect::<Result<Vec<_>>>()?
-        .into_iter()
-        .max()
-        .context("pool has no local quote dependency slots")
+        .collect::<Result<Vec<_>>>()?;
+    let snapshot_slot = *slots
+        .first()
+        .context("pool has no local quote dependency slots")?;
+    if slots.iter().any(|slot| *slot != snapshot_slot) {
+        bail!(
+            "pool quote dependencies do not share one coherent RPC snapshot slot: {}",
+            pool.address
+        );
+    }
+    Ok(snapshot_slot)
 }
 
 fn build_raydium_context(
@@ -529,6 +536,7 @@ fn build_meteora_context(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::{DependencyAccount, PoolDependencies, VersionedAccountData};
 
     fn raydium_pool(address: &str) -> PoolInfo {
         PoolInfo {
@@ -575,6 +583,38 @@ mod tests {
         cache.insert_context(raydium_context("pool", 10)).unwrap();
         cache.insert_context(raydium_context("pool", 11)).unwrap();
         assert_eq!(cache.snapshot_slot("pool").unwrap(), 11);
+    }
+
+    #[test]
+    fn coherent_dependency_slot_rejects_mixed_rpc_snapshots() {
+        let pool = raydium_pool("pool");
+        let mut state = QuoteState::new();
+        state
+            .replace_pool_dependencies(
+                PoolDependencies::new(
+                    pool.clone(),
+                    vec![
+                        DependencyAccount::new("pool", DependencyKind::PoolState).unwrap(),
+                        DependencyAccount::new("vault", DependencyKind::TokenVault).unwrap(),
+                    ],
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        for (address, slot) in [("pool", 7), ("vault", 8)] {
+            state
+                .apply_account_update(
+                    address,
+                    VersionedAccountData {
+                        slot,
+                        owner: "owner".into(),
+                        data: vec![0],
+                    },
+                )
+                .unwrap();
+        }
+
+        assert!(coherent_dependency_slot(&state, &pool).is_err());
     }
 
     #[test]

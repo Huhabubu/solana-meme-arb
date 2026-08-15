@@ -135,15 +135,15 @@ HELIUS_API_KEY=REPLACE_WITH_HELIUS_API_KEY
 
 不要把 `/etc/solana-meme-arb/monitor.env` 上传到 GitHub。
 
-常驻模式默认不设置：
+模板默认设置：
 
 ```text
-OPPORTUNITY_MONITOR_UPDATES
-OPPORTUNITY_MONITOR_MAX_SECONDS
-OPPORTUNITY_MONITOR_MAX_RECONNECTS
+OPPORTUNITY_MONITOR_MAX_SECONDS=259200
 ```
 
-因此 monitor 不会因 update 数/总时长主动退出；程序内部持续做有界退避重连，真正不可恢复退出时由 systemd 拉起。
+即采样运行 72 小时后正常退出；`Restart=on-failure` 不会把正常到期当成故障重启。`OPPORTUNITY_MONITOR_UPDATES` 与 `OPPORTUNITY_MONITOR_MAX_RECONNECTS` 默认不设置，程序内部仍持续做有界退避重连，真正不可恢复退出时由 systemd 拉起。
+
+两小时旧样本约 41 MiB；部署前建议确认 `/var/lib/solana-meme-arb` 至少有 3 GiB 可用空间，并在采样过程中监控磁盘占用。
 
 ## 5. 安装并启动 systemd
 
