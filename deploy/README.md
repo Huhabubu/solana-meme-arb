@@ -175,6 +175,26 @@ sudo wc -l /var/lib/solana-meme-arb/opportunities.jsonl
 
 数据是 append-only JSONL，每条 `OpportunityRecord` 一行。采样期间不要手工编辑。
 
+## 6.1 运行延迟基准
+
+Release 二进制内置 `latency-bench` 命令。它复用正式 monitor 的 WSS、RPC、快照、报价和 JSONL 落盘链路，输出每个阶段的 p50/p95 延迟（p50 是中位数，p95 是较慢尾部的 95 分位），单位为微秒。
+
+为避免与常驻服务重复订阅，先停止服务；在受保护的终端中加载已有配置，再使用独立日志文件运行：
+
+```bash
+sudo systemctl stop solana-meme-arb
+set -a
+. /etc/solana-meme-arb/monitor.env
+set +a
+export OPPORTUNITY_LOG_PATH=/var/lib/solana-meme-arb/latency-bench.jsonl
+export OPPORTUNITY_MONITOR_UPDATES=20
+export OPPORTUNITY_MONITOR_MAX_SECONDS=1800
+sudo runuser -u solana-arb --preserve-environment -- /opt/solana-meme-arb/solana-meme-arb latency-bench
+sudo systemctl start solana-meme-arb
+```
+
+输出中的 `end_to_end_us_p50/p95` 是从 WSS 更新排队、处理到持久化完成的近似端到端时间；`queue_delay`、`snapshot`、`quote` 等字段用于定位瓶颈。基准文件应在完成分析后按采样文件流程归档或清理。
+
 ## 7. 结束 24–72 小时采样并取回数据
 
 先停止服务，得到静止文件：

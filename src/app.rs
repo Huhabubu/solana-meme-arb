@@ -98,6 +98,7 @@ enum AppCommand {
     DependencyWssCheck,
     OpportunityWssCheck,
     OpportunityMonitor,
+    LatencyBench,
     RoundTripCheck,
 }
 
@@ -113,6 +114,7 @@ fn parse_command(value: Option<&str>) -> Result<Option<AppCommand>> {
         Some("dependency-wss-check") => Ok(Some(AppCommand::DependencyWssCheck)),
         Some("opportunity-wss-check") => Ok(Some(AppCommand::OpportunityWssCheck)),
         Some("opportunity-monitor") => Ok(Some(AppCommand::OpportunityMonitor)),
+        Some("latency-bench") => Ok(Some(AppCommand::LatencyBench)),
         Some("round-trip-check") => Ok(Some(AppCommand::RoundTripCheck)),
         Some(other) => bail!("unknown command: {other}"),
     }
@@ -122,7 +124,7 @@ pub async fn run() -> Result<()> {
     let argument = std::env::args().nth(1);
     let Some(command) = parse_command(argument.as_deref())? else {
         println!(
-            "Usage: {APP_NAME} <discover|verify|helius-check|raydium-quote-check|orca-quote-check|meteora-quote-check|dependency-wss-check|opportunity-wss-check|opportunity-monitor|round-trip-check>"
+            "Usage: {APP_NAME} <discover|verify|helius-check|raydium-quote-check|orca-quote-check|meteora-quote-check|dependency-wss-check|opportunity-wss-check|opportunity-monitor|latency-bench|round-trip-check>"
         );
         return Ok(());
     };
@@ -142,7 +144,8 @@ pub async fn run() -> Result<()> {
         AppCommand::MeteoraQuoteCheck => run_meteora_quote_check(&client).await,
         AppCommand::DependencyWssCheck => run_dependency_wss_check(&client).await,
         AppCommand::OpportunityWssCheck => run_opportunity_wss_check(&client).await,
-        AppCommand::OpportunityMonitor => run_opportunity_monitor(&client).await,
+        AppCommand::OpportunityMonitor => run_opportunity_monitor(&client, false).await,
+        AppCommand::LatencyBench => run_latency_bench(&client).await,
         AppCommand::RoundTripCheck => run_round_trip_check(&client).await,
     }
 }
@@ -1682,6 +1685,81 @@ struct OpportunityProcessResult {
     confirmation_wait_duration: Duration,
 }
 
+#[derive(Debug, Default)]
+struct LatencySamples {
+    end_to_end_us: Vec<u128>,
+    queue_delay_us: Vec<u128>,
+    processing_us: Vec<u128>,
+    dependency_refresh_us: Vec<u128>,
+    snapshot_us: Vec<u128>,
+    quote_us: Vec<u128>,
+    confirmation_wait_us: Vec<u128>,
+    persistence_us: Vec<u128>,
+}
+
+impl LatencySamples {
+    fn observe(
+        &mut self,
+        queue_delay: Duration,
+        processing: Duration,
+        result: &OpportunityProcessResult,
+        persistence: Duration,
+    ) {
+        let queue_delay_us = queue_delay.as_micros();
+        let processing_us = processing.as_micros();
+        let persistence_us = persistence.as_micros();
+        self.end_to_end_us.push(
+            queue_delay_us
+                .saturating_add(processing_us)
+                .saturating_add(persistence_us),
+        );
+        self.queue_delay_us.push(queue_delay_us);
+        self.processing_us.push(processing_us);
+        self.dependency_refresh_us
+            .push(result.dependency_refresh_duration.as_micros());
+        self.snapshot_us.push(result.snapshot_duration.as_micros());
+        self.quote_us.push(result.quote_duration.as_micros());
+        self.confirmation_wait_us
+            .push(result.confirmation_wait_duration.as_micros());
+        self.persistence_us.push(persistence_us);
+    }
+
+    fn summary(&self) -> Option<String> {
+        let samples = self.end_to_end_us.len();
+        if samples == 0 {
+            return None;
+        }
+        Some(format!(
+            "samples={samples} end_to_end_us_p50={} end_to_end_us_p95={} queue_delay_us_p50={} queue_delay_us_p95={} process_us_p50={} process_us_p95={} dependency_refresh_us_p50={} dependency_refresh_us_p95={} snapshot_us_p50={} snapshot_us_p95={} quote_us_p50={} quote_us_p95={} confirmation_wait_us_p50={} confirmation_wait_us_p95={} persistence_us_p50={} persistence_us_p95={}",
+            percentile_us(&self.end_to_end_us, 50),
+            percentile_us(&self.end_to_end_us, 95),
+            percentile_us(&self.queue_delay_us, 50),
+            percentile_us(&self.queue_delay_us, 95),
+            percentile_us(&self.processing_us, 50),
+            percentile_us(&self.processing_us, 95),
+            percentile_us(&self.dependency_refresh_us, 50),
+            percentile_us(&self.dependency_refresh_us, 95),
+            percentile_us(&self.snapshot_us, 50),
+            percentile_us(&self.snapshot_us, 95),
+            percentile_us(&self.quote_us, 50),
+            percentile_us(&self.quote_us, 95),
+            percentile_us(&self.confirmation_wait_us, 50),
+            percentile_us(&self.confirmation_wait_us, 95),
+            percentile_us(&self.persistence_us, 50),
+            percentile_us(&self.persistence_us, 95),
+        ))
+    }
+}
+
+fn percentile_us(values: &[u128], percentile: usize) -> u128 {
+    debug_assert!(!values.is_empty());
+    debug_assert!((1..=100).contains(&percentile));
+    let mut sorted = values.to_vec();
+    sorted.sort_unstable();
+    let rank = (sorted.len() * percentile).div_ceil(100).max(1);
+    sorted[rank.min(sorted.len()) - 1]
+}
+
 struct QueuedAccountUpdate {
     received_at: Instant,
     result: Result<RawAccountUpdate>,
@@ -2294,7 +2372,21 @@ async fn run_opportunity_wss_check(client: &Client) -> Result<()> {
     Ok(())
 }
 
-async fn run_opportunity_monitor(client: &Client) -> Result<()> {
+async fn run_latency_bench(client: &Client) -> Result<()> {
+    let target = std::env::var("OPPORTUNITY_MONITOR_UPDATES")
+        .context("latency-bench requires OPPORTUNITY_MONITOR_UPDATES, for example 20")?
+        .parse::<usize>()
+        .context("OPPORTUNITY_MONITOR_UPDATES must be a positive integer for latency-bench")?;
+    if target == 0 {
+        bail!("OPPORTUNITY_MONITOR_UPDATES must be greater than zero for latency-bench");
+    }
+    println!(
+        "V3.6 latency benchmark starting: target_updates={target}; use a fresh OPPORTUNITY_LOG_PATH for an isolated sample"
+    );
+    run_opportunity_monitor(client, true).await
+}
+
+async fn run_opportunity_monitor(client: &Client, collect_latency: bool) -> Result<()> {
     let config = HeliusConfig::from_env()?;
     let monitor_config = opportunity_monitor_config_from_env()?;
     let log_path =
@@ -2321,6 +2413,7 @@ async fn run_opportunity_monitor(client: &Client) -> Result<()> {
     let mut subscription_refreshes = 0usize;
     let mut connected_sessions = 0usize;
     let mut max_updates_in_single_session = 0usize;
+    let mut latency_samples = collect_latency.then(LatencySamples::default);
 
     'session: loop {
         if monitor_config.target_reached(processed_updates) {
@@ -2469,6 +2562,14 @@ async fn run_opportunity_monitor(client: &Client) -> Result<()> {
             let persistence_started = Instant::now();
             log_writer.append_records(&result.records)?;
             let persistence_duration = persistence_started.elapsed();
+            if let Some(samples) = latency_samples.as_mut() {
+                samples.observe(
+                    queue_delay,
+                    processing_duration,
+                    &result,
+                    persistence_duration,
+                );
+            }
             cumulative_stats.ingest_records(&result.records)?;
             appended_records += result.records.len();
             processed_updates += 1;
@@ -2533,6 +2634,9 @@ async fn run_opportunity_monitor(client: &Client) -> Result<()> {
         final_stats.gross_positive,
         final_stats.net_positive
     );
+    if let Some(summary) = latency_samples.and_then(|samples| samples.summary()) {
+        println!("V3.6 latency summary: {summary}");
+    }
     Ok(())
 }
 
@@ -2582,11 +2686,22 @@ mod tests {
             Some(AppCommand::OpportunityMonitor)
         );
         assert_eq!(
+            parse_command(Some("latency-bench")).unwrap(),
+            Some(AppCommand::LatencyBench)
+        );
+        assert_eq!(
             parse_command(Some("round-trip-check")).unwrap(),
             Some(AppCommand::RoundTripCheck)
         );
         assert_eq!(parse_command(None).unwrap(), None);
         assert!(parse_command(Some("definitely-unknown")).is_err());
+    }
+
+    #[test]
+    fn percentile_uses_nearest_rank_for_latency_samples() {
+        let samples = [10, 20, 30, 40];
+        assert_eq!(percentile_us(&samples, 50), 20);
+        assert_eq!(percentile_us(&samples, 95), 40);
     }
 
     #[test]
