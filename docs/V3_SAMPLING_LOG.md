@@ -10,9 +10,9 @@
 - 按 route + amount 合并后只有 15 段正值；每一段在同一路径的下一次观察中都转为非正，间隔约 83–3,191 ms。
 - 同一 slot 内也出现依赖账户依次到达后利润正负翻转，符合 WebSocket 单账户通知造成的部分状态混合。
 
-因此旧样本中的正值不能解释为可执行套利。修复后的 monitor 把 WSS 仅作为触发信号，通过一次 `getMultipleAccounts` 为相关两腿建立同一 RPC snapshot；若首次结果为正，再跨到下一 slot 复核。旧 artifact 保留为缺陷证据，不与修复后的样本合并统计。
+因此旧样本中的正值不能解释为可执行套利。修复后的 monitor 把 WSS 仅作为触发信号，为相关路径建立同一 RPC context slot 的一致快照；超过 100 个账户时自动分片并重试到同一 context slot。若首次结果为正，首次观察先原样落盘，再跨到下一 slot 复核并追加第二次观察。旧 artifact 保留为缺陷证据，不与修复后的样本合并统计。
 
-同时完成：固定 6 个 V3 研究池；JSONL 改为流式重放并仅恢复未写完的最后一行；配置模板统一为 `HELIUS_API_KEY`。
+同时完成：Pool Universe 改为支持池型过滤后按每 DEX TVL Top-N 选择，并用 `.universe` 清单绑定每份样本；JSONL 改为流式重放并仅恢复未写完的最后一行；配置模板统一为 `HELIUS_API_KEY`。
 
 ## 2026-08-14 — GitHub 2h 采样 Attempt 1
 

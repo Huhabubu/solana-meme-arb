@@ -1,5 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
+    fs,
+    path::Path,
     str::FromStr,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -54,8 +56,8 @@ use crate::{
     persistence::{append_records, scan_records, OpportunityLogWriter, OpportunityRecord},
     quote_context::{QuoteContextCache, QuoteRuntime},
     rpc::{
-        fetch_account_owners, fetch_accounts, is_min_context_slot_not_reached,
-        verify_pool_accounts, PUBLIC_MAINNET_RPC,
+        fetch_account_owners, fetch_accounts, fetch_accounts_coherent,
+        is_min_context_slot_not_reached, verify_pool_accounts, PUBLIC_MAINNET_RPC,
     },
     state::{DependencyKind, PoolDependencies, QuoteState, VersionedAccountData},
     token_account::{decode_spl_token_account, decode_spl_token_mint, SPL_TOKEN_PROGRAM_ID},
@@ -74,14 +76,6 @@ const POSITIVE_CONFIRMATION_DELAY_MILLIS: u64 = 400;
 const COHERENT_SNAPSHOT_MAX_ATTEMPTS: usize = 3;
 const WSS_UPDATE_QUEUE_CAPACITY: usize = 256;
 const ROUND_TRIP_PROBE_LAMPORTS: [u64; 3] = [10_000_000, 50_000_000, 100_000_000];
-const FIXED_V3_POOL_ADDRESSES: [&str; 6] = [
-    "HVNwzt7Pxfu76KHCMQPTLuTCLTm6WnQ1esLv4eizseSv",
-    "5zpyutJu9ee6jFymDGoK7F6S5Kczqtc9FomP3ueKuyA9",
-    "6oFWm7KPLfxnwMb3z5xwBoXNSPP3JJyirAPqPSiVcnsp",
-    "EP2ib6dYdEeqD8MfE2ezHCxX3kP3K2eLKkirfPm5eyMx",
-    "D6NdKrKNQPmRZCCnG1GqXtF7MMoHB7qR6GU5TkG59Qz1",
-    "8Ve9KtGNtLRxCQNAVfkHEP5GRZHjdj6BjB1RQFZewG6V",
-];
 // V3.4 只用作净利润链路的成本下界：当前假设一笔交易仅 1 个普通签名，
 // 并使用 Jito 文档最低 bundle tip。Priority Fee 在 V4 得到真实 CU 结构后再动态估计。
 const V3_COST_FLOOR_BASE_FEE_LAMPORTS: u64 = 5_000;
@@ -170,9 +164,9 @@ async fn discover_candidates(client: &Client, token: &Token) -> Result<(usize, V
 async fn discover_supported_quote_pools(client: &Client, token: &Token) -> Result<Vec<PoolInfo>> {
     let discovered = discover_quote_pair(client, token.mint, WSOL).await?;
     let pools = supported_quote_pools(&discovered);
-    if pools.len() != 3 {
+    if pools.len() < 2 {
         bail!(
-            "{} / WSOL: fixed V3 universe requires 3 supported pools, found {}",
+            "{} / WSOL: arbitrage monitoring requires at least 2 supported pools, found {}",
             token.symbol,
             pools.len()
         );
@@ -193,27 +187,12 @@ fn is_supported_quote_pool(pool: &PoolInfo) -> bool {
 }
 
 fn supported_quote_pools(discovered: &[PoolInfo]) -> Vec<PoolInfo> {
-    let fixed = FIXED_V3_POOL_ADDRESSES.into_iter().collect::<HashSet<_>>();
-    let candidates = discovered
+    let supported = discovered
         .iter()
-        .filter(|pool| {
-            fixed.contains(pool.address.as_str())
-                && pool.tvl_usd >= MIN_MONITOR_TVL_USD
-                && is_supported_quote_pool(pool)
-        })
+        .filter(|pool| is_supported_quote_pool(pool))
         .cloned()
         .collect::<Vec<_>>();
-    let mut selected = Vec::with_capacity(3);
-    if let Some(pool) = candidates.iter().find(|pool| pool.dex == Dex::Raydium) {
-        selected.push(pool.clone());
-    }
-    if let Some(pool) = candidates.iter().find(|pool| pool.dex == Dex::Orca) {
-        selected.push(pool.clone());
-    }
-    if let Some(pool) = candidates.iter().find(|pool| pool.dex == Dex::MeteoraDlmm) {
-        selected.push(pool.clone());
-    }
-    selected
+    select_monitoring_candidates(&supported, MIN_MONITOR_TVL_USD, MAX_POOLS_PER_DEX)
 }
 
 fn token_symbol_for_pool(pool: &PoolInfo) -> Result<&'static str> {
@@ -817,6 +796,7 @@ async fn run_round_trip_check(client: &Client) -> Result<()> {
     };
     let cost_floor_lamports = cost_floor.total_lamports()?;
     let mut verified_routes = 0usize;
+    let mut expected_routes = 0usize;
     let mut evaluated_points = 0usize;
     let mut unavailable_points = 0usize;
     let mut gross_profitable_points = 0usize;
@@ -833,21 +813,11 @@ async fn run_round_trip_check(client: &Client) -> Result<()> {
 
     for token in tracked_tokens() {
         let pools = discover_supported_quote_pools(client, token).await?;
-        if pools.len() != 3 {
-            bail!(
-                "{}/WSOL expected exactly 3 V3 quoteable pools, got {}",
-                token.symbol,
-                pools.len()
-            );
-        }
         let routes = directed_route_indices(pools.len());
-        if routes.len() != 6 {
-            bail!(
-                "{}/WSOL expected 6 directed two-pool routes, got {}",
-                token.symbol,
-                routes.len()
-            );
+        if routes.is_empty() {
+            bail!("{}/WSOL produced no directed two-pool routes", token.symbol);
         }
+        expected_routes += routes.len();
 
         for (first_index, second_index) in routes {
             let first_pool = &pools[first_index];
@@ -995,7 +965,6 @@ async fn run_round_trip_check(client: &Client) -> Result<()> {
         }
     }
 
-    let expected_routes = tracked_tokens().len() * 6;
     let expected_points = expected_routes * ROUND_TRIP_PROBE_LAMPORTS.len();
     if verified_routes != expected_routes
         || evaluated_points + unavailable_points != expected_points
@@ -1457,6 +1426,13 @@ async fn build_quote_state(
     if pools.is_empty() {
         bail!("V2 quoteable universe is empty");
     }
+    println!("V3 selected research universe: {} pools", pools.len());
+    for pool in &pools {
+        println!(
+            "  dex={} pool={} tvl_usd={:.2} type={} pair={}/{}",
+            pool.dex, pool.address, pool.tvl_usd, pool.pool_type, pool.mint_a, pool.mint_b
+        );
+    }
     let state = build_quote_state_for_pools(client, config, &pools).await?;
     Ok((state, pools))
 }
@@ -1467,14 +1443,14 @@ async fn build_quote_state_for_pools(
     pools: &[PoolInfo],
 ) -> Result<QuoteState> {
     if pools.is_empty() {
-        bail!("cannot build QuoteState for an empty fixed pool universe");
+        bail!("cannot build QuoteState for an empty selected pool universe");
     }
     let mut state = QuoteState::new();
     let mut seen = HashSet::new();
     for pool in pools {
         if !seen.insert(pool.address.as_str()) {
             bail!(
-                "duplicate pool in fixed QuoteState universe: {}",
+                "duplicate pool in selected QuoteState universe: {}",
                 pool.address
             );
         }
@@ -1500,7 +1476,7 @@ async fn preload_state_accounts(
     min_context_slot: Option<u64>,
 ) -> Result<()> {
     let addresses = state.unique_dependency_addresses();
-    let batch = fetch_accounts(
+    let batch = fetch_accounts_coherent(
         client,
         config.http_url().as_str(),
         &addresses,
@@ -1832,6 +1808,70 @@ fn opportunity_log_path(required: bool) -> Result<Option<std::path::PathBuf>> {
     }
 }
 
+fn pool_universe_manifest_contents(pools: &[PoolInfo]) -> String {
+    let mut entries = pools
+        .iter()
+        .map(|pool| {
+            format!(
+                "{}\t{}\t{}\t{}\t{}",
+                pool.address, pool.dex, pool.pool_type, pool.mint_a, pool.mint_b
+            )
+        })
+        .collect::<Vec<_>>();
+    entries.sort();
+    entries.push(String::new());
+    entries.join("\n")
+}
+
+fn ensure_pool_universe_manifest(log_path: &Path, pools: &[PoolInfo]) -> Result<()> {
+    let manifest_path = log_path.with_extension("universe");
+    let expected = pool_universe_manifest_contents(pools);
+    if manifest_path.exists() {
+        let stored = fs::read_to_string(&manifest_path).with_context(|| {
+            format!(
+                "failed to read pool universe manifest: {}",
+                manifest_path.display()
+            )
+        })?;
+        if stored != expected {
+            bail!(
+                "selected pool universe differs from {}; use a new OPPORTUNITY_LOG_PATH for this research sample",
+                manifest_path.display()
+            );
+        }
+        return Ok(());
+    }
+
+    if log_path.exists()
+        && fs::metadata(log_path)
+            .with_context(|| format!("failed to inspect opportunity log: {}", log_path.display()))?
+            .len()
+            > 0
+    {
+        bail!(
+            "existing opportunity log has no pool universe manifest; use a new OPPORTUNITY_LOG_PATH before changing the monitored pool set"
+        );
+    }
+    if let Some(parent) = manifest_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "failed to create pool universe manifest directory: {}",
+                parent.display()
+            )
+        })?;
+    }
+    fs::write(&manifest_path, expected).with_context(|| {
+        format!(
+            "failed to write pool universe manifest: {}",
+            manifest_path.display()
+        )
+    })?;
+    Ok(())
+}
+
 struct CoherentRouteSnapshot {
     slot: u64,
     meteora_clock: Option<Clock>,
@@ -1979,7 +2019,7 @@ async fn refresh_coherent_route_snapshot(
             request_addresses.push(clock_address);
         }
 
-        let batch = fetch_accounts(
+        let batch = fetch_accounts_coherent(
             client,
             config.http_url().as_str(),
             &request_addresses,
@@ -2193,25 +2233,32 @@ async fn process_opportunity_update(
     }
     let route_pools = unique_route_pools(&routes);
     let snapshot_started = Instant::now();
-    let mut snapshot =
+    let initial_snapshot =
         refresh_coherent_route_snapshot(client, config, state, cache, &route_pools, update.slot)
             .await?;
     let mut snapshot_duration = snapshot_started.elapsed();
     let quote_started = Instant::now();
-    let mut events = evaluate_coherent_routes(cache, &routes, &snapshot)?;
+    let initial_events = evaluate_coherent_routes(cache, &routes, &initial_snapshot)?;
     let mut quote_duration = quote_started.elapsed();
+    let initial_positive = contains_net_positive(&initial_events);
+    let mut observations = vec![(
+        initial_snapshot.slot,
+        unix_timestamp_millis()?,
+        initial_snapshot.meteora_clock.is_some(),
+        initial_events,
+    )];
     let mut confirmation_wait_duration = Duration::ZERO;
-    if contains_net_positive(&events) {
-        let confirmation_slot = snapshot.slot.saturating_add(1);
+    if initial_positive {
+        let confirmation_slot = initial_snapshot.slot.saturating_add(1);
         println!(
-            "V3.6 net-positive candidate at coherent slot={}; confirming at min_slot={confirmation_slot}",
-            snapshot.slot
+            "V3.6 net-positive candidate at coherent slot={}; recording initial observation and confirming at min_slot={confirmation_slot}",
+            initial_snapshot.slot
         );
         let confirmation_wait_started = Instant::now();
         tokio::time::sleep(Duration::from_millis(POSITIVE_CONFIRMATION_DELAY_MILLIS)).await;
         confirmation_wait_duration = confirmation_wait_started.elapsed();
         let confirmation_snapshot_started = Instant::now();
-        snapshot = refresh_coherent_route_snapshot(
+        let confirmation_snapshot = refresh_coherent_route_snapshot(
             client,
             config,
             state,
@@ -2222,69 +2269,83 @@ async fn process_opportunity_update(
         .await?;
         snapshot_duration += confirmation_snapshot_started.elapsed();
         let confirmation_quote_started = Instant::now();
-        events = evaluate_coherent_routes(cache, &routes, &snapshot)?;
+        let confirmation_events = evaluate_coherent_routes(cache, &routes, &confirmation_snapshot)?;
         quote_duration += confirmation_quote_started.elapsed();
+        observations.push((
+            confirmation_snapshot.slot,
+            unix_timestamp_millis()?,
+            confirmation_snapshot.meteora_clock.is_some(),
+            confirmation_events,
+        ));
     }
 
-    let observed_at_unix_ms = unix_timestamp_millis()?;
+    let observation_count = observations.len();
     let mut evaluated_count = 0usize;
     let mut unavailable_count = 0usize;
     let mut net_positive_count = 0usize;
-    let mut records = Vec::with_capacity(routes.len() * ROUND_TRIP_PROBE_LAMPORTS.len());
+    let mut records =
+        Vec::with_capacity(routes.len() * ROUND_TRIP_PROBE_LAMPORTS.len() * observation_count);
 
-    println!(
-        "V3.6 coherent recompute: slot={} {} affected pool(s), {} related route(s), clock_in_snapshot={}",
-        snapshot.slot,
-        affected_pools.len(),
-        routes.len(),
-        snapshot.meteora_clock.is_some()
-    );
-    for event in &events {
-        let token = tracked_tokens()
-            .iter()
-            .find(|token| token.mint == event.token_mint)
-            .context("route token is outside tracked universe")?;
-        match &event.outcome {
-            OpportunityEventOutcome::Evaluated {
-                gross_profit_raw,
-                net_profit_raw,
-                ..
-            } => {
-                evaluated_count += 1;
-                if *net_profit_raw > 0 {
-                    net_positive_count += 1;
-                }
-                println!(
-                    "{}/WSOL monitor event: {}->{} input={} gross_profit_raw={} net_profit_raw={}",
-                    token.symbol,
-                    event.first_dex,
-                    event.second_dex,
-                    event.input_amount,
+    for (observation_index, (snapshot_slot, observed_at_unix_ms, clock_in_snapshot, events)) in
+        observations.into_iter().enumerate()
+    {
+        let observation_kind = if observation_index == 0 {
+            "initial"
+        } else {
+            "confirmation"
+        };
+        println!(
+            "V3.6 coherent recompute: observation={observation_kind} slot={snapshot_slot} {} affected pool(s), {} related route(s), clock_in_snapshot={clock_in_snapshot}",
+            affected_pools.len(),
+            routes.len(),
+        );
+        for event in &events {
+            let token = tracked_tokens()
+                .iter()
+                .find(|token| token.mint == event.token_mint)
+                .context("route token is outside tracked universe")?;
+            match &event.outcome {
+                OpportunityEventOutcome::Evaluated {
                     gross_profit_raw,
-                    net_profit_raw
-                );
+                    net_profit_raw,
+                    ..
+                } => {
+                    evaluated_count += 1;
+                    if *net_profit_raw > 0 {
+                        net_positive_count += 1;
+                    }
+                    println!(
+                        "{}/WSOL monitor event: observation={observation_kind} {}->{} input={} gross_profit_raw={} net_profit_raw={}",
+                        token.symbol,
+                        event.first_dex,
+                        event.second_dex,
+                        event.input_amount,
+                        gross_profit_raw,
+                        net_profit_raw
+                    );
+                }
+                OpportunityEventOutcome::InsufficientLiquidity { stage } => {
+                    unavailable_count += 1;
+                    println!(
+                        "{}/WSOL monitor event: observation={observation_kind} {}->{} input={} status=insufficient_liquidity stage={stage:?}",
+                        token.symbol,
+                        event.first_dex,
+                        event.second_dex,
+                        event.input_amount
+                    );
+                }
             }
-            OpportunityEventOutcome::InsufficientLiquidity { stage } => {
-                unavailable_count += 1;
-                println!(
-                    "{}/WSOL monitor event: {}->{} input={} status=insufficient_liquidity stage={stage:?}",
-                    token.symbol,
-                    event.first_dex,
-                    event.second_dex,
-                    event.input_amount
-                );
-            }
+            records.push(OpportunityRecord::from_event(
+                event,
+                observed_at_unix_ms,
+                update.slot,
+                &update.address,
+                update.subscription_id,
+            )?);
         }
-        records.push(OpportunityRecord::from_event(
-            event,
-            observed_at_unix_ms,
-            update.slot,
-            &update.address,
-            update.subscription_id,
-        )?);
     }
 
-    let expected_records = routes.len() * ROUND_TRIP_PROBE_LAMPORTS.len();
+    let expected_records = routes.len() * ROUND_TRIP_PROBE_LAMPORTS.len() * observation_count;
     if records.len() != expected_records || evaluated_count + unavailable_count != records.len() {
         bail!("opportunity update event accounting mismatch");
     }
@@ -2391,6 +2452,8 @@ async fn run_opportunity_monitor(client: &Client, collect_latency: bool) -> Resu
     let monitor_config = opportunity_monitor_config_from_env()?;
     let log_path =
         opportunity_log_path(true)?.context("opportunity monitor requires a persistence path")?;
+    let (initial_state, pools) = build_quote_state(client, &config).await?;
+    ensure_pool_universe_manifest(&log_path, &pools)?;
     let mut cumulative_stats = if log_path.exists() {
         scan_records(&log_path)?
     } else {
@@ -2398,7 +2461,6 @@ async fn run_opportunity_monitor(client: &Client, collect_latency: bool) -> Resu
     };
     let initial_record_count = cumulative_stats.total;
     let mut log_writer = OpportunityLogWriter::open(&log_path)?;
-    let (initial_state, pools) = build_quote_state(client, &config).await?;
     let mut state = initial_state;
     let mut cache = QuoteContextCache::build(&state, &pools)?;
     let mut watermark = UpdateWatermark::default();
@@ -2705,39 +2767,56 @@ mod tests {
     }
 
     #[test]
-    fn supported_pool_selection_keeps_only_current_quote_engines() {
+    fn supported_pool_selection_filters_before_per_dex_top_n_and_keeps_multiple_pools() {
         let mut candidates = vec![
-            pool(Dex::Raydium, "Concentrated", "clmm", "ray-clmm-1"),
-            pool(Dex::Raydium, "Concentrated", "clmm", "ray-clmm-2"),
-            pool(Dex::Raydium, "Concentrated", "clmm", "ray-clmm-3"),
-            pool(
-                Dex::Raydium,
-                "Standard",
-                RAYDIUM_AMM_V4_PROGRAM_ID,
-                FIXED_V3_POOL_ADDRESSES[0],
-            ),
-            pool(
-                Dex::Orca,
-                "whirlpool",
-                ORCA_WHIRLPOOL_PROGRAM_ID,
-                FIXED_V3_POOL_ADDRESSES[1],
-            ),
-            pool(
-                Dex::MeteoraDlmm,
-                "DLMM",
-                DLMM_PROGRAM_ID,
-                FIXED_V3_POOL_ADDRESSES[2],
-            ),
+            pool(Dex::Raydium, "Concentrated", "clmm", "ray-clmm"),
+            pool(Dex::Raydium, "Standard", RAYDIUM_AMM_V4_PROGRAM_ID, "ray-1"),
+            pool(Dex::Raydium, "Standard", RAYDIUM_AMM_V4_PROGRAM_ID, "ray-2"),
+            pool(Dex::Raydium, "Standard", RAYDIUM_AMM_V4_PROGRAM_ID, "ray-3"),
+            pool(Dex::Raydium, "Standard", RAYDIUM_AMM_V4_PROGRAM_ID, "ray-4"),
+            pool(Dex::Orca, "whirlpool", ORCA_WHIRLPOOL_PROGRAM_ID, "orca-1"),
+            pool(Dex::Orca, "whirlpool", ORCA_WHIRLPOOL_PROGRAM_ID, "orca-2"),
+            pool(Dex::MeteoraDlmm, "DLMM", DLMM_PROGRAM_ID, "meteora-1"),
+            pool(Dex::MeteoraDlmm, "DLMM", DLMM_PROGRAM_ID, "meteora-2"),
             pool(Dex::MeteoraDammV2, "DAMM v2", "damm", "damm"),
         ];
         for (index, candidate) in candidates.iter_mut().enumerate() {
-            candidate.tvl_usd = 10_000.0 - index as f64;
+            candidate.tvl_usd = 20_000.0 - index as f64 * 1_000.0;
         }
+        candidates[0].tvl_usd = 100_000.0;
+
         let selected = supported_quote_pools(&candidates);
-        assert_eq!(selected.len(), 3);
-        assert_eq!(selected[0].address, FIXED_V3_POOL_ADDRESSES[0]);
-        assert_eq!(selected[1].address, FIXED_V3_POOL_ADDRESSES[1]);
-        assert_eq!(selected[2].address, FIXED_V3_POOL_ADDRESSES[2]);
+        let addresses = selected
+            .iter()
+            .map(|pool| pool.address.as_str())
+            .collect::<HashSet<_>>();
+        assert!(selected.iter().all(is_supported_quote_pool));
+        assert_eq!(
+            selected
+                .iter()
+                .filter(|pool| pool.dex == Dex::Raydium)
+                .count(),
+            MAX_POOLS_PER_DEX
+        );
+        assert!(addresses.contains("ray-1"));
+        assert!(addresses.contains("ray-2"));
+        assert!(addresses.contains("ray-3"));
+        assert!(!addresses.contains("ray-4"));
+        assert!(!addresses.contains("ray-clmm"));
+        assert!(addresses.contains("orca-1"));
+        assert!(addresses.contains("orca-2"));
+        assert!(addresses.contains("meteora-1"));
+        assert!(addresses.contains("meteora-2"));
+    }
+
+    #[test]
+    fn pool_universe_manifest_is_order_independent() {
+        let first = pool(Dex::Raydium, "Standard", RAYDIUM_AMM_V4_PROGRAM_ID, "ray");
+        let second = pool(Dex::Orca, "whirlpool", ORCA_WHIRLPOOL_PROGRAM_ID, "orca");
+        assert_eq!(
+            pool_universe_manifest_contents(&[first.clone(), second.clone()]),
+            pool_universe_manifest_contents(&[second, first])
+        );
     }
 
     #[test]

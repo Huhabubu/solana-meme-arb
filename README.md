@@ -26,12 +26,12 @@
 | Raydium Standard 双方向 Quote | ✅ | `WSOL ↔ Token` Mainnet 实测 |
 | Orca Whirlpool 双方向 Quote | ✅ | 官方 core Quote + TickArray 实测 |
 | Meteora DLMM 双方向 Quote | ✅ | 官方 Rust Quote + BinArray 实测 |
-| 三 DEX 全有向路径 | ✅ | 每 Token 3 池 → 6 路；BONK/WIF 共 12 路 |
+| 支持池全有向路径 | ✅ | 先过滤当前 Quote Engine 支持池型，再按每 DEX TVL Top-N，生成全部有向两池路径 |
 | 多金额利润曲线 | ✅ | 0.01 / 0.05 / 0.10 SOL，同一快照本地批量 Quote |
 | 流动性不足 | ✅ | 显式 `insufficient_liquidity` |
 | 执行成本 / 净利润 | ✅ | `ExecutionCost → NetOpportunity` |
 | RPC 恢复 | ✅ | `-32016` 有限重试；429/408/部分 5xx 有界退避 |
-| affected-route 实时路由 | ✅ | WSS 仅作触发；相关两腿依赖通过同一次 `getMultipleAccounts` 刷新 |
+| affected-route 实时路由 | ✅ | WSS 仅作触发；相关路径依赖刷新到同一 RPC context slot，>100 账户时自动分片并一致性重试 |
 | `QuoteContextCache` | ✅ | 相关路径所有 Pool Context 使用同一个 RPC snapshot slot |
 | JSONL 持久化 / 统计 | ✅ | append-only、流式重放、崩溃尾行恢复、分组统计 |
 | 连续 monitor | ✅ | 长连接、去重/stale、有限重连、动态依赖刷新、正值跨 slot 复核 |
@@ -42,16 +42,8 @@
 
 BONK/WIF 只是两个并行测试样本，套利引擎不与这两个 Token 绑定。后续根据长时数据决定是否扩展为动态 Universe。
 
-当前完整支持 6 个研究池：
+当前 Token Universe 仍为 BONK/WIF；Pool Universe 不再写死地址。启动时会先过滤当前 Quote Engine 支持的池型，再按每个 DEX 的 TVL 选择最多 `MAX_POOLS_PER_DEX` 个池。程序会把本次选择写入与 JSONL 同名的 `.universe` 清单；重启后若池集合变化，会拒绝继续写旧样本，要求新建 `OPPORTUNITY_LOG_PATH`。
 
-| Token | DEX | Pool |
-|---|---|---|
-| BONK | Raydium Standard | `HVNwzt7Pxfu76KHCMQPTLuTCLTm6WnQ1esLv4eizseSv` |
-| BONK | Orca Whirlpool | `5zpyutJu9ee6jFymDGoK7F6S5Kczqtc9FomP3ueKuyA9` |
-| BONK | Meteora DLMM | `6oFWm7KPLfxnwMb3z5xwBoXNSPP3JJyirAPqPSiVcnsp` |
-| WIF | Raydium Standard | `EP2ib6dYdEeqD8MfE2ezHCxX3kP3K2eLKkirfPm5eyMx` |
-| WIF | Orca Whirlpool | `D6NdKrKNQPmRZCCnG1GqXtF7MMoHB7qR6GU5TkG59Qz1` |
-| WIF | Meteora DLMM | `8Ve9KtGNtLRxCQNAVfkHEP5GRZHjdj6BjB1RQFZewG6V` |
 
 尚未进入本地 Quote Engine：Raydium CLMM、Meteora DAMM v2 以及其他 Solana DEX/Pool 类型。
 
@@ -66,7 +58,7 @@ duplicate / stale slot 过滤
         ↓
 WSS 只确定 affected Pool / related routes
         ↓
-一次 getMultipleAccounts 刷新两腿全部依赖与 Clock
+coherent getMultipleAccounts 刷新相关路径全部依赖与 Clock（>100 时分片并对齐同一 context slot）
         ↓
 QuoteState + 相关 QuoteContext 使用同一 snapshot slot
         ↓
@@ -74,9 +66,9 @@ QuoteState + 相关 QuoteContext 使用同一 snapshot slot
         ↓
 Gross Profit → ExecutionCost → NetOpportunity
         ↓
-若 net-positive，等待并用下一 slot 的一致快照复核
+首次一致快照先写入 OpportunityRecord
         ↓
-OpportunityRecord
+若 net-positive，等待并用下一 slot 的一致快照复核，再追加第二组 OpportunityRecord
         ↓
 append-only JSONL + 增量统计
         ↓
@@ -141,7 +133,7 @@ DEX swap fee 已体现在两腿 Quote 输出中，不重复扣除。
 
 > 6,000 lamports **不是未来实盘 landing cost**。V4 构造真实交易后，Priority Fee 与竞争性 Jito Tip 必须根据实际 CU 与当时市场动态估计。
 
-2026-08-14 的两小时旧样本记录过 47 条正“研究净利润”，但其中大量记录混用了不同 slot 的账户状态，不能作为可执行套利证据。修复后必须重新采样；只有通过一致快照与下一 slot 复核的正值才进入后续分析。
+2026-08-14 的两小时旧样本记录过 47 条正“研究净利润”，但其中大量记录混用了不同 slot 的账户状态，不能作为可执行套利证据。修复后必须重新采样；首次一致快照与下一 slot 复核会同时保留，后续离线分析据此判断机会持续时间和可执行性。
 
 ## Linux VPS 部署准备
 
@@ -314,7 +306,7 @@ V3 只有在 Linux VPS 长时采样后才整体标记完成。至少回答：
 
 ## 最近更新 — 2026-08-15
 
-- 固定 BONK/WIF 的 6 个 V3 研究池，进程重启不再静默切换 Universe。
+- Pool Universe 改为支持池型优先过滤 + 每 DEX TVL Top-N；每个样本文件绑定 `.universe` 清单，防止重启后静默混入不同池集合。
 - WSS 改为触发信号；相关两腿的所有依赖与 Meteora Clock 使用同一批 RPC 快照。
 - 正净利润候选至少跨到下一 slot 再做一次一致快照复核。
 - 长时 JSONL 启动/退出校验改为流式扫描；仅恢复未写完的最后一行，并对每批追加执行数据同步。
