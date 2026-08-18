@@ -1,0 +1,66 @@
+name: agent-expand-monitor
+
+on:
+  push:
+    branches:
+      - agent/fix-coherent-snapshots
+    paths:
+      - .github/workflows/agent-expand-monitor.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch-and-verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      HELIUS_API_KEY: ${{ secrets.HELIUS_API_KEY }}
+    steps:
+      - name: Checkout target branch
+        uses: actions/checkout@v7
+        with:
+          ref: agent/fix-coherent-snapshots
+          fetch-depth: 0
+
+      - name: Install stable Rust
+        run: |
+          rustup update stable
+          rustup default stable
+          rustup component add rustfmt clippy
+
+      - name: Apply scoped monitor patch
+        run: python3 tools/agent_expand_monitor.py
+
+      - name: Format
+        run: cargo fmt --all
+
+      - name: Diff sanity
+        run: |
+          git diff --check
+          ! grep -R "FIXED_V3_POOL_ADDRESSES\|fixed V3 universe" -n src/app.rs
+
+      - name: Compile check
+        run: cargo check --locked --all-targets
+
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Unit tests
+        run: cargo test --locked --all-targets
+
+      - name: Live one-update monitor smoke
+        if: ${{ env.HELIUS_API_KEY != '' }}
+        env:
+          OPPORTUNITY_LOG_PATH: /tmp/agent-expand-monitor.jsonl
+        run: timeout 180s cargo run --locked -- opportunity-wss-check
+
+      - name: Commit verified patch
+        run: |
+          rm -f tools/agent_expand_monitor.py .github/workflows/agent-expand-monitor.yml
+          git config user.name "OpenAI Agent"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --check
+          git commit -m "research: expand coherent monitor universe"
+          git push origin HEAD:agent/fix-coherent-snapshots
