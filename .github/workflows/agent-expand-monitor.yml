@@ -1,17 +1,19 @@
 name: agent-expand-monitor
 
 on:
-  push:
+  pull_request:
     branches:
-      - agent/fix-coherent-snapshots
+      - main
     paths:
       - .github/workflows/agent-expand-monitor.yml
+      - tools/agent_expand_monitor.py
 
 permissions:
   contents: write
 
 jobs:
   patch-and-verify:
+    if: github.head_ref == 'agent/fix-coherent-snapshots'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
