@@ -31,8 +31,34 @@ jobs:
           rustup default stable
           rustup component add rustfmt clippy
 
-      - name: Apply scoped monitor patch
-        run: python3 tools/agent_expand_monitor.py
+      - name: Fix staged matcher and apply scoped monitor patch
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("tools/agent_expand_monitor.py")
+          text = path.read_text()
+          helper_anchor = "\ndef sub_once(text: str, pattern: str, replacement: str, label: str) -> str:\n"
+          helper = '''\ndef replace_first(text: str, old: str, new: str, label: str) -> str:\n    if old not in text:\n        raise RuntimeError(f"{label}: expected at least one match")\n    return text.replace(old, new, 1)\n\n'''
+          if "def replace_first(" not in text:
+              if helper_anchor not in text:
+                  raise RuntimeError("replace_first insertion anchor missing")
+              text = text.replace(helper_anchor, helper + helper_anchor, 1)
+
+          marker = '"owner request limit constant",'
+          marker_pos = text.find(marker)
+          if marker_pos < 0:
+              raise RuntimeError("owner request matcher marker missing")
+          call_pos = text.rfind("rpc = replace_once(", 0, marker_pos)
+          if call_pos < 0:
+              raise RuntimeError("owner request replace_once call missing")
+          text = (
+              text[:call_pos]
+              + text[call_pos:].replace("rpc = replace_once(", "rpc = replace_first(", 1)
+          )
+          path.write_text(text)
+          PY
+          python3 tools/agent_expand_monitor.py
 
       - name: Format
         run: cargo fmt --all
