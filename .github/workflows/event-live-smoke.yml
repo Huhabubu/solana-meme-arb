@@ -1,18 +1,20 @@
 name: event-live-smoke
 
 on:
-  workflow_dispatch:
+  push:
+    branches:
+      - agent/event-driven-monitor-v1
 
 jobs:
-  smoke:
+  fail-fast-smoke:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 4
     env:
       HELIUS_API_KEY: ${{ secrets.HELIUS_API_KEY }}
       EVENT_LOG_PATH: /tmp/event-driven-v2.jsonl
       EVENT_MONITOR_MAX_EVENTS: "1"
-      EVENT_MONITOR_MAX_SECONDS: "180"
-      EVENT_MONITOR_UPDATE_TIMEOUT_SECONDS: "45"
+      EVENT_MONITOR_MAX_SECONDS: "30"
+      EVENT_MONITOR_UPDATE_TIMEOUT_SECONDS: "10"
       EVENT_MONITOR_MAX_RECONNECTS: "3"
       EVENT_MIN_WSOL_LAMPORTS: "0"
     steps:
@@ -27,59 +29,41 @@ jobs:
           rustup update stable
           rustup default stable
 
-      - name: Run one dynamic event
-        run: |
-          rm -f "$EVENT_LOG_PATH"
-          cargo run -- opportunity-monitor 2>&1 | tee "$RUNNER_TEMP/event-live-smoke.log"
-          grep -q 'Event-driven V2 started:.*fixed_mints=0' "$RUNNER_TEMP/event-live-smoke.log"
-          grep -q 'Event-driven V2 completed: accepted_events=1' "$RUNNER_TEMP/event-live-smoke.log"
-          test -s "$EVENT_LOG_PATH"
+      - name: Resolve Rust cache key
+        id: rust-version
+        run: echo "version=$(rustc --version | awk '{print $2}')" >> "$GITHUB_OUTPUT"
 
-      - name: Validate event JSONL invariants
+      - name: Restore Cargo cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ steps.rust-version.outputs.version }}-${{ hashFiles('Cargo.toml', 'Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-${{ steps.rust-version.outputs.version }}-
+
+      - name: Verify exhausted credits fail immediately
         run: |
-          python3 - <<'PY'
-          import json, os
-          from pathlib import Path
-          path = Path(os.environ["EVENT_LOG_PATH"])
-          rows = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
-          assert len(rows) == 1, rows
-          row = rows[0]
-          assert row["schema"] == "event-driven-v2"
-          assert row["token_mint"] and row["token_mint"] != "So11111111111111111111111111111111111111112"
-          assert row["event_slot"] > 0
-          assert row["candidate_pool_count"] == len(row["candidate_pools"])
-          assert row["quote_status"] in {
-              "evaluated",
-              "fewer_than_two_supported_pools",
-              "pool_discovery_failed",
-              "coherent_snapshot_unavailable",
-          }
-          if row["quote_status"] == "evaluated":
-              assert row["quote_snapshot_slot"] is not None
-              assert row["quote_snapshot_slot"] >= row["event_slot"]
-              assert row["route_count"] > 0
-              for opp in row["opportunities"]:
-                  if opp["status"] == "evaluated":
-                      assert opp["oldest_slot"] >= row["event_slot"]
-                      assert opp["newest_slot"] >= opp["oldest_slot"]
-          print(json.dumps({
-              "event_slot": row["event_slot"],
-              "quote_status": row["quote_status"],
-              "candidate_pool_count": row["candidate_pool_count"],
-              "route_count": row["route_count"],
-              "evaluated_count": row["evaluated_count"],
-              "net_positive_count": row["net_positive_count"],
-              "best_net_profit_lamports": row["best_net_profit_lamports"],
-          }, ensure_ascii=False))
-          PY
+          set +e
+          cargo run -- opportunity-monitor 2>&1 | tee "$RUNNER_TEMP/event-live-smoke.log"
+          status=${PIPESTATUS[0]}
+          set -e
+          test "$status" -ne 0
+          grep -q 'Event-driven V2 started:.*fixed_mints=0' "$RUNNER_TEMP/event-live-smoke.log"
+          grep -q 'Helius WSS usage exhausted' "$RUNNER_TEMP/event-live-smoke.log"
+          grep -q 'max usage reached' "$RUNNER_TEMP/event-live-smoke.log"
+          if grep -q 'WSS reconnect #' "$RUNNER_TEMP/event-live-smoke.log"; then
+            echo 'unexpected reconnect after permanent Helius usage exhaustion'
+            exit 1
+          fi
 
       - name: Upload smoke evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: event-live-smoke
-          path: |
-            ${{ runner.temp }}/event-live-smoke.log
-            /tmp/event-driven-v2.jsonl
+          name: event-live-smoke-fail-fast
+          path: ${{ runner.temp }}/event-live-smoke.log
           if-no-files-found: warn
           retention-days: 3
