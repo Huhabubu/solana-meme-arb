@@ -3,6 +3,7 @@ mod config;
 mod dependencies;
 mod dex;
 mod discovery;
+mod event_monitor;
 mod helius;
 mod model;
 mod monitor;
@@ -17,5 +18,8 @@ mod tokens;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    app::run().await
+    match std::env::args().nth(1).as_deref() {
+        Some("opportunity-monitor") | Some("event-monitor") => event_monitor::run().await,
+        _ => app::run().await,
+    }
 }
