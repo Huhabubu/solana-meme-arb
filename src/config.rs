@@ -31,11 +31,12 @@ impl HeliusConfig {
         format!("wss://mainnet.helius-rpc.com/?api-key={}", self.api_key)
     }
 
-    /// V1 事件监控暂时使用 Helius Enhanced Transactions 把 WSS 交易签名分类为 SWAP。
+    /// V1/V2 事件研究暂时使用 Helius Enhanced Transactions 把 WSS 交易签名分类为 SWAP。
+    /// 明确请求 confirmed，避免该 REST 接口默认 finalized 带来的额外等待。
     /// URL 只在请求边界构造，调用方不得把它写入日志，避免泄露 API Key。
     pub fn enhanced_transactions_url(&self) -> String {
         format!(
-            "https://api-mainnet.helius-rpc.com/v0/transactions/?api-key={}",
+            "https://api-mainnet.helius-rpc.com/v0/transactions/?api-key={}&commitment=confirmed",
             self.api_key
         )
     }
@@ -63,7 +64,7 @@ mod tests {
         );
         assert_eq!(
             config.enhanced_transactions_url(),
-            "https://api-mainnet.helius-rpc.com/v0/transactions/?api-key=test-key"
+            "https://api-mainnet.helius-rpc.com/v0/transactions/?api-key=test-key&commitment=confirmed"
         );
     }
 }
