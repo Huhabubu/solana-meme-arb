@@ -1,4 +1,8 @@
-use std::{collections::HashSet, str::FromStr, time::{SystemTime, UNIX_EPOCH}};
+use std::{
+    collections::HashSet,
+    str::FromStr,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use anyhow::{bail, Context, Result};
 use orca_whirlpools_client::{get_oracle_address, get_tick_array_address};
@@ -59,11 +63,15 @@ pub async fn evaluate_post_event_pools(
     }
     for pool in pools {
         if !pool.matches_pair(token_mint, WSOL) {
-            bail!("dynamic quote pool is outside event Mint/WSOL pair: {}", pool.address);
+            bail!(
+                "dynamic quote pool is outside event Mint/WSOL pair: {}",
+                pool.address
+            );
         }
     }
 
-    let (state, snapshot_slot) = build_coherent_post_event_state(client, config, pools, event_slot).await?;
+    let (state, snapshot_slot) =
+        build_coherent_post_event_state(client, config, pools, event_slot).await?;
     let cache = QuoteContextCache::build(&state, pools)?;
     for pool in pools {
         let slot = coherent_pool_slot(&state, &pool.address)?;
@@ -78,7 +86,10 @@ pub async fn evaluate_post_event_pools(
         }
     }
 
-    let affected = pools.iter().map(|pool| pool.address.clone()).collect::<Vec<_>>();
+    let affected = pools
+        .iter()
+        .map(|pool| pool.address.clone())
+        .collect::<Vec<_>>();
     let routes = affected_directed_pool_routes(pools, &affected, WSOL)?;
     if routes.is_empty() {
         bail!("dynamic event produced no two-pool routes");
@@ -118,7 +129,12 @@ pub async fn evaluate_post_event_pools(
 
     let mut events = Vec::with_capacity(routes.len() * ROUND_TRIP_PROBE_LAMPORTS.len());
     for route in &routes {
-        events.extend(evaluate_route_events(&cache, route, execution_cost, runtime)?);
+        events.extend(evaluate_route_events(
+            &cache,
+            route,
+            execution_cost,
+            runtime,
+        )?);
     }
     let expected = routes.len() * ROUND_TRIP_PROBE_LAMPORTS.len();
     if events.len() != expected {
@@ -161,13 +177,8 @@ async fn build_coherent_post_event_state(
     preload_registered_accounts(client, config, &mut state, Some(event_slot)).await?;
 
     let coherence_floor = max_registered_slot(&state)?.max(event_slot);
-    let snapshot_slot = preload_registered_accounts(
-        client,
-        config,
-        &mut state,
-        Some(coherence_floor),
-    )
-    .await?;
+    let snapshot_slot =
+        preload_registered_accounts(client, config, &mut state, Some(coherence_floor)).await?;
     if snapshot_slot < coherence_floor {
         bail!("final dynamic quote snapshot did not reach coherence floor");
     }
@@ -320,18 +331,19 @@ async fn build_pool_dependencies(
             if !pool.matches_pair(&mint_a, &mint_b) {
                 bail!("dynamic Orca decoded pair does not match discovery metadata");
             }
-            let pool_pubkey = Pubkey::from_str(&pool.address).context("invalid Orca pool address")?;
-            let tick_addresses = tick_array_start_indexes(
-                whirlpool.tick_current_index,
-                whirlpool.tick_spacing,
-            )
-            .iter()
-            .map(|index| {
-                get_tick_array_address(&pool_pubkey, *index, Some(program_id))
-                    .map(|(address, _)| address.to_string())
-                    .map_err(|error| anyhow::anyhow!("failed to derive Orca TickArray PDA: {error}"))
-            })
-            .collect::<Result<Vec<_>>>()?;
+            let pool_pubkey =
+                Pubkey::from_str(&pool.address).context("invalid Orca pool address")?;
+            let tick_addresses =
+                tick_array_start_indexes(whirlpool.tick_current_index, whirlpool.tick_spacing)
+                    .iter()
+                    .map(|index| {
+                        get_tick_array_address(&pool_pubkey, *index, Some(program_id))
+                            .map(|(address, _)| address.to_string())
+                            .map_err(|error| {
+                                anyhow::anyhow!("failed to derive Orca TickArray PDA: {error}")
+                            })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
             let tick_batch = fetch_accounts(
                 client,
                 config.http_url().as_str(),
@@ -351,7 +363,9 @@ async fn build_pool_dependencies(
             let oracle_address = if needs_oracle(&whirlpool) {
                 Some(
                     get_oracle_address(&pool_pubkey, Some(program_id))
-                        .map_err(|error| anyhow::anyhow!("failed to derive Orca Oracle PDA: {error}"))?
+                        .map_err(|error| {
+                            anyhow::anyhow!("failed to derive Orca Oracle PDA: {error}")
+                        })?
                         .0
                         .to_string(),
                 )

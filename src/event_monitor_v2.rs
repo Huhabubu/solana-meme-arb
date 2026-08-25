@@ -17,8 +17,7 @@ use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, Web
 use crate::{
     config::HeliusConfig,
     dex::{
-        meteora::DLMM_PROGRAM_ID,
-        orca_whirlpool::ORCA_WHIRLPOOL_PROGRAM_ID,
+        meteora::DLMM_PROGRAM_ID, orca_whirlpool::ORCA_WHIRLPOOL_PROGRAM_ID,
         raydium_amm::RAYDIUM_AMM_V4_PROGRAM_ID,
     },
     discovery::{
@@ -85,7 +84,11 @@ impl From<&PoolInfo> for EventPoolRecord {
             program_id: pool.program_id.clone(),
             mint_a: pool.mint_a.clone(),
             mint_b: pool.mint_b.clone(),
-            tvl_usd: if pool.tvl_usd.is_finite() { pool.tvl_usd } else { 0.0 },
+            tvl_usd: if pool.tvl_usd.is_finite() {
+                pool.tvl_usd
+            } else {
+                0.0
+            },
         }
     }
 }
@@ -231,10 +234,11 @@ impl EventMonitorConfig {
     }
 
     fn should_stop(&self, started: Instant, accepted_events: usize) -> bool {
-        self.max_events.is_some_and(|target| accepted_events >= target)
-            || self.max_seconds.is_some_and(|seconds| {
-                started.elapsed() >= Duration::from_secs(seconds)
-            })
+        self.max_events
+            .is_some_and(|target| accepted_events >= target)
+            || self
+                .max_seconds
+                .is_some_and(|seconds| started.elapsed() >= Duration::from_secs(seconds))
     }
 
     fn next_wait_timeout(&self, started: Instant) -> Option<Duration> {
@@ -384,7 +388,10 @@ impl ProgramLogSubscriptionClient {
         Ok(client)
     }
 
-    async fn next_event(&mut self, wait_timeout: Duration) -> Result<Option<RawProgramTransaction>> {
+    async fn next_event(
+        &mut self,
+        wait_timeout: Duration,
+    ) -> Result<Option<RawProgramTransaction>> {
         if let Some(event) = self.buffered.pop_front() {
             return Ok(Some(event));
         }
@@ -435,7 +442,10 @@ impl ProgramLogSubscriptionClient {
     fn parse_text(&mut self, text: &str) -> Result<Option<RawProgramTransaction>> {
         let value: Value = serde_json::from_str(text).context("invalid Helius event WSS JSON")?;
         if let Some(error) = value.get("error") {
-            let code = error.get("code").and_then(Value::as_i64).unwrap_or_default();
+            let code = error
+                .get("code")
+                .and_then(Value::as_i64)
+                .unwrap_or_default();
             let message = error
                 .get("message")
                 .and_then(Value::as_str)
@@ -443,7 +453,9 @@ impl ProgramLogSubscriptionClient {
             bail!("Helius event WSS RPC error code={code}: {message}");
         }
         if value.get("method").and_then(Value::as_str) == Some("logsNotification") {
-            let params = value.get("params").context("logsNotification missing params")?;
+            let params = value
+                .get("params")
+                .context("logsNotification missing params")?;
             let subscription_id = params
                 .get("subscription")
                 .and_then(Value::as_u64)
@@ -453,8 +465,12 @@ impl ProgramLogSubscriptionClient {
                 .get(&subscription_id)
                 .cloned()
                 .with_context(|| format!("unknown logs subscription id {subscription_id}"))?;
-            let result = params.get("result").context("logsNotification missing result")?;
-            let tx = result.get("value").context("logsNotification missing value")?;
+            let result = params
+                .get("result")
+                .context("logsNotification missing result")?;
+            let tx = result
+                .get("value")
+                .context("logsNotification missing value")?;
             if tx.get("err").is_some_and(|error| !error.is_null()) {
                 return Ok(None);
             }
@@ -535,7 +551,8 @@ async fn fetch_enhanced_transaction(
             .map_err(|_| anyhow::anyhow!("Helius transaction parse request failed"))?;
         let status = response.status();
         if !status.is_success() {
-            if (status.as_u16() == 429 || status.is_server_error()) && attempt + 1 < retries.max(1) {
+            if (status.as_u16() == 429 || status.is_server_error()) && attempt + 1 < retries.max(1)
+            {
                 tokio::time::sleep(Duration::from_millis(100 * (attempt as u64 + 1))).await;
                 continue;
             }
@@ -624,7 +641,10 @@ fn parse_direct_wsol_swap(
     if non_wsol.len() != 1 {
         return Ok(None);
     }
-    let token_mint = non_wsol.into_iter().next().context("dynamic mint disappeared")?;
+    let token_mint = non_wsol
+        .into_iter()
+        .next()
+        .context("dynamic mint disappeared")?;
     let token_in = input_mints.iter().any(|mint| mint == &token_mint);
     let token_out = output_mints.iter().any(|mint| mint == &token_mint);
     let wsol_token_in = input_mints.iter().any(|mint| mint == WSOL);
@@ -721,7 +741,13 @@ impl DynamicPoolRegistry {
 
 fn summarize_opportunities(
     events: &[OpportunityEvent],
-) -> (usize, usize, Option<i128>, Option<i128>, Vec<OpportunityRecord>) {
+) -> (
+    usize,
+    usize,
+    Option<i128>,
+    Option<i128>,
+    Vec<OpportunityRecord>,
+) {
     let mut evaluated = 0usize;
     let mut net_positive = 0usize;
     let mut best_profit = None;
@@ -763,8 +789,9 @@ fn unix_timestamp_millis() -> Result<u64> {
 fn append_event_record(path: &Path, record: &EventRecord) -> Result<()> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
-            create_dir_all(parent)
-                .with_context(|| format!("failed to create event log directory {}", parent.display()))?;
+            create_dir_all(parent).with_context(|| {
+                format!("failed to create event log directory {}", parent.display())
+            })?;
         }
     }
     let mut file = OpenOptions::new()
@@ -847,7 +874,9 @@ pub async fn run() -> Result<()> {
                         return Err(error).context("event monitor exhausted WSS reconnect budget");
                     }
                     reconnects += 1;
-                    eprintln!("Event-driven V2 WSS session ended; reconnect #{reconnects}: {error}");
+                    eprintln!(
+                        "Event-driven V2 WSS session ended; reconnect #{reconnects}: {error}"
+                    );
                     tokio::time::sleep(Duration::from_millis(250)).await;
                     continue 'monitor;
                 }
@@ -895,20 +924,18 @@ pub async fn run() -> Result<()> {
             }
 
             let discovery_started = Instant::now();
-            let (pool_discovery_ok, pools) = match registry
-                .pools_for_mint(&client, &event.token_mint)
-                .await
-            {
-                Ok(pools) => (true, pools),
-                Err(error) => {
-                    discovery_failures += 1;
-                    eprintln!(
+            let (pool_discovery_ok, pools) =
+                match registry.pools_for_mint(&client, &event.token_mint).await {
+                    Ok(pools) => (true, pools),
+                    Err(error) => {
+                        discovery_failures += 1;
+                        eprintln!(
                         "Event-driven V2 pool discovery failed: mint={} signature={} error={error}",
                         event.token_mint, event.signature
                     );
-                    (false, Vec::new())
-                }
-            };
+                        (false, Vec::new())
+                    }
+                };
             let pool_discovery_ms =
                 u64::try_from(discovery_started.elapsed().as_millis()).unwrap_or(u64::MAX);
 
@@ -1035,7 +1062,10 @@ mod tests {
         let event = parse_direct_wsol_swap(&transaction, &trigger("sig-a"))
             .unwrap()
             .unwrap();
-        assert_eq!(event.token_mint, "DynamicMint111111111111111111111111111111111");
+        assert_eq!(
+            event.token_mint,
+            "DynamicMint111111111111111111111111111111111"
+        );
         assert_eq!(event.direction, DirectSwapDirection::WsolToToken);
         assert_eq!(event.wsol_amount_lamports, Some(1_000_000_000));
     }
