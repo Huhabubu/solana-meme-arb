@@ -19,30 +19,7 @@ jobs:
 
       - name: Fix useless timestamp conversion
         run: |
-          python3 - <<'PY'
-          from pathlib import Path
-          path = Path('src/dynamic_quote.rs')
-          text = path.read_text()
-          old = '''fn unix_timestamp() -> Result<u64> {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .context("system clock is before Unix epoch")?
-        .as_secs()
-        .try_into()
-        .context("Unix timestamp does not fit u64")
-}
-'''
-          new = '''fn unix_timestamp() -> Result<u64> {
-    Ok(SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .context("system clock is before Unix epoch")?
-        .as_secs())
-}
-'''
-          if old not in text:
-              raise SystemExit('expected unix_timestamp block not found')
-          path.write_text(text.replace(old, new, 1))
-          PY
+          python3 -c 'from pathlib import Path; p=Path("src/dynamic_quote.rs"); s=p.read_text(); old="        .as_secs()\n        .try_into()\n        .context(\"Unix timestamp does not fit u64\")"; new="        .as_secs()"; assert old in s, "expected clippy block not found"; s=s.replace(old,new,1); s=s.replace("fn unix_timestamp() -> Result<u64> {\n    SystemTime::now()", "fn unix_timestamp() -> Result<u64> {\n    Ok(SystemTime::now()", 1); s=s.replace("        .as_secs()\n}", "        .as_secs())\n}", 1); p.write_text(s)'
 
       - name: Apply rustfmt
         run: cargo fmt --all
