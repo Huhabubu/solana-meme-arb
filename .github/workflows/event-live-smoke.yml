@@ -11,7 +11,7 @@ jobs:
     timeout-minutes: 6
     env:
       HELIUS_API_KEY: ${{ secrets.HELIUS_API_KEY }}
-      EVENT_LOG_PATH: ${{ runner.temp }}/event-driven-v2.jsonl
+      EVENT_LOG_PATH: /tmp/event-driven-v2.jsonl
       EVENT_MONITOR_MAX_EVENTS: "1"
       EVENT_MONITOR_MAX_SECONDS: "180"
       EVENT_MONITOR_UPDATE_TIMEOUT_SECONDS: "45"
@@ -84,6 +84,6 @@ jobs:
           name: event-live-smoke
           path: |
             ${{ runner.temp }}/event-live-smoke.log
-            ${{ runner.temp }}/event-driven-v2.jsonl
+            /tmp/event-driven-v2.jsonl
           if-no-files-found: warn
           retention-days: 3
