@@ -35,6 +35,23 @@ jobs:
           curl -sS --max-time 10 -o /dev/null -w 'HTTPS status=%{http_code} remote_ip=%{remote_ip}\n' "https://mainnet.helius-rpc.com/?api-key=$HELIUS_API_KEY" || true
           set -e
 
+      - name: Compare Helius WebSocket upgrade endpoints
+        run: |
+          set +e
+          for host in mainnet.helius-rpc.com atlas-mainnet.helius-rpc.com beta.helius-rpc.com; do
+            echo "=== WSS upgrade: $host ==="
+            curl --http1.1 -sS -i -o "$RUNNER_TEMP/ws-${host}.log" --max-time 5 \
+              -H 'Connection: Upgrade' \
+              -H 'Upgrade: websocket' \
+              -H 'Sec-WebSocket-Version: 13' \
+              -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' \
+              "https://${host}/?api-key=$HELIUS_API_KEY"
+            status=$?
+            sed -n '1,12p' "$RUNNER_TEMP/ws-${host}.log" | grep -E '^(HTTP/|upgrade:|connection:|server:|cf-ray:|x-|content-type:)' -i || true
+            echo "curl_exit=$status"
+          done
+          set -e
+
       - name: Install stable Rust
         run: |
           rustup update stable
@@ -119,6 +136,7 @@ jobs:
           name: event-live-smoke
           path: |
             ${{ runner.temp }}/helius-tls.log
+            ${{ runner.temp }}/ws-*.log
             ${{ runner.temp }}/legacy-helius-check.log
             ${{ runner.temp }}/event-live-smoke.log
             /tmp/event-driven-v2.jsonl
