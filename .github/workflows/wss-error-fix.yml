@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   fix:
-    if: github.event.head_commit.message == 'ci: add temporary WSS error fixer'
+    if: ${{ github.event.head_commit.message == 'ci: simplify temporary WSS error fixer' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -22,104 +22,86 @@ jobs:
           python3 - <<'PY'
           from pathlib import Path
 
-          helius = Path('src/helius.rs')
+          helius = Path("src/helius.rs")
           text = helius.read_text()
-          old = 'use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};'
-          new = '''use tokio_tungstenite::{
-              connect_async,
-              tungstenite::{Error as WebSocketError, Message},
-              MaybeTlsStream, WebSocketStream,
-          };'''
-          assert old in text
-          text = text.replace(old, new, 1)
+          old_import = "use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};"
+          new_import = "use tokio_tungstenite::{connect_async, tungstenite::{Error as WebSocketError, Message}, MaybeTlsStream, WebSocketStream};"
+          assert old_import in text
+          text = text.replace(old_import, new_import, 1)
 
           marker = 'const SUBSCRIPTION_COMMITMENT: &str = "confirmed";\n'
-          helper = r'''
-          const WSS_MAX_USAGE_MARKER: &str = "max usage reached";
-
-          pub(crate) fn sanitized_wss_connect_error(error: WebSocketError) -> anyhow::Error {
-              match error {
-                  WebSocketError::Http(response) => {
-                      let status = response.status();
-                      let max_usage = response
-                          .body()
-                          .as_deref()
-                          .and_then(|body| std::str::from_utf8(body).ok())
-                          .is_some_and(|body| body.contains(WSS_MAX_USAGE_MARKER));
-                      if max_usage {
-                          anyhow::anyhow!("Helius WSS HTTP {status}: max usage reached")
-                      } else {
-                          anyhow::anyhow!("Helius WSS HTTP handshake failed with status {status}")
-                      }
-                  }
-                  WebSocketError::Io(error) => {
-                      anyhow::anyhow!("Helius WSS I/O error kind={:?}", error.kind())
-                  }
-                  WebSocketError::Tls(_) => anyhow::anyhow!("Helius WSS TLS error"),
-                  WebSocketError::Protocol(_) => anyhow::anyhow!("Helius WSS protocol error"),
-                  WebSocketError::Url(_) => anyhow::anyhow!("Helius WSS URL error"),
-                  _ => anyhow::anyhow!("Helius WSS connection error"),
-              }
-          }
-
-          pub(crate) fn is_wss_max_usage_error(error: &anyhow::Error) -> bool {
-              error.to_string().contains(WSS_MAX_USAGE_MARKER)
-          }
-          '''
+          helper_lines = [
+              '',
+              'const WSS_MAX_USAGE_MARKER: &str = "max usage reached";',
+              '',
+              'pub(crate) fn sanitized_wss_connect_error(error: WebSocketError) -> anyhow::Error {',
+              '    match error {',
+              '        WebSocketError::Http(response) => {',
+              '            let status = response.status();',
+              '            let max_usage = response',
+              '                .body()',
+              '                .as_deref()',
+              '                .and_then(|body| std::str::from_utf8(body).ok())',
+              '                .is_some_and(|body| body.contains(WSS_MAX_USAGE_MARKER));',
+              '            if max_usage {',
+              '                anyhow::anyhow!("Helius WSS HTTP {status}: max usage reached")',
+              '            } else {',
+              '                anyhow::anyhow!("Helius WSS HTTP handshake failed with status {status}")',
+              '            }',
+              '        }',
+              '        WebSocketError::Io(error) => anyhow::anyhow!(',
+              '            "Helius WSS I/O error kind={:?}",',
+              '            error.kind()',
+              '        ),',
+              '        WebSocketError::Tls(_) => anyhow::anyhow!("Helius WSS TLS error"),',
+              '        WebSocketError::Protocol(_) => anyhow::anyhow!("Helius WSS protocol error"),',
+              '        WebSocketError::Url(_) => anyhow::anyhow!("Helius WSS URL error"),',
+              '        _ => anyhow::anyhow!("Helius WSS connection error"),',
+              '    }',
+              '}',
+              '',
+              'pub(crate) fn is_wss_max_usage_error(error: &anyhow::Error) -> bool {',
+              '    error.to_string().contains(WSS_MAX_USAGE_MARKER)',
+              '}',
+              '',
+          ]
+          helper = "\n".join(helper_lines)
           assert marker in text
           text = text.replace(marker, marker + helper, 1)
 
-          old = '''        let (socket, _) = connect_async(wss_url.as_str())
-              .await
-              .map_err(|_| anyhow::anyhow!("Helius WSS connection failed"))?;'''
-          new = '''        let (socket, _) = connect_async(wss_url.as_str())
-              .await
-              .map_err(sanitized_wss_connect_error)?;'''
-          assert old in text
-          text = text.replace(old, new, 1)
+          old_connect = '        let (socket, _) = connect_async(wss_url.as_str())\n            .await\n            .map_err(|_| anyhow::anyhow!("Helius WSS connection failed"))?;'
+          new_connect = '        let (socket, _) = connect_async(wss_url.as_str())\n            .await\n            .map_err(sanitized_wss_connect_error)?;'
+          assert old_connect in text
+          text = text.replace(old_connect, new_connect, 1)
           helius.write_text(text)
 
-          event = Path('src/event_monitor_v2.rs')
+          event = Path("src/event_monitor_v2.rs")
           text = event.read_text()
-          old = '''    dynamic_quote::evaluate_post_event_pools,
-              model::{Dex, PoolInfo},'''
-          new = '''    dynamic_quote::evaluate_post_event_pools,
-              helius::{is_wss_max_usage_error, sanitized_wss_connect_error},
-              model::{Dex, PoolInfo},'''
-          assert old in text
-          text = text.replace(old, new, 1)
+          old_import = '    dynamic_quote::evaluate_post_event_pools,\n    model::{Dex, PoolInfo},'
+          new_import = '    dynamic_quote::evaluate_post_event_pools,\n    helius::{is_wss_max_usage_error, sanitized_wss_connect_error},\n    model::{Dex, PoolInfo},'
+          assert old_import in text
+          text = text.replace(old_import, new_import, 1)
 
-          old = '''        let (socket, _) = connect_async(config.wss_url().as_str())
-              .await
-              .map_err(|_| anyhow::anyhow!("Helius event WSS connection failed"))?;'''
-          new = '''        let (socket, _) = connect_async(config.wss_url().as_str())
-              .await
-              .map_err(sanitized_wss_connect_error)?;'''
-          assert old in text
-          text = text.replace(old, new, 1)
+          old_connect = '        let (socket, _) = connect_async(config.wss_url().as_str())\n            .await\n            .map_err(|_| anyhow::anyhow!("Helius event WSS connection failed"))?;'
+          new_connect = '        let (socket, _) = connect_async(config.wss_url().as_str())\n            .await\n            .map_err(sanitized_wss_connect_error)?;'
+          assert old_connect in text
+          text = text.replace(old_connect, new_connect, 1)
 
-          old = '''            Err(error) => {
-                      if reconnects >= monitor_config.max_reconnects {'''
-          new = '''            Err(error) => {
-                      if is_wss_max_usage_error(&error) {
-                          return Err(error).context(
-                              "Helius WSS usage exhausted; replenish credits before running event monitor",
-                          );
-                      }
-                      if reconnects >= monitor_config.max_reconnects {'''
-          assert old in text
-          text = text.replace(old, new, 1)
+          old_branch = '            Err(error) => {\n                if reconnects >= monitor_config.max_reconnects {'
+          new_branch = '            Err(error) => {\n                if is_wss_max_usage_error(&error) {\n                    return Err(error).context(\n                        "Helius WSS usage exhausted; replenish credits before running event monitor",\n                    );\n                }\n                if reconnects >= monitor_config.max_reconnects {'
+          assert old_branch in text
+          text = text.replace(old_branch, new_branch, 1)
           event.write_text(text)
           PY
 
           cargo fmt
           cargo fmt --check
+          git diff --check
 
       - name: Commit patch
         run: |
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add src/helius.rs src/event_monitor_v2.rs
-          git diff --cached --check
           git commit -m 'fix: classify Helius WSS usage exhaustion'
           git push origin HEAD:agent/event-driven-monitor-v1
