@@ -159,8 +159,8 @@ jobs:
           test -s "$OPPORTUNITY_LOG_PATH"
           echo "V3.6 JSONL line count: $(wc -l < "$OPPORTUNITY_LOG_PATH")"
 
-      # V4 事件驱动入口：交易事件先动态解析 Mint，再发现同 Mint/WSOL 的支持池。
-      # 这里仍沿用旧 OPPORTUNITY_* 环境变量验证部署兼容层；程序内部映射为 EVENT_*。
+      # V4：交易事件动态解析 Mint → 动态池发现 → event_slot 之后的同-context池快照 → 双向报价。
+      # 继续接受旧 OPPORTUNITY_* 环境变量，避免部署脚本与本次切换必须原子更新。
       - name: Live V4 event-driven dynamic Mint monitor verification
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         timeout-minutes: 4
@@ -179,7 +179,9 @@ jobs:
           rm -f "$OPPORTUNITY_LOG_PATH"
           cargo run -- opportunity-monitor 2>&1 | tee "$RUNNER_TEMP/event-driven-monitor.log"
           test -s "$OPPORTUNITY_LOG_PATH"
-          grep -q 'Event-driven V1 started:.*fixed_mints=0' "$RUNNER_TEMP/event-driven-monitor.log"
+          grep -q 'Event-driven V2 started:.*fixed_mints=0' "$RUNNER_TEMP/event-driven-monitor.log"
           grep -q 'accepted_events=2' "$RUNNER_TEMP/event-driven-monitor.log"
           grep -q 'fixed_mints=0' "$RUNNER_TEMP/event-driven-monitor.log"
+          grep -q '"quote_status"' "$OPPORTUNITY_LOG_PATH"
+          grep -q '"event_slot"' "$OPPORTUNITY_LOG_PATH"
           echo "V4 event-driven JSONL line count: $(wc -l < "$OPPORTUNITY_LOG_PATH")"
