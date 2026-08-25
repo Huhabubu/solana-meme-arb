@@ -8,7 +8,7 @@ on:
 jobs:
   smoke:
     runs-on: ubuntu-latest
-    timeout-minutes: 6
+    timeout-minutes: 8
     env:
       HELIUS_API_KEY: ${{ secrets.HELIUS_API_KEY }}
       EVENT_LOG_PATH: /tmp/event-driven-v2.jsonl
@@ -24,10 +24,45 @@ jobs:
       - name: Require Helius key
         run: test -n "$HELIUS_API_KEY"
 
+      - name: Diagnose Helius DNS and TLS
+        run: |
+          echo "DNS:"
+          getent ahostsv4 mainnet.helius-rpc.com | head -n 5 || true
+          echo "TLS:"
+          set +e
+          timeout 10 openssl s_client -connect mainnet.helius-rpc.com:443 -servername mainnet.helius-rpc.com </dev/null 2>&1 | tee "$RUNNER_TEMP/helius-tls.log"
+          grep -E 'subject=|issuer=|Verify return code' "$RUNNER_TEMP/helius-tls.log" || true
+          curl -sS --max-time 10 -o /dev/null -w 'HTTPS status=%{http_code} remote_ip=%{remote_ip}\n' "https://mainnet.helius-rpc.com/?api-key=$HELIUS_API_KEY" || true
+          set -e
+
       - name: Install stable Rust
         run: |
           rustup update stable
           rustup default stable
+
+      - name: Resolve Rust cache key
+        id: rust-version
+        run: echo "version=$(rustc --version | awk '{print $2}')" >> "$GITHUB_OUTPUT"
+
+      - name: Restore Cargo cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ steps.rust-version.outputs.version }}-${{ hashFiles('Cargo.toml', 'Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-${{ steps.rust-version.outputs.version }}-
+            ${{ runner.os }}-cargo-
+
+      - name: A/B legacy Helius connection path
+        run: |
+          set +e
+          cargo run -- helius-check 2>&1 | tee "$RUNNER_TEMP/legacy-helius-check.log"
+          legacy_status=${PIPESTATUS[0]}
+          set -e
+          echo "legacy_helius_check_exit=$legacy_status"
 
       - name: Run one dynamic event
         run: |
@@ -83,6 +118,8 @@ jobs:
         with:
           name: event-live-smoke
           path: |
+            ${{ runner.temp }}/helius-tls.log
+            ${{ runner.temp }}/legacy-helius-check.log
             ${{ runner.temp }}/event-live-smoke.log
             /tmp/event-driven-v2.jsonl
           if-no-files-found: warn
