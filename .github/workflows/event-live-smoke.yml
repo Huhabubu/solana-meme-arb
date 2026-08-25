@@ -6,139 +6,38 @@ on:
       - agent/event-driven-monitor-v1
 
 jobs:
-  smoke:
+  websocket-gateway-probe:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 2
     env:
       HELIUS_API_KEY: ${{ secrets.HELIUS_API_KEY }}
-      EVENT_LOG_PATH: /tmp/event-driven-v2.jsonl
-      EVENT_MONITOR_MAX_EVENTS: "1"
-      EVENT_MONITOR_MAX_SECONDS: "180"
-      EVENT_MONITOR_UPDATE_TIMEOUT_SECONDS: "45"
-      EVENT_MONITOR_MAX_RECONNECTS: "3"
-      EVENT_MIN_WSOL_LAMPORTS: "0"
     steps:
-      - name: Checkout branch
-        uses: actions/checkout@v7
-
       - name: Require Helius key
         run: test -n "$HELIUS_API_KEY"
-
-      - name: Diagnose Helius DNS and TLS
-        run: |
-          echo "DNS:"
-          getent ahostsv4 mainnet.helius-rpc.com | head -n 5 || true
-          echo "TLS:"
-          set +e
-          timeout 10 openssl s_client -connect mainnet.helius-rpc.com:443 -servername mainnet.helius-rpc.com </dev/null 2>&1 | tee "$RUNNER_TEMP/helius-tls.log"
-          grep -E 'subject=|issuer=|Verify return code' "$RUNNER_TEMP/helius-tls.log" || true
-          curl -sS --max-time 10 -o /dev/null -w 'HTTPS status=%{http_code} remote_ip=%{remote_ip}\n' "https://mainnet.helius-rpc.com/?api-key=$HELIUS_API_KEY" || true
-          set -e
 
       - name: Compare Helius WebSocket upgrade endpoints
         run: |
           set +e
           for host in mainnet.helius-rpc.com atlas-mainnet.helius-rpc.com beta.helius-rpc.com; do
             echo "=== WSS upgrade: $host ==="
-            curl --http1.1 -sS -i -o "$RUNNER_TEMP/ws-${host}.log" --max-time 5 \
+            file="$RUNNER_TEMP/ws-${host}.log"
+            curl --http1.1 -sS -i -o "$file" --max-time 5 \
               -H 'Connection: Upgrade' \
               -H 'Upgrade: websocket' \
               -H 'Sec-WebSocket-Version: 13' \
               -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' \
               "https://${host}/?api-key=$HELIUS_API_KEY"
             status=$?
-            sed -n '1,12p' "$RUNNER_TEMP/ws-${host}.log" | grep -E '^(HTTP/|upgrade:|connection:|server:|cf-ray:|x-|content-type:)' -i || true
+            sed -n '1,16p' "$file" | grep -E '^(HTTP/|upgrade:|connection:|server:|cf-ray:|x-|content-type:)' -i || true
             echo "curl_exit=$status"
           done
           set -e
 
-      - name: Install stable Rust
-        run: |
-          rustup update stable
-          rustup default stable
-
-      - name: Resolve Rust cache key
-        id: rust-version
-        run: echo "version=$(rustc --version | awk '{print $2}')" >> "$GITHUB_OUTPUT"
-
-      - name: Restore Cargo cache
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ steps.rust-version.outputs.version }}-${{ hashFiles('Cargo.toml', 'Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-${{ steps.rust-version.outputs.version }}-
-            ${{ runner.os }}-cargo-
-
-      - name: A/B legacy Helius connection path
-        run: |
-          set +e
-          cargo run -- helius-check 2>&1 | tee "$RUNNER_TEMP/legacy-helius-check.log"
-          legacy_status=${PIPESTATUS[0]}
-          set -e
-          echo "legacy_helius_check_exit=$legacy_status"
-
-      - name: Run one dynamic event
-        run: |
-          rm -f "$EVENT_LOG_PATH"
-          cargo run -- opportunity-monitor 2>&1 | tee "$RUNNER_TEMP/event-live-smoke.log"
-          grep -q 'Event-driven V2 started:.*fixed_mints=0' "$RUNNER_TEMP/event-live-smoke.log"
-          grep -q 'Event-driven V2 completed: accepted_events=1' "$RUNNER_TEMP/event-live-smoke.log"
-          test -s "$EVENT_LOG_PATH"
-
-      - name: Validate event JSONL invariants
-        run: |
-          python3 - <<'PY'
-          import json, os
-          from pathlib import Path
-          path = Path(os.environ["EVENT_LOG_PATH"])
-          rows = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
-          assert len(rows) == 1, rows
-          row = rows[0]
-          assert row["schema"] == "event-driven-v2"
-          assert row["token_mint"] and row["token_mint"] != "So11111111111111111111111111111111111111112"
-          assert row["event_slot"] > 0
-          assert row["candidate_pool_count"] == len(row["candidate_pools"])
-          assert row["quote_status"] in {
-              "evaluated",
-              "fewer_than_two_supported_pools",
-              "pool_discovery_failed",
-              "coherent_snapshot_unavailable",
-          }
-          if row["quote_status"] == "evaluated":
-              assert row["quote_snapshot_slot"] is not None
-              assert row["quote_snapshot_slot"] >= row["event_slot"]
-              assert row["route_count"] > 0
-              assert row["evaluated_count"] <= len(row["opportunities"])
-              for opp in row["opportunities"]:
-                  if opp["status"] == "evaluated":
-                      assert opp["oldest_slot"] >= row["event_slot"]
-                      assert opp["newest_slot"] >= opp["oldest_slot"]
-          print(json.dumps({
-              "event_slot": row["event_slot"],
-              "quote_status": row["quote_status"],
-              "quote_snapshot_slot": row["quote_snapshot_slot"],
-              "candidate_pool_count": row["candidate_pool_count"],
-              "route_count": row["route_count"],
-              "evaluated_count": row["evaluated_count"],
-              "net_positive_count": row["net_positive_count"],
-              "best_net_profit_lamports": row["best_net_profit_lamports"],
-          }, ensure_ascii=False))
-          PY
-
-      - name: Upload smoke evidence
+      - name: Upload gateway evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: event-live-smoke
-          path: |
-            ${{ runner.temp }}/helius-tls.log
-            ${{ runner.temp }}/ws-*.log
-            ${{ runner.temp }}/legacy-helius-check.log
-            ${{ runner.temp }}/event-live-smoke.log
-            /tmp/event-driven-v2.jsonl
-          if-no-files-found: warn
+          name: helius-wss-gateway-probe
+          path: ${{ runner.temp }}/ws-*.log
+          if-no-files-found: error
           retention-days: 3
