@@ -496,10 +496,8 @@ fn evaluate_route_events(
 }
 
 fn unix_timestamp() -> Result<u64> {
-    SystemTime::now()
+    Ok(SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .context("system clock is before Unix epoch")?
-        .as_secs()
-        .try_into()
-        .context("Unix timestamp does not fit u64")
+        .as_secs())
 }
