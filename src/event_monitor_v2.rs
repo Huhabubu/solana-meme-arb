@@ -24,6 +24,7 @@ use crate::{
         discover_pair, select_monitoring_candidates, MAX_POOLS_PER_DEX, MIN_MONITOR_TVL_USD,
     },
     dynamic_quote::evaluate_post_event_pools,
+    helius::{is_wss_max_usage_error, sanitized_wss_connect_error},
     model::{Dex, PoolInfo},
     opportunity::{LiquidityStage, OpportunityEvent, OpportunityEventOutcome},
     tokens::WSOL,
@@ -363,7 +364,7 @@ impl ProgramLogSubscriptionClient {
         }
         let (socket, _) = connect_async(config.wss_url().as_str())
             .await
-            .map_err(|_| anyhow::anyhow!("Helius event WSS connection failed"))?;
+            .map_err(sanitized_wss_connect_error)?;
         let mut pending = HashMap::new();
         for (index, program) in programs.iter().enumerate() {
             pending.insert((index + 1) as u64, program.clone());
@@ -849,6 +850,11 @@ pub async fn run() -> Result<()> {
         {
             Ok(subscription) => subscription,
             Err(error) => {
+                if is_wss_max_usage_error(&error) {
+                    return Err(error).context(
+                        "Helius WSS usage exhausted; replenish credits before running event monitor",
+                    );
+                }
                 if reconnects >= monitor_config.max_reconnects {
                     return Err(error).context("event monitor exhausted WSS reconnect budget");
                 }

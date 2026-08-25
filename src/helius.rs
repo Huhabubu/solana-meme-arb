@@ -8,12 +8,47 @@ use reqwest::Client;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::{net::TcpStream, time::timeout};
-use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
+use tokio_tungstenite::{
+    connect_async,
+    tungstenite::{Error as WebSocketError, Message},
+    MaybeTlsStream, WebSocketStream,
+};
 
 use crate::config::HeliusConfig;
 use crate::model::PoolInfo;
 
 const SUBSCRIPTION_COMMITMENT: &str = "confirmed";
+
+const WSS_MAX_USAGE_MARKER: &str = "max usage reached";
+
+pub(crate) fn sanitized_wss_connect_error(error: WebSocketError) -> anyhow::Error {
+    match error {
+        WebSocketError::Http(response) => {
+            let status = response.status();
+            let max_usage = response
+                .body()
+                .as_deref()
+                .and_then(|body| std::str::from_utf8(body).ok())
+                .is_some_and(|body| body.contains(WSS_MAX_USAGE_MARKER));
+            if max_usage {
+                anyhow::anyhow!("Helius WSS HTTP {status}: max usage reached")
+            } else {
+                anyhow::anyhow!("Helius WSS HTTP handshake failed with status {status}")
+            }
+        }
+        WebSocketError::Io(error) => {
+            anyhow::anyhow!("Helius WSS I/O error kind={:?}", error.kind())
+        }
+        WebSocketError::Tls(_) => anyhow::anyhow!("Helius WSS TLS error"),
+        WebSocketError::Protocol(_) => anyhow::anyhow!("Helius WSS protocol error"),
+        WebSocketError::Url(_) => anyhow::anyhow!("Helius WSS URL error"),
+        _ => anyhow::anyhow!("Helius WSS connection error"),
+    }
+}
+
+pub(crate) fn is_wss_max_usage_error(error: &anyhow::Error) -> bool {
+    error.to_string().contains(WSS_MAX_USAGE_MARKER)
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct AccountUpdate {
@@ -280,7 +315,7 @@ impl AccountSubscriptionClient {
         let wss_url = config.wss_url();
         let (socket, _) = connect_async(wss_url.as_str())
             .await
-            .map_err(|_| anyhow::anyhow!("Helius WSS connection failed"))?;
+            .map_err(sanitized_wss_connect_error)?;
         let mut client = Self {
             socket,
             tracker: AddressSubscriptionTracker::new(addresses)?,
