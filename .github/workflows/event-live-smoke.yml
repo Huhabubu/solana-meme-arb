@@ -15,22 +15,21 @@ jobs:
       - name: Require Helius key
         run: test -n "$HELIUS_API_KEY"
 
-      - name: Compare Helius WebSocket upgrade endpoints
+      - name: Probe unified Helius WebSocket endpoint
         run: |
           set +e
-          for host in mainnet.helius-rpc.com atlas-mainnet.helius-rpc.com beta.helius-rpc.com; do
-            echo "=== WSS upgrade: $host ==="
-            file="$RUNNER_TEMP/ws-${host}.log"
-            curl --http1.1 -sS -i -o "$file" --max-time 5 \
-              -H 'Connection: Upgrade' \
-              -H 'Upgrade: websocket' \
-              -H 'Sec-WebSocket-Version: 13' \
-              -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' \
-              "https://${host}/?api-key=$HELIUS_API_KEY"
-            status=$?
-            sed -n '1,16p' "$file" | grep -E '^(HTTP/|upgrade:|connection:|server:|cf-ray:|x-|content-type:)' -i || true
-            echo "curl_exit=$status"
-          done
+          file="$RUNNER_TEMP/ws-mainnet.log"
+          curl --http1.1 -sS -i -o "$file" --max-time 5 \
+            -H 'Connection: Upgrade' \
+            -H 'Upgrade: websocket' \
+            -H 'Sec-WebSocket-Version: 13' \
+            -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' \
+            "https://mainnet.helius-rpc.com/?api-key=$HELIUS_API_KEY"
+          status=$?
+          echo "=== redacted response ==="
+          sed "s/${HELIUS_API_KEY}/REDACTED/g" "$file" | head -c 4096
+          echo
+          echo "curl_exit=$status"
           set -e
 
       - name: Upload gateway evidence
@@ -38,6 +37,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: helius-wss-gateway-probe
-          path: ${{ runner.temp }}/ws-*.log
+          path: ${{ runner.temp }}/ws-mainnet.log
           if-no-files-found: error
           retention-days: 3
