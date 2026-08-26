@@ -13,20 +13,28 @@ permissions:
 jobs:
   probe:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 8
     steps:
-      - name: Probe OKX KOL APIs
+      - name: Probe manual KOL BSC histories
         shell: bash
         run: |
           python - <<'PY'
           import json
+          import statistics
           import time
           import urllib.parse
           import urllib.request
+          from datetime import datetime, timezone
 
-          WALLET = "MRiYA4oN3158fCV8evhuCofrDzbHyYvYnGZUDJvoCsa"
-          MINT = "AFbX8oGjGpmVFywbVouvhQSRmiW2aR1mohfahi4Y2AdB"
+          CHAIN_ID = "56"
+          KOLS = {
+              "阿峰": "0xbf004bff64725914ee36d03b87d6965b0ced4903",
+              "枯坐P小将": "0x2ce9d43d1cba6ae31d7f07bfe0098dfa2d833373",
+              "西瓜": "0x5388668c4fa8da7f756ef8498ff24d7999999999",
+          }
           UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+          PNL_URL = "https://web3.okx.com/priapi/v1/dx/market/v2/pnl/token-list"
+          TRADE_URL = "https://web3.okx.com/priapi/v1/dx/market/v2/trading-history/filter-list"
 
           def get_json(url, headers=None, timeout=15):
               req = urllib.request.Request(url, headers=headers or {}, method="GET")
@@ -42,60 +50,40 @@ jobs:
                   return r.status, json.loads(r.read().decode("utf-8"))
 
           common_headers = {"User-Agent": UA, "Accept": "application/json"}
-
-          # 1) Wallet -> Mint 聚合 PnL
-          pnl_params = {
-              "walletAddress": WALLET,
-              "chainId": "501",
-              "isAsc": "false",
-              "sortType": "1",
-              "offset": "0",
-              "limit": "10",
-              "filterRisk": "true",
-              "filterSmallBalance": "false",
-              "t": str(int(time.time() * 1000)),
-          }
-          pnl_url = "https://web3.okx.com/priapi/v1/dx/market/v2/pnl/token-list?" + urllib.parse.urlencode(pnl_params)
           pnl_headers = dict(common_headers)
           pnl_headers["Referer"] = "https://web3.okx.com/zh-hans/market/pnl/wallet-profile"
-          status, pnl = get_json(pnl_url, pnl_headers)
-          token_list = ((pnl.get("data") or {}).get("tokenList") or [])
-          print("PNL_HTTP", status, "CODE", pnl.get("code"), "TOKEN_COUNT", len(token_list))
-          gst = next((x for x in token_list if x.get("tokenContractAddress") == MINT), None)
-          if not gst:
-              raise SystemExit("GST not found in first PnL page")
-          print("PNL_GST", json.dumps({
-              "symbol": gst.get("tokenSymbol"),
-              "mint": gst.get("tokenContractAddress"),
-              "buy_count": gst.get("totalTxBuy"),
-              "sell_count": gst.get("totalTxSell"),
-              "buy_volume": gst.get("buyVolume"),
-              "sell_volume": gst.get("sellVolume"),
-              "buy_avg_price": gst.get("buyAvgPrice"),
-              "sell_avg_price": gst.get("sellAvgPrice"),
-              "holding_time": gst.get("holdingTime"),
-              "sell_off_time": gst.get("sellOffTime"),
-              "latest_time": gst.get("latestTime"),
-              "balance": gst.get("balance"),
-              "total_pnl": gst.get("totalPnl"),
-          }, ensure_ascii=False))
-
-          # 2) Mint 全市场第一页 vs userAddressList 服务端过滤第一页
           trade_headers = dict(common_headers)
           trade_headers["Referer"] = "https://web3.okx.com/zh-hans/market/dex"
-          base_url = "https://web3.okx.com/priapi/v1/dx/market/v2/trading-history/filter-list"
 
-          def payload(users, data_id=None):
+          def fetch_recent_mints(wallet, limit=10):
+              params = {
+                  "walletAddress": wallet,
+                  "chainId": CHAIN_ID,
+                  "isAsc": "false",
+                  "sortType": "1",
+                  "offset": "0",
+                  "limit": str(limit),
+                  "filterRisk": "true",
+                  "filterSmallBalance": "false",
+                  "t": str(int(time.time() * 1000)),
+              }
+              url = PNL_URL + "?" + urllib.parse.urlencode(params)
+              status, payload = get_json(url, pnl_headers)
+              if status != 200 or str(payload.get("code")) != "0":
+                  raise RuntimeError(f"pnl failed status={status} code={payload.get('code')} msg={payload.get('msg')}")
+              return ((payload.get("data") or {}).get("tokenList") or [])
+
+          def trade_payload(wallet, mint, data_id=None):
               out = {
                   "desc": True,
                   "orderBy": "timestamp",
                   "limit": 30,
                   "tradingHistoryFilter": {
-                      "chainId": "501",
-                      "tokenContractAddress": MINT,
+                      "chainId": CHAIN_ID,
+                      "tokenContractAddress": mint,
                       "type": "0",
                       "currentUserWalletAddress": "",
-                      "userAddressList": users,
+                      "userAddressList": [wallet],
                       "volumeMin": "", "volumeMax": "",
                       "priceMin": "", "priceMax": "",
                       "amountMin": "", "amountMax": "",
@@ -105,73 +93,109 @@ jobs:
                   out["dataId"] = data_id
               return out
 
-          url = base_url + "?t=" + str(int(time.time() * 1000))
-          _, all_resp = post_json(url, payload([]), trade_headers)
-          _, filtered_first = post_json(url, payload([WALLET]), trade_headers)
-          all_rows = ((all_resp.get("data") or {}).get("list") or [])
-          frows = ((filtered_first.get("data") or {}).get("list") or [])
-          target = WALLET.lower()
-          print("FILTER_TEST", json.dumps({
-              "all_count": len(all_rows),
-              "all_target_count": sum(str(r.get("userAddress") or "").lower() == target for r in all_rows),
-              "filtered_count": len(frows),
-              "filtered_target_count": sum(str(r.get("userAddress") or "").lower() == target for r in frows),
-              "filtered_has_more": (filtered_first.get("data") or {}).get("hasMore"),
-              "server_filter_effective": bool(frows) and all(str(r.get("userAddress") or "").lower() == target for r in frows),
-          }, ensure_ascii=False))
+          def fetch_history(wallet, mint, max_rows=180):
+              rows = []
+              data_id = None
+              pages = 0
+              while len(rows) < max_rows and pages < 20:
+                  url = TRADE_URL + "?t=" + str(int(time.time() * 1000))
+                  status, payload = post_json(url, trade_payload(wallet, mint, data_id), trade_headers)
+                  if status != 200 or str(payload.get("code")) != "0":
+                      raise RuntimeError(f"history failed status={status} code={payload.get('code')} msg={payload.get('msg')}")
+                  data = payload.get("data") or {}
+                  page = data.get("list") or []
+                  if not page:
+                      break
+                  rows.extend(page)
+                  pages += 1
+                  next_id = page[-1].get("id")
+                  if str(data.get("hasMore", "0")) != "1" or not next_id or next_id == data_id:
+                      break
+                  data_id = next_id
+                  time.sleep(0.05)
+              dedup = {}
+              for r in rows:
+                  dedup[r.get("id") or (r.get("timestamp"), r.get("userAddress"), r.get("volume"), r.get("isBuy"))] = r
+              return list(dedup.values())[:max_rows]
 
-          # 3) userAddressList=[KOL] 持续分页，恢复该 Mint 能看到的全部历史成交
-          rows = []
-          data_id = None
-          pages = 0
-          while pages < 100:
-              page_url = base_url + "?t=" + str(int(time.time() * 1000))
-              _, resp = post_json(page_url, payload([WALLET], data_id), trade_headers)
-              if str(resp.get("code")) != "0":
-                  raise SystemExit(f"trade history code={resp.get('code')} msg={resp.get('msg')}")
-              data = resp.get("data") or {}
-              page = data.get("list") or []
-              if not page:
-                  break
-              rows.extend(page)
-              pages += 1
-              has_more = str(data.get("hasMore", "0"))
-              next_id = page[-1].get("id")
-              if has_more != "1" or not next_id or next_id == data_id:
-                  break
-              data_id = next_id
-              time.sleep(0.05)
+          def side(r):
+              return "BUY" if str(r.get("isBuy")) == "1" else "SELL"
 
-          buys = [r for r in rows if str(r.get("isBuy")) == "1"]
-          sells = [r for r in rows if str(r.get("isBuy")) != "1"]
-          volumes = [float(r.get("volume") or 0) for r in rows]
-          timestamps = [int(r.get("timestamp") or 0) for r in rows if r.get("timestamp")]
-          trade_total_counts = sorted({str(r.get("tradeTotalCount")) for r in rows if r.get("tradeTotalCount") is not None})
-          unique_ids = len({r.get("id") for r in rows if r.get("id")})
-          print("FILTERED_HISTORY", json.dumps({
-              "pages": pages,
-              "rows": len(rows),
-              "unique_ids": unique_ids,
-              "buy_rows": len(buys),
-              "sell_rows": len(sells),
-              "volume_sum": sum(volumes),
-              "max_timestamp": max(timestamps) if timestamps else None,
-              "min_timestamp": min(timestamps) if timestamps else None,
-              "tradeTotalCount_values": trade_total_counts[:20],
-              "all_addresses_match": all(str(r.get("userAddress") or "").lower() == target for r in rows),
-          }, ensure_ascii=False))
+          def vol(r):
+              try:
+                  return float(r.get("volume") or 0)
+              except Exception:
+                  return 0.0
 
-          # 4) 直接对比 PnL 聚合字段与历史成交恢复值
-          print("PNL_VS_HISTORY", json.dumps({
-              "pnl_buy_count": gst.get("totalTxBuy"),
-              "history_buy_rows": len(buys),
-              "pnl_sell_count": gst.get("totalTxSell"),
-              "history_sell_rows": len(sells),
-              "pnl_buy_volume": gst.get("buyVolume"),
-              "history_buy_volume": sum(float(r.get("volume") or 0) for r in buys),
-              "pnl_sell_volume": gst.get("sellVolume"),
-              "history_sell_volume": sum(float(r.get("volume") or 0) for r in sells),
-              "pnl_latest_time": gst.get("latestTime"),
-              "history_latest_time": max(timestamps) if timestamps else None,
-          }, ensure_ascii=False))
+          def summarize(rows):
+              chron = sorted(rows, key=lambda r: int(r.get("timestamp") or 0))
+              buys = [r for r in chron if side(r) == "BUY"]
+              sells = [r for r in chron if side(r) == "SELL"]
+              buy_vals = [vol(r) for r in buys]
+              sell_vals = [vol(r) for r in sells]
+              first_buy = buys[0] if buys else None
+              later_buy_vals = buy_vals[1:] if len(buy_vals) > 1 else []
+              return {
+                  "rows": len(chron),
+                  "buy_rows": len(buys),
+                  "sell_rows": len(sells),
+                  "buy_usd_sum": round(sum(buy_vals), 6),
+                  "sell_usd_sum": round(sum(sell_vals), 6),
+                  "first_buy_usd": round(vol(first_buy), 6) if first_buy else None,
+                  "later_buy_median_usd": round(statistics.median(later_buy_vals), 6) if later_buy_vals else None,
+                  "max_buy_usd": round(max(buy_vals), 6) if buy_vals else None,
+                  "median_buy_usd": round(statistics.median(buy_vals), 6) if buy_vals else None,
+                  "max_sell_usd": round(max(sell_vals), 6) if sell_vals else None,
+                  "median_sell_usd": round(statistics.median(sell_vals), 6) if sell_vals else None,
+                  "min_ts": min((int(r.get("timestamp") or 0) for r in chron), default=None),
+                  "max_ts": max((int(r.get("timestamp") or 0) for r in chron), default=None),
+              }
+
+          def ts_text(ms):
+              if not ms:
+                  return None
+              return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).isoformat()
+
+          for name, wallet in KOLS.items():
+              print("\n=== KOL", name, wallet, "===")
+              mints = fetch_recent_mints(wallet, 10)
+              print("RECENT_MINT_COUNT", len(mints))
+              candidates = []
+              for idx, item in enumerate(mints[:8]):
+                  mint = item.get("tokenContractAddress")
+                  symbol = item.get("tokenSymbol")
+                  latest = item.get("latestTime")
+                  if not mint:
+                      continue
+                  rows = fetch_history(wallet, mint, max_rows=120)
+                  s = summarize(rows)
+                  candidate = {
+                      "idx": idx,
+                      "symbol": symbol,
+                      "mint": mint,
+                      "latestTime": latest,
+                      **s,
+                  }
+                  candidates.append((candidate, rows))
+                  print("MINT_SCAN", json.dumps(candidate, ensure_ascii=False))
+
+              eligible = [x for x in candidates if 6 <= x[0]["rows"] <= 100 and x[0]["buy_rows"] > 0 and x[0]["sell_rows"] > 0]
+              chosen = eligible[0] if eligible else (candidates[0] if candidates else None)
+              if not chosen:
+                  print("NO_CANDIDATE")
+                  continue
+
+              meta, rows = chosen
+              print("CHOSEN", json.dumps(meta, ensure_ascii=False))
+              chron = sorted(rows, key=lambda r: int(r.get("timestamp") or 0))
+              # 输出最近 40 笔真实成交，避免 PnL/UI 交易次数口径干扰。
+              for r in chron[-40:]:
+                  print("TRADE", json.dumps({
+                      "time_utc": ts_text(int(r.get("timestamp") or 0)),
+                      "timestamp": r.get("timestamp"),
+                      "side": side(r),
+                      "usd": round(vol(r), 6),
+                      "price": r.get("price"),
+                      "id": r.get("id"),
+                  }, ensure_ascii=False))
           PY
