@@ -1,0 +1,120 @@
+name: helius-v2-diagnostic
+
+on:
+  push:
+    branches:
+      - agent/event-driven-monitor-v2
+    paths:
+      - .github/workflows/helius-v2-diagnostic.yml
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      HELIUS_API_KEY_V2: ${{ secrets.HELIUS_API_KEY_V2 }}
+    steps:
+      - name: Require V2 secret
+        run: test -n "$HELIUS_API_KEY_V2"
+
+      - name: Probe HTTP RPC and WSS handshake
+        run: |
+          python3 - <<'PY'
+          import base64
+          import json
+          import os
+          import secrets
+          import socket
+          import ssl
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          key = os.environ["HELIUS_API_KEY_V2"].strip()
+          if not key:
+              raise SystemExit("HELIUS_API_KEY_V2 is empty")
+
+          result = {
+              "secret_present": True,
+              "http": {},
+              "wss": {},
+          }
+
+          http_url = "https://mainnet.helius-rpc.com/?api-key=" + urllib.parse.quote(key, safe="")
+          payload = json.dumps({
+              "jsonrpc": "2.0",
+              "id": 1,
+              "method": "getSlot",
+              "params": [{"commitment": "confirmed"}],
+          }).encode()
+          req = urllib.request.Request(
+              http_url,
+              data=payload,
+              headers={"Content-Type": "application/json"},
+              method="POST",
+          )
+          try:
+              with urllib.request.urlopen(req, timeout=15) as resp:
+                  body = json.loads(resp.read().decode())
+                  result["http"] = {
+                      "status": resp.status,
+                      "jsonrpc_ok": isinstance(body.get("result"), int),
+                      "rpc_error": body.get("error"),
+                  }
+          except urllib.error.HTTPError as exc:
+              body = exc.read().decode(errors="replace")[:500]
+              result["http"] = {"status": exc.code, "body": body}
+          except Exception as exc:
+              result["http"] = {"exception": type(exc).__name__, "message": str(exc)}
+
+          host = "mainnet.helius-rpc.com"
+          path = "/?api-key=" + urllib.parse.quote(key, safe="")
+          ws_key = base64.b64encode(secrets.token_bytes(16)).decode()
+          request = (
+              f"GET {path} HTTP/1.1\r\n"
+              f"Host: {host}\r\n"
+              "Upgrade: websocket\r\n"
+              "Connection: Upgrade\r\n"
+              f"Sec-WebSocket-Key: {ws_key}\r\n"
+              "Sec-WebSocket-Version: 13\r\n"
+              "User-Agent: solana-meme-arb-helius-v2-diagnostic\r\n"
+              "\r\n"
+          ).encode()
+          try:
+              raw = socket.create_connection((host, 443), timeout=15)
+              ctx = ssl.create_default_context()
+              with ctx.wrap_socket(raw, server_hostname=host) as sock:
+                  sock.sendall(request)
+                  response = b""
+                  while b"\r\n\r\n" not in response and len(response) < 8192:
+                      chunk = sock.recv(2048)
+                      if not chunk:
+                          break
+                      response += chunk
+              head = response.decode(errors="replace").split("\r\n\r\n", 1)[0]
+              lines = head.splitlines()
+              status_line = lines[0] if lines else ""
+              parts = status_line.split(" ", 2)
+              status = int(parts[1]) if len(parts) >= 2 and parts[1].isdigit() else None
+              result["wss"] = {"status": status, "status_line": status_line}
+          except Exception as exc:
+              result["wss"] = {"exception": type(exc).__name__, "message": str(exc)}
+
+          out = "/tmp/helius-v2-diagnostic.json"
+          with open(out, "w", encoding="utf-8") as fh:
+              json.dump(result, fh, ensure_ascii=False, indent=2)
+          print(json.dumps(result, ensure_ascii=False))
+
+          # Diagnostic itself succeeds even when an endpoint is unhealthy;
+          # the JSON result is the evidence we want to inspect.
+          PY
+
+      - name: Upload sanitized diagnostic
+        uses: actions/upload-artifact@v4
+        with:
+          name: helius-v2-diagnostic
+          path: /tmp/helius-v2-diagnostic.json
+          retention-days: 3
