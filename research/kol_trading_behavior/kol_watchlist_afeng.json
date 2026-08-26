@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "notes": [
+    "阿峰扩样本研究专用 watchlist；仅用于隔离研究请求，不修改主 watchlist。"
+  ],
+  "kols": [
+    {
+      "name": "阿峰",
+      "aliases": ["Afeng", "@aa_AFeng"],
+      "chain": "BNB Chain",
+      "chain_id": "56",
+      "address": "0xbf004bff64725914ee36d03b87d6965b0ced4903",
+      "tier": "primary",
+      "identity_confidence": "high",
+      "manual_confidence": "high",
+      "note": "OKX 有阿峰_Afeng标签；阿峰扩样本研究专用。"
+    }
+  ]
+}
