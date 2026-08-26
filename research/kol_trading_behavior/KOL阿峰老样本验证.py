@@ -45,11 +45,37 @@ def _is_true(v: Any) -> bool:
     return str(v).lower() in ("true", "1")
 
 
+def _evenly_spaced(xs: List[Dict[str, Any]], n: int) -> List[Dict[str, Any]]:
+    """从已按时间排序的序列中覆盖整段地均匀抽样，而不是只取较新一端。"""
+    if n <= 0 or not xs:
+        return []
+    if n >= len(xs):
+        return list(xs)
+    if n == 1:
+        return [xs[len(xs) // 2]]
+    idxs = [round(i * (len(xs) - 1) / (n - 1)) for i in range(n)]
+    # round 在极端小样本可能重复，按顺序去重后再从未选元素补足。
+    out: List[Dict[str, Any]] = []
+    seen_idx = set()
+    for idx in idxs:
+        if idx not in seen_idx:
+            seen_idx.add(idx)
+            out.append(xs[idx])
+    if len(out) < n:
+        for idx, item in enumerate(xs):
+            if idx in seen_idx:
+                continue
+            out.append(item)
+            if len(out) >= n:
+                break
+    return out
+
+
 def discover_old_mints(wallet: str, chain_id: str, limit: int) -> List[Dict[str, Any]]:
     """从钱包级交易历史发现 7-30 天内出现 BUY 的 Mint。
 
     钱包历史按新到旧分页；扫描到 30 天以前即停止。若候选过多，则按
-    7-14 / 14-21 / 21-30 天三个时间层近似均衡抽取，避免又被靠近 7 天的事件占满。
+    7-14 / 14-21 / 21-30 天三个时间层均衡，并在每个时间层内部覆盖整段均匀抽取。
     """
     now_ms = int(time.time() * 1000)
     newest_ms = now_ms - int(MIN_AGE_HOURS * 3_600_000)
@@ -63,7 +89,7 @@ def discover_old_mints(wallet: str, chain_id: str, limit: int) -> List[Dict[str,
     rows_seen = 0
     reached_old_boundary = False
 
-    # mint -> representative BUY row。保留区间内最早看到（时间更老）的 BUY，便于时间分层。
+    # mint -> representative BUY row。保留区间内更老的 BUY，便于时间分层。
     candidates: Dict[str, Dict[str, Any]] = {}
 
     while has_next and pages < 1000:
@@ -137,7 +163,6 @@ def discover_old_mints(wallet: str, chain_id: str, limit: int) -> List[Dict[str,
         time.sleep(0.02)
 
     items = list(candidates.values())
-    # 按发现 BUY 的年龄分三层；若超过 wanted，则尽量均衡取样。
     buckets: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     for item in items:
         age_h = (now_ms - base.inum(item.get("_discovery_buy_ms"))) / 3_600_000
@@ -150,25 +175,38 @@ def discover_old_mints(wallet: str, chain_id: str, limit: int) -> List[Dict[str,
         item["_discovery_age_hours"] = round(age_h, 4)
         buckets[key].append(item)
 
+    # 每层从新到旧排序，但抽样使用 evenly-spaced 覆盖整层。
     for xs in buckets.values():
         xs.sort(key=lambda x: base.inum(x.get("_discovery_buy_ms")), reverse=True)
 
     if len(items) > wanted:
-        selected: List[Dict[str, Any]] = []
         keys = ("7_14d", "14_21d", "21_30d")
-        # round-robin，保证时间层不被单一区间垄断。
-        idx = 0
-        while len(selected) < wanted:
-            added = False
-            for key in keys:
-                xs = buckets.get(key) or []
-                if idx < len(xs) and len(selected) < wanted:
-                    selected.append(xs[idx])
-                    added = True
-            if not added:
-                break
-            idx += 1
-        items = selected
+        base_quota = wanted // len(keys)
+        remainder = wanted % len(keys)
+        selected: List[Dict[str, Any]] = []
+        selected_keys = set()
+        for i, key in enumerate(keys):
+            quota = base_quota + (1 if i < remainder else 0)
+            chosen = _evenly_spaced(buckets.get(key) or [], quota)
+            selected.extend(chosen)
+            selected_keys.update(str(x.get("tokenContractAddress")) for x in chosen)
+
+        # 若某层不足配额，从其余未选候选按时间均匀顺序补足。
+        if len(selected) < wanted:
+            leftovers = [x for x in items if str(x.get("tokenContractAddress")) not in selected_keys]
+            leftovers.sort(key=lambda x: base.inum(x.get("_discovery_buy_ms")), reverse=True)
+            selected.extend(_evenly_spaced(leftovers, wanted - len(selected)))
+        items = selected[:wanted]
+
+    sampled_ranges = {}
+    for key in ("7_14d", "14_21d", "21_30d"):
+        chosen = [x for x in items if (
+            (key == "7_14d" and float(x.get("_discovery_age_hours") or 0) < 336)
+            or (key == "14_21d" and 336 <= float(x.get("_discovery_age_hours") or 0) < 504)
+            or (key == "21_30d" and float(x.get("_discovery_age_hours") or 0) >= 504)
+        )]
+        ages = [float(x.get("_discovery_age_hours") or 0) for x in chosen]
+        sampled_ranges[key] = (round(min(ages), 2), round(max(ages), 2), len(ages)) if ages else None
 
     print(
         "AFENG_OLD_DISCOVERY "
@@ -176,7 +214,7 @@ def discover_old_mints(wallet: str, chain_id: str, limit: int) -> List[Dict[str,
         f"7_14d={len(buckets.get('7_14d') or [])} "
         f"14_21d={len(buckets.get('14_21d') or [])} "
         f"21_30d={len(buckets.get('21_30d') or [])} "
-        f"reached_30d={reached_old_boundary}"
+        f"sampled_ranges={sampled_ranges} reached_30d={reached_old_boundary}"
     )
     return items
 
@@ -249,6 +287,7 @@ def summarize(events: List[Dict[str, Any]]) -> Dict[str, Any]:
     out["afeng_old_validation"] = {
         "window": "7-30d",
         "rules_frozen_before_old_sample": True,
+        "sampling": "equal-quota 7-14/14-21/21-30d; evenly spaced within each discovery-time bucket",
         "rule_A_fast_1s": _rule_metrics(valid),
         "rule_B_fast_1s_premium_le5pct": _rule_metrics(rule_b),
         "time_buckets": {
@@ -265,5 +304,5 @@ v2.analyze_event = analyze_event
 v2.summarize = summarize
 
 if __name__ == "__main__":
-    print("AFENG_OLD_VALIDATION_ACTIVE 1")
+    print("AFENG_OLD_VALIDATION_ACTIVE 2")
     v2.main()
