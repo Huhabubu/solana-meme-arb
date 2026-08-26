@@ -14,55 +14,88 @@ permissions:
   contents: read
 
 jobs:
-  bnb-study:
+  bnb-primary-study:
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    timeout-minutes: 45
     steps:
       - name: Checkout
         uses: actions/checkout@v7
 
-      - name: Run BNB KOL first-buy study
+      - name: Run BNB primary KOL study
         run: |
           python "research/kol_trading_behavior/KOL首买事件研究.py" \
             --chains 56 \
-            --tiers primary,secondary \
-            --recent-mints 5 \
+            --tiers primary \
+            --recent-mints 20 \
             --min-first-buy-usd 100 \
-            --max-event-age-hours 48 \
-            --max-kol-history-rows 300 \
+            --max-event-age-hours 168 \
+            --max-follower-event-age-hours 72 \
+            --max-kol-history-rows 600 \
             --pre-window-seconds 5 \
             --post-window-seconds 300 \
-            --max-market-pages 160 \
-            --output-dir /tmp/kol-first-buy-bnb
+            --max-market-pages 120 \
+            --output-dir /tmp/kol-first-buy-bnb-primary
 
-      - name: Upload BNB study
+      - name: Upload BNB primary study
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: kol-first-buy-bnb-${{ github.sha }}
-          path: /tmp/kol-first-buy-bnb/
+          name: kol-first-buy-bnb-primary-${{ github.sha }}
+          path: /tmp/kol-first-buy-bnb-primary/
+          if-no-files-found: warn
+          retention-days: 14
+
+  bnb-secondary-study:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Run BNB secondary KOL study
+        run: |
+          python "research/kol_trading_behavior/KOL首买事件研究.py" \
+            --chains 56 \
+            --tiers secondary \
+            --recent-mints 20 \
+            --min-first-buy-usd 100 \
+            --max-event-age-hours 168 \
+            --max-follower-event-age-hours 72 \
+            --max-kol-history-rows 600 \
+            --pre-window-seconds 5 \
+            --post-window-seconds 300 \
+            --max-market-pages 120 \
+            --output-dir /tmp/kol-first-buy-bnb-secondary
+
+      - name: Upload BNB secondary study
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: kol-first-buy-bnb-secondary-${{ github.sha }}
+          path: /tmp/kol-first-buy-bnb-secondary/
           if-no-files-found: warn
           retention-days: 14
 
   solana-candidate-study:
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 35
     steps:
       - name: Checkout
         uses: actions/checkout@v7
 
-      - name: Run Solana candidate first-buy study
+      - name: Run Solana candidate study
         run: |
           python "research/kol_trading_behavior/KOL首买事件研究.py" \
             --chains 501 \
             --tiers solana_candidate \
-            --recent-mints 3 \
+            --recent-mints 10 \
             --min-first-buy-usd 50 \
-            --max-event-age-hours 48 \
-            --max-kol-history-rows 300 \
+            --max-event-age-hours 168 \
+            --max-follower-event-age-hours 72 \
+            --max-kol-history-rows 600 \
             --pre-window-seconds 5 \
             --post-window-seconds 300 \
-            --max-market-pages 120 \
+            --max-market-pages 100 \
             --output-dir /tmp/kol-first-buy-solana
 
       - name: Upload Solana study
