@@ -34,7 +34,7 @@ jobs:
             --pre-window-seconds 5 \
             --post-window-seconds 300 \
             --max-market-pages 30 \
-            --workers 4 \
+            --workers 3 \
             --output-dir /tmp/kol-first-buy-bnb-primary
 
       - name: Upload BNB primary study
@@ -66,7 +66,7 @@ jobs:
             --pre-window-seconds 5 \
             --post-window-seconds 300 \
             --max-market-pages 30 \
-            --workers 4 \
+            --workers 3 \
             --output-dir /tmp/kol-first-buy-bnb-secondary
 
       - name: Upload BNB secondary study
@@ -98,7 +98,7 @@ jobs:
             --pre-window-seconds 5 \
             --post-window-seconds 300 \
             --max-market-pages 30 \
-            --workers 3 \
+            --workers 2 \
             --output-dir /tmp/kol-first-buy-solana
 
       - name: Upload Solana study
