@@ -82,10 +82,10 @@ jobs:
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         timeout-minutes: 2
         env:
-          HELIUS_API_KEY: ${{ secrets.HELIUS_API_KEY }}
+          HELIUS_API_KEY_V2: ${{ secrets.HELIUS_API_KEY_V2 }}
         run: |
-          if [ -z "$HELIUS_API_KEY" ]; then
-            echo "HELIUS_API_KEY secret is not configured; V1 live verification skipped."
+          if [ -z "$HELIUS_API_KEY_V2" ]; then
+            echo "HELIUS_API_KEY_V2 secret is not configured; V1 live verification skipped."
             exit 0
           fi
           cargo run -- helius-check
@@ -95,10 +95,10 @@ jobs:
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         timeout-minutes: 2
         env:
-          HELIUS_API_KEY: ${{ secrets.HELIUS_API_KEY }}
+          HELIUS_API_KEY_V2: ${{ secrets.HELIUS_API_KEY_V2 }}
         run: |
-          if [ -z "$HELIUS_API_KEY" ]; then
-            echo "HELIUS_API_KEY secret is not configured; V2 Raydium live verification skipped."
+          if [ -z "$HELIUS_API_KEY_V2" ]; then
+            echo "HELIUS_API_KEY_V2 secret is not configured; V2 Raydium live verification skipped."
             exit 0
           fi
           cargo run -- raydium-quote-check
@@ -108,10 +108,10 @@ jobs:
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         timeout-minutes: 2
         env:
-          HELIUS_API_KEY: ${{ secrets.HELIUS_API_KEY }}
+          HELIUS_API_KEY_V2: ${{ secrets.HELIUS_API_KEY_V2 }}
         run: |
-          if [ -z "$HELIUS_API_KEY" ]; then
-            echo "HELIUS_API_KEY secret is not configured; V2 Orca live verification skipped."
+          if [ -z "$HELIUS_API_KEY_V2" ]; then
+            echo "HELIUS_API_KEY_V2 secret is not configured; V2 Orca live verification skipped."
             exit 0
           fi
           cargo run -- orca-quote-check
@@ -121,10 +121,10 @@ jobs:
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         timeout-minutes: 2
         env:
-          HELIUS_API_KEY: ${{ secrets.HELIUS_API_KEY }}
+          HELIUS_API_KEY_V2: ${{ secrets.HELIUS_API_KEY_V2 }}
         run: |
-          if [ -z "$HELIUS_API_KEY" ]; then
-            echo "HELIUS_API_KEY secret is not configured; V2 Meteora live verification skipped."
+          if [ -z "$HELIUS_API_KEY_V2" ]; then
+            echo "HELIUS_API_KEY_V2 secret is not configured; V2 Meteora live verification skipped."
             exit 0
           fi
           cargo run -- meteora-quote-check
@@ -134,25 +134,24 @@ jobs:
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         timeout-minutes: 3
         env:
-          HELIUS_API_KEY: ${{ secrets.HELIUS_API_KEY }}
+          HELIUS_API_KEY_V2: ${{ secrets.HELIUS_API_KEY_V2 }}
         run: |
-          if [ -z "$HELIUS_API_KEY" ]; then
-            echo "HELIUS_API_KEY secret is not configured; V3 multi-size round-trip verification skipped."
+          if [ -z "$HELIUS_API_KEY_V2" ]; then
+            echo "HELIUS_API_KEY_V2 secret is not configured; V3 multi-size round-trip verification skipped."
             exit 0
           fi
           cargo run -- round-trip-check
 
-      # V3.5/V3.6：真实 WSS update → affected Pool Context → related routes → OpportunityEvent；
-      # 同一步把事件追加写到临时 JSONL，再由程序重读并汇总，验证持久化链路。
+      # V3.5/V3.6 旧账户更新回归仍保留，确保本地 QuoteState/OpportunityEvent 数学没有被事件入口改坏。
       - name: Live V3 dependency-triggered opportunity and persistence verification
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         timeout-minutes: 4
         env:
-          HELIUS_API_KEY: ${{ secrets.HELIUS_API_KEY }}
+          HELIUS_API_KEY_V2: ${{ secrets.HELIUS_API_KEY_V2 }}
           OPPORTUNITY_LOG_PATH: ${{ runner.temp }}/opportunity-events.jsonl
         run: |
-          if [ -z "$HELIUS_API_KEY" ]; then
-            echo "HELIUS_API_KEY secret is not configured; V3.6 opportunity persistence verification skipped."
+          if [ -z "$HELIUS_API_KEY_V2" ]; then
+            echo "HELIUS_API_KEY_V2 secret is not configured; V3.6 opportunity persistence verification skipped."
             exit 0
           fi
           rm -f "$OPPORTUNITY_LOG_PATH"
@@ -160,26 +159,29 @@ jobs:
           test -s "$OPPORTUNITY_LOG_PATH"
           echo "V3.6 JSONL line count: $(wc -l < "$OPPORTUNITY_LOG_PATH")"
 
-      # V3.6.2：同一个进程/同一个 WSS session 连续处理至少 2 条真实账户更新。
-      # 最终日志必须证明两条都在同一 session 内完成，并持续追加到同一个 JSONL。
-      - name: Live V3.6.2 continuous opportunity monitor verification
+      # V4：交易事件动态解析 Mint → 动态池发现 → event_slot 之后的同-context池快照 → 双向报价。
+      # 继续接受旧 OPPORTUNITY_* 环境变量，避免部署脚本与本次切换必须原子更新。
+      - name: Live V4 event-driven dynamic Mint monitor verification
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         timeout-minutes: 4
         env:
-          HELIUS_API_KEY: ${{ secrets.HELIUS_API_KEY }}
-          OPPORTUNITY_LOG_PATH: ${{ runner.temp }}/opportunity-monitor.jsonl
+          HELIUS_API_KEY_V2: ${{ secrets.HELIUS_API_KEY_V2 }}
+          OPPORTUNITY_LOG_PATH: ${{ runner.temp }}/event-driven-monitor.jsonl
           OPPORTUNITY_MONITOR_UPDATES: "2"
           OPPORTUNITY_MONITOR_MAX_SECONDS: "120"
           OPPORTUNITY_MONITOR_UPDATE_TIMEOUT_SECONDS: "45"
           OPPORTUNITY_MONITOR_MAX_RECONNECTS: "2"
         run: |
-          if [ -z "$HELIUS_API_KEY" ]; then
-            echo "HELIUS_API_KEY secret is not configured; V3.6.2 continuous monitor verification skipped."
+          if [ -z "$HELIUS_API_KEY_V2" ]; then
+            echo "HELIUS_API_KEY_V2 secret is not configured; V4 event monitor verification skipped."
             exit 0
           fi
           rm -f "$OPPORTUNITY_LOG_PATH"
-          cargo run -- opportunity-monitor 2>&1 | tee "$RUNNER_TEMP/opportunity-monitor.log"
+          cargo run -- opportunity-monitor 2>&1 | tee "$RUNNER_TEMP/event-driven-monitor.log"
           test -s "$OPPORTUNITY_LOG_PATH"
-          grep -q 'processed_updates=2' "$RUNNER_TEMP/opportunity-monitor.log"
-          grep -q 'max_updates_in_single_session=2' "$RUNNER_TEMP/opportunity-monitor.log"
-          echo "V3.6.2 continuous JSONL line count: $(wc -l < "$OPPORTUNITY_LOG_PATH")"
+          grep -q 'Event-driven V2 started:.*fixed_mints=0' "$RUNNER_TEMP/event-driven-monitor.log"
+          grep -q 'accepted_events=2' "$RUNNER_TEMP/event-driven-monitor.log"
+          grep -q 'fixed_mints=0' "$RUNNER_TEMP/event-driven-monitor.log"
+          grep -q '"quote_status"' "$OPPORTUNITY_LOG_PATH"
+          grep -q '"event_slot"' "$OPPORTUNITY_LOG_PATH"
+          echo "V4 event-driven JSONL line count: $(wc -l < "$OPPORTUNITY_LOG_PATH")"
