@@ -1,0 +1,138 @@
+name: kol-api-probe
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/kol-api-probe.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Probe OKX KOL APIs
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          import time
+          import urllib.parse
+          import urllib.request
+
+          WALLET = "MRiYA4oN3158fCV8evhuCofrDzbHyYvYnGZUDJvoCsa"
+          MINT = "AFbX8oGjGpmVFywbVouvhQSRmiW2aR1mohfahi4Y2AdB"
+          UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+
+          def get_json(url, headers=None, timeout=15):
+              req = urllib.request.Request(url, headers=headers or {}, method="GET")
+              with urllib.request.urlopen(req, timeout=timeout) as r:
+                  body = r.read().decode("utf-8")
+                  return r.status, json.loads(body)
+
+          def post_json(url, payload, headers=None, timeout=15):
+              data = json.dumps(payload).encode("utf-8")
+              h = {"Content-Type": "application/json"}
+              h.update(headers or {})
+              req = urllib.request.Request(url, data=data, headers=h, method="POST")
+              with urllib.request.urlopen(req, timeout=timeout) as r:
+                  body = r.read().decode("utf-8")
+                  return r.status, json.loads(body)
+
+          common_headers = {
+              "User-Agent": UA,
+              "Accept": "application/json",
+          }
+
+          # 1) 钱包 -> 按 Mint 聚合的 PnL 列表
+          pnl_params = {
+              "walletAddress": WALLET,
+              "chainId": "501",
+              "isAsc": "false",
+              "sortType": "1",
+              "offset": "0",
+              "limit": "10",
+              "filterRisk": "true",
+              "filterSmallBalance": "false",
+              "t": str(int(time.time() * 1000)),
+          }
+          pnl_url = "https://web3.okx.com/priapi/v1/dx/market/v2/pnl/token-list?" + urllib.parse.urlencode(pnl_params)
+          pnl_headers = dict(common_headers)
+          pnl_headers["Referer"] = "https://web3.okx.com/zh-hans/market/pnl/wallet-profile"
+          status, pnl = get_json(pnl_url, pnl_headers)
+          print("PNL_HTTP", status)
+          print("PNL_CODE", pnl.get("code"))
+          token_list = ((pnl.get("data") or {}).get("tokenList") or [])
+          print("PNL_TOKEN_COUNT", len(token_list))
+          for x in token_list[:10]:
+              print("PNL_ROW", json.dumps({
+                  "symbol": x.get("tokenSymbol"),
+                  "mint": x.get("tokenContractAddress"),
+                  "buy_count": x.get("totalTxBuy"),
+                  "sell_count": x.get("totalTxSell"),
+                  "buy_volume": x.get("buyVolume"),
+                  "sell_volume": x.get("sellVolume"),
+                  "latest_time": x.get("latestTime"),
+                  "total_pnl": x.get("totalPnl"),
+              }, ensure_ascii=False))
+
+          if str(pnl.get("code")) != "0" or not token_list:
+              raise SystemExit("pnl/token-list probe failed")
+
+          # 2) Mint 历史成交：比较 userAddressList=[] 与 [KOL]
+          trade_url = "https://web3.okx.com/priapi/v1/dx/market/v2/trading-history/filter-list?t=" + str(int(time.time() * 1000))
+          trade_headers = dict(common_headers)
+          trade_headers["Referer"] = "https://web3.okx.com/zh-hans/market/dex"
+
+          def trade_payload(users):
+              return {
+                  "desc": True,
+                  "orderBy": "timestamp",
+                  "limit": 30,
+                  "tradingHistoryFilter": {
+                      "chainId": "501",
+                      "tokenContractAddress": MINT,
+                      "type": "0",
+                      "currentUserWalletAddress": "",
+                      "userAddressList": users,
+                      "volumeMin": "", "volumeMax": "",
+                      "priceMin": "", "priceMax": "",
+                      "amountMin": "", "amountMax": "",
+                  },
+              }
+
+          s0, all_resp = post_json(trade_url, trade_payload([]), trade_headers)
+          s1, filtered_resp = post_json(trade_url, trade_payload([WALLET]), trade_headers)
+          print("TRADES_ALL_HTTP", s0, "CODE", all_resp.get("code"))
+          print("TRADES_FILTERED_HTTP", s1, "CODE", filtered_resp.get("code"))
+
+          all_rows = ((all_resp.get("data") or {}).get("list") or [])
+          filtered_rows = ((filtered_resp.get("data") or {}).get("list") or [])
+          all_addrs = [str(r.get("userAddress") or "") for r in all_rows]
+          filtered_addrs = [str(r.get("userAddress") or "") for r in filtered_rows]
+          target = WALLET.lower()
+
+          print("TRADES_ALL_COUNT", len(all_rows))
+          print("TRADES_ALL_TARGET_COUNT", sum(a.lower() == target for a in all_addrs))
+          print("TRADES_FILTERED_COUNT", len(filtered_rows))
+          print("TRADES_FILTERED_TARGET_COUNT", sum(a.lower() == target for a in filtered_addrs))
+          print("TRADES_FILTERED_UNIQUE_ADDRESSES", len(set(a.lower() for a in filtered_addrs if a)))
+          print("USER_ADDRESS_LIST_SERVER_FILTER_EFFECTIVE", bool(filtered_rows) and all(a.lower() == target for a in filtered_addrs if a))
+
+          for r in filtered_rows[:10]:
+              print("FILTERED_ROW", json.dumps({
+                  "timestamp": r.get("timestamp"),
+                  "userAddress": r.get("userAddress"),
+                  "isBuy": r.get("isBuy"),
+                  "volume": r.get("volume"),
+                  "price": r.get("price"),
+                  "id": r.get("id"),
+              }, ensure_ascii=False))
+
+          if str(all_resp.get("code")) != "0" or str(filtered_resp.get("code")) != "0":
+              raise SystemExit("trading-history probe failed")
+          PY
