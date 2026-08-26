@@ -33,15 +33,15 @@ jobs:
           cargo clippy --all-targets --locked -- -D warnings
           cargo test --all-targets --locked
 
-      - name: Commit upgraded event schema
+      - name: Commit upgraded event source
         run: |
-          if git diff --quiet; then
+          if git diff --quiet -- src/event_monitor_v2.rs; then
             echo "No source changes to commit"
             exit 0
           fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add src/event_monitor_v2.rs .github/workflows/event-live-smoke.yml
+          git add src/event_monitor_v2.rs
           git commit -m "feat: attribute large swaps to trigger pools"
           git push origin HEAD:agent/event-driven-monitor-v2
 
