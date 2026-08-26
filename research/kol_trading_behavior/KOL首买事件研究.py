@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""KOL 首买事件研究（只读）。
+"""KOL 首笔建仓事件研究（只读）。
 
 研究问题：公开 KOL 对某 Mint 的历史首笔明显买入出现后，延迟 1/2/3/5/10 秒
 跟入，价格路径是否仍有正收益窗口；同时比较 KOL 自身收益、跟单压力和跟随者收益。
 
-口径：
+数据口径：
 - pnl/token-list 只用于发现近期活跃 Mint，并保留其 PnL 字段作为参考；不使用网页/PnL 的交易次数。
 - trading-history/filter-list + userAddressList=[KOL] 恢复 KOL×Mint 历史成交。
-- userAddressList=[] 恢复事件附近全市场逐笔成交，统计跟单压力。
+- 全市场逐笔使用 startTime/endTime + dataId 时间戳直接定位事件窗口。
+- OKX 实测 trading-history 单页有效上限为 100；同一 cursor 链顺序分页，不并发同一 Mint 的页。
+- 不同 Mint/Event 可以并行处理。
 - 价格路径优先使用 OKX 1 秒 K 线；若 K 线窗口不可用，仅在逐笔窗口完整时回退逐笔价格。
 - KOL 首买->首卖收益按逐笔实际成交价计算。
 - 整轮 KOL 收益仅在按成交数量估算剩余仓位 <=1% 时，将 SELL USD - BUY USD 视为已完成轮次毛收益。
@@ -22,9 +24,11 @@ import json
 import math
 import statistics
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -35,6 +39,7 @@ UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 )
+TRADE_PAGE_LIMIT = 100
 DELAYS_S = (1, 2, 3, 5, 10)
 HORIZONS_S = (5, 10, 20, 30, 60, 300)
 PRESSURE_WINDOWS_S = (1, 3, 5, 10)
@@ -61,6 +66,9 @@ def tx_hash(row: Optional[Dict[str, Any]]) -> Optional[str]:
         value = row.get(key)
         if value:
             return str(value)
+    url = row.get("txHashUrl")
+    if url:
+        return str(url).rstrip("/").split("/")[-1]
     return None
 
 
@@ -70,24 +78,29 @@ def request_json(
     method: str = "GET",
     payload: Optional[Dict[str, Any]] = None,
     referer: str,
-    retries: int = 3,
-    timeout: int = 15,
+    retries: int = 4,
+    timeout: int = 20,
 ) -> Tuple[int, Dict[str, Any]]:
     headers = {"User-Agent": UA, "Accept": "application/json", "Referer": referer}
     data = None
     if payload is not None:
         data = json.dumps(payload).encode("utf-8")
         headers["Content-Type"] = "application/json"
+
     last: Optional[Exception] = None
     for attempt in range(retries):
         try:
             req = urllib.request.Request(url, data=data, headers=headers, method=method)
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 return resp.status, json.loads(resp.read().decode("utf-8"))
-        except Exception as exc:  # noqa: BLE001
+        except urllib.error.HTTPError as exc:
             last = exc
-            if attempt + 1 < retries:
-                time.sleep(0.5 * (attempt + 1))
+            if exc.code not in (408, 425, 429, 500, 502, 503, 504):
+                break
+        except Exception as exc:  # noqa: BLE001 - standalone research script
+            last = exc
+        if attempt + 1 < retries:
+            time.sleep(0.6 * (2 ** attempt))
     raise RuntimeError(f"request failed after {retries} attempts: {last}")
 
 
@@ -112,32 +125,61 @@ def fetch_recent_mints(wallet: str, chain_id: str, limit: int) -> List[Dict[str,
     return ((body.get("data") or {}).get("tokenList") or [])
 
 
-def trade_payload(chain_id: str, mint: str, users: List[str], data_id: Optional[str]) -> Dict[str, Any]:
+def trade_payload(
+    chain_id: str,
+    mint: str,
+    users: List[str],
+    data_id: Optional[str],
+    *,
+    limit: int = TRADE_PAGE_LIMIT,
+    start_ms: Optional[int] = None,
+    end_ms: Optional[int] = None,
+) -> Dict[str, Any]:
+    filters: Dict[str, Any] = {
+        "chainId": chain_id,
+        "tokenContractAddress": mint,
+        "type": "0",
+        "currentUserWalletAddress": "",
+        "userAddressList": users,
+        "volumeMin": "", "volumeMax": "",
+        "priceMin": "", "priceMax": "",
+        "amountMin": "", "amountMax": "",
+    }
+    # GitHub Runner 2026-08-26 实测：这两个字段会在服务端按时间过滤。
+    if start_ms is not None:
+        filters["startTime"] = int(start_ms)
+    if end_ms is not None:
+        filters["endTime"] = int(end_ms)
+
     out: Dict[str, Any] = {
         "desc": True,
         "orderBy": "timestamp",
-        "limit": 30,
-        "tradingHistoryFilter": {
-            "chainId": chain_id,
-            "tokenContractAddress": mint,
-            "type": "0",
-            "currentUserWalletAddress": "",
-            "userAddressList": users,
-            "volumeMin": "", "volumeMax": "",
-            "priceMin": "", "priceMax": "",
-            "amountMin": "", "amountMax": "",
-        },
+        "limit": max(1, min(int(limit), TRADE_PAGE_LIMIT)),
+        "tradingHistoryFilter": filters,
     }
-    if data_id:
-        out["dataId"] = data_id
+    # 实测 dataId 可直接传毫秒时间戳；后续页继续用服务端返回的复合 id。
+    if data_id is not None:
+        out["dataId"] = str(data_id)
     return out
 
 
-def fetch_trade_page(chain_id: str, mint: str, users: List[str], data_id: Optional[str]) -> Dict[str, Any]:
+def fetch_trade_page(
+    chain_id: str,
+    mint: str,
+    users: List[str],
+    data_id: Optional[str],
+    *,
+    limit: int = TRADE_PAGE_LIMIT,
+    start_ms: Optional[int] = None,
+    end_ms: Optional[int] = None,
+) -> Dict[str, Any]:
     status, body = request_json(
         TRADE_URL + "?t=" + str(int(time.time() * 1000)),
         method="POST",
-        payload=trade_payload(chain_id, mint, users, data_id),
+        payload=trade_payload(
+            chain_id, mint, users, data_id,
+            limit=limit, start_ms=start_ms, end_ms=end_ms,
+        ),
         referer="https://web3.okx.com/zh-hans/market/dex",
     )
     if status != 200 or str(body.get("code")) != "0":
@@ -157,13 +199,20 @@ def dedup_rows(rows: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return list(out.values())
 
 
-def fetch_kol_history(wallet: str, chain_id: str, mint: str, max_rows: int) -> Tuple[List[Dict[str, Any]], bool]:
+def fetch_kol_history(
+    wallet: str,
+    chain_id: str,
+    mint: str,
+    max_rows: int,
+) -> Tuple[List[Dict[str, Any]], bool, int]:
     rows: List[Dict[str, Any]] = []
     data_id: Optional[str] = None
     complete = False
     pages = 0
-    while len(rows) < max_rows and pages < 300:
-        data = fetch_trade_page(chain_id, mint, [wallet], data_id)
+    max_pages = max(1, math.ceil(max_rows / TRADE_PAGE_LIMIT) + 1)
+
+    while len(rows) < max_rows and pages < max_pages:
+        data = fetch_trade_page(chain_id, mint, [wallet], data_id, limit=TRADE_PAGE_LIMIT)
         page = data.get("list") or []
         if not page:
             complete = True
@@ -176,9 +225,12 @@ def fetch_kol_history(wallet: str, chain_id: str, mint: str, max_rows: int) -> T
             break
         if not next_id or next_id == data_id:
             break
-        data_id = next_id
-        time.sleep(0.025)
-    return dedup_rows(rows)[:max_rows], complete
+        data_id = str(next_id)
+        time.sleep(0.01)
+
+    rows = dedup_rows(rows)
+    rows.sort(key=lambda r: inum(r.get("timestamp")))
+    return rows[:max_rows], complete, pages
 
 
 def fetch_market_window(
@@ -188,35 +240,63 @@ def fetch_market_window(
     end_ms: int,
     max_pages: int,
 ) -> Tuple[List[Dict[str, Any]], bool, int]:
+    """直接定位 [start_ms, end_ms]；不再从最新成交一路向过去扫描。"""
     rows: List[Dict[str, Any]] = []
-    data_id: Optional[str] = None
+    # 实测裸毫秒时间戳可作为 dataId，第一请求直接跳到 end_ms 附近。
+    data_id: Optional[str] = str(end_ms)
     pages = 0
-    covered_start = False
+    complete = False
+
     while pages < max_pages:
-        data = fetch_trade_page(chain_id, mint, [], data_id)
+        data = fetch_trade_page(
+            chain_id,
+            mint,
+            [],
+            data_id,
+            limit=TRADE_PAGE_LIMIT,
+            start_ms=start_ms,
+            end_ms=end_ms,
+        )
         page = data.get("list") or []
-        if not page:
-            break
         pages += 1
-        oldest = min(inum(r.get("timestamp")) for r in page)
+
+        # 时间过滤后的空页代表窗口内没有更多成交，本窗口完整。
+        if not page:
+            complete = True
+            break
+
         for r in page:
             ts = inum(r.get("timestamp"))
             if start_ms <= ts <= end_ms:
                 rows.append(r)
+
+        oldest = min(inum(r.get("timestamp")) for r in page)
         if oldest <= start_ms:
-            covered_start = True
+            complete = True
             break
+
         next_id = page[-1].get("id")
-        if str(data.get("hasMore", "0")) != "1" or not next_id or next_id == data_id:
+        has_more = str(data.get("hasMore", "0")) == "1"
+        if not has_more:
+            # 因为 startTime/endTime 已在服务端过滤，hasMore=0 即窗口已取完。
+            complete = True
             break
-        data_id = next_id
-        time.sleep(0.015)
+        if not next_id or str(next_id) == str(data_id):
+            break
+        data_id = str(next_id)
+        time.sleep(0.005)
+
     rows = dedup_rows(rows)
     rows.sort(key=lambda r: inum(r.get("timestamp")))
-    return rows, covered_start, pages
+    return rows, complete, pages
 
 
-def fetch_candles(chain_id: str, mint: str, start_ms: int, end_ms: int) -> Tuple[List[Dict[str, float]], bool]:
+def fetch_candles(
+    chain_id: str,
+    mint: str,
+    start_ms: int,
+    end_ms: int,
+) -> Tuple[List[Dict[str, float]], bool]:
     limit = min(1000, max(420, int((end_ms - start_ms) / 1000) + 60))
     params = {
         "chainId": chain_id,
@@ -232,6 +312,7 @@ def fetch_candles(chain_id: str, mint: str, start_ms: int, end_ms: int) -> Tuple
     )
     if status != 200 or str(body.get("code")) != "0":
         return [], False
+
     rows: List[Dict[str, float]] = []
     for item in body.get("data") or []:
         if not isinstance(item, list) or len(item) < 5:
@@ -240,13 +321,18 @@ def fetch_candles(chain_id: str, mint: str, start_ms: int, end_ms: int) -> Tuple
         if start_ms <= ts <= end_ms + 2000:
             rows.append({
                 "timestamp": float(ts),
-                "open": fnum(item[1]), "high": fnum(item[2]),
-                "low": fnum(item[3]), "close": fnum(item[4]),
+                "open": fnum(item[1]),
+                "high": fnum(item[2]),
+                "low": fnum(item[3]),
+                "close": fnum(item[4]),
             })
     rows.sort(key=lambda r: int(r["timestamp"]))
     if not rows:
         return [], False
-    covered = int(rows[0]["timestamp"]) <= start_ms + 5000 and int(rows[-1]["timestamp"]) >= end_ms - 5000
+    covered = (
+        int(rows[0]["timestamp"]) <= start_ms + 5000
+        and int(rows[-1]["timestamp"]) >= end_ms - 5000
+    )
     return rows, covered
 
 
@@ -271,7 +357,11 @@ def token_qty(r: Dict[str, Any]) -> float:
     return (v / p) if p and p > 0 and v > 0 else 0.0
 
 
-def first_trade_after(rows: List[Dict[str, Any]], target_ms: int, wait_ms: int = 5000) -> Optional[Dict[str, Any]]:
+def first_trade_after(
+    rows: List[Dict[str, Any]],
+    target_ms: int,
+    wait_ms: int = 5000,
+) -> Optional[Dict[str, Any]]:
     end = target_ms + wait_ms
     for r in rows:
         ts = inum(r.get("timestamp"))
@@ -282,7 +372,11 @@ def first_trade_after(rows: List[Dict[str, Any]], target_ms: int, wait_ms: int =
     return None
 
 
-def candle_price(rows: List[Dict[str, float]], target_ms: int, tolerance_ms: int = 5000) -> Optional[float]:
+def candle_price(
+    rows: List[Dict[str, float]],
+    target_ms: int,
+    tolerance_ms: int = 5000,
+) -> Optional[float]:
     best: Optional[Tuple[int, float]] = None
     for r in rows:
         d = abs(int(r["timestamp"]) - target_ms)
@@ -362,6 +456,7 @@ def analyze_event(
     pnl_item: Dict[str, Any],
     history: List[Dict[str, Any]],
     history_complete: bool,
+    history_pages: int,
     args: argparse.Namespace,
 ) -> Optional[Dict[str, Any]]:
     wallet = kol["address"]
@@ -371,11 +466,13 @@ def analyze_event(
     buys = [r for r in chron if is_buy(r)]
     if not buys:
         return None
+
     first = buys[0]
     first_usd = fnum(first.get("volume"))
     t0 = inum(first.get("timestamp"))
     if first_usd < args.min_first_buy_usd:
         return None
+
     age_h = (int(time.time() * 1000) - t0) / 3_600_000 if t0 else math.inf
     if age_h < 0 or age_h > args.max_event_age_hours:
         return None
@@ -386,54 +483,78 @@ def analyze_event(
     sell_ts = inum(first_sell.get("timestamp")) if first_sell else None
     sell_delay = (sell_ts - t0) / 1000 if sell_ts else None
     before_sell_buys = [
-        r for r in later if is_buy(r) and (sell_ts is None or inum(r.get("timestamp")) < sell_ts)
+        r for r in later
+        if is_buy(r) and (sell_ts is None or inum(r.get("timestamp")) < sell_ts)
     ]
     probes = [r for r in before_sell_buys if fnum(r.get("volume")) <= first_usd * 0.10]
     probe_hashes = [tx_hash(r) for r in probes if tx_hash(r)]
 
     start = t0 - args.pre_window_seconds * 1000
     end = t0 + args.post_window_seconds * 1000
+
+    candle_t0 = time.perf_counter()
     try:
         candles, candle_complete = fetch_candles(chain_id, mint, start, end)
     except Exception:  # noqa: BLE001
         candles, candle_complete = [], False
+    candle_fetch_s = time.perf_counter() - candle_t0
 
     market: List[Dict[str, Any]] = []
     market_complete = False
     market_pages = 0
+    market_fetch_s: Optional[float] = None
     if age_h <= args.max_follower_event_age_hours:
+        market_t0 = time.perf_counter()
         try:
             market, market_complete, market_pages = fetch_market_window(
                 chain_id, mint, start, end, args.max_market_pages
             )
         except Exception:  # noqa: BLE001
             market, market_complete, market_pages = [], False, 0
+        market_fetch_s = time.perf_counter() - market_t0
 
     price_source = "kline_1s" if candle_complete else ("market_trades" if market_complete else None)
     price_complete = price_source is not None
     first_sell_ret = bps(row_price(first), row_price(first_sell))
 
     event: Dict[str, Any] = {
-        "kol": kol["name"], "kol_address": wallet,
-        "chain": kol["chain"], "chain_id": chain_id, "tier": kol["tier"],
-        "symbol": pnl_item.get("tokenSymbol"), "mint": mint,
-        "t0_ms": t0, "event_age_hours": round(age_h, 4),
-        "first_buy_usd": round(first_usd, 6), "first_buy_price": row_price(first),
-        "first_buy_id": first.get("id"), "first_buy_tx_hash": tx_hash(first),
-        "history_rows": len(chron), "history_complete": history_complete,
-        "kol_buy_rows": len(buys), "kol_sell_rows": len([r for r in chron if not is_buy(r)]),
+        "kol": kol["name"],
+        "kol_address": wallet,
+        "chain": kol["chain"],
+        "chain_id": chain_id,
+        "tier": kol["tier"],
+        "symbol": pnl_item.get("tokenSymbol"),
+        "mint": mint,
+        "t0_ms": t0,
+        "event_age_hours": round(age_h, 4),
+        "first_buy_usd": round(first_usd, 6),
+        "first_buy_price": row_price(first),
+        "first_buy_id": first.get("id"),
+        "first_buy_tx_hash": tx_hash(first),
+        "history_rows": len(chron),
+        "history_complete": history_complete,
+        "history_pages": history_pages,
+        "kol_buy_rows": len(buys),
+        "kol_sell_rows": len([r for r in chron if not is_buy(r)]),
         "first_sell_delay_s": round(sell_delay, 3) if sell_delay is not None else None,
         "first_sell_usd": round(fnum(first_sell.get("volume")), 6) if first_sell else None,
-        "first_sell_price": row_price(first_sell), "first_sell_tx_hash": tx_hash(first_sell),
+        "first_sell_price": row_price(first_sell),
+        "first_sell_tx_hash": tx_hash(first_sell),
         "kol_first_buy_to_first_sell_bps": round(first_sell_ret, 3) if first_sell_ret is not None else None,
         "pre_first_sell_extra_buys": len(before_sell_buys),
         "pre_first_sell_small_probe_buys": len(probes),
         "small_probe_buy_usd": [round(fnum(r.get("volume")), 6) for r in probes[:50]],
         "small_probe_tx_hashes": probe_hashes[:50],
         "small_probe_unique_tx_hashes": len(set(probe_hashes)) if probe_hashes else None,
-        "market_rows": len(market), "market_window_complete": market_complete, "market_pages": market_pages,
-        "candle_rows": len(candles), "candle_window_complete": candle_complete,
-        "price_window_complete": price_complete, "price_source": price_source,
+        "market_rows": len(market),
+        "market_window_complete": market_complete,
+        "market_pages": market_pages,
+        "market_fetch_seconds": round(market_fetch_s, 4) if market_fetch_s is not None else None,
+        "candle_rows": len(candles),
+        "candle_window_complete": candle_complete,
+        "candle_fetch_seconds": round(candle_fetch_s, 4),
+        "price_window_complete": price_complete,
+        "price_source": price_source,
         "pnl_reference_total_pnl_usd": fnum(pnl_item.get("totalPnl")),
         "pnl_reference_total_pnl_pct": fnum(pnl_item.get("totalPnlPercentage")),
         "pnl_reference_realized_pnl_usd": fnum(pnl_item.get("realizedPnl")),
@@ -470,6 +591,7 @@ def analyze_event(
         else:
             entry_price = None
             entry_ts = None
+
         event[f"entry_{delay}s_price"] = entry_price
         event[f"entry_{delay}s_actual_delay_ms"] = (entry_ts - t0) if entry_ts else None
         penalty = bps(row_price(first), entry_price)
@@ -477,11 +599,17 @@ def analyze_event(
 
         if entry_price and price_complete:
             if candle_complete:
-                future = [r for r in candles if target <= int(r["timestamp"]) <= end and r["high"] > 0 and r["low"] > 0]
+                future = [
+                    r for r in candles
+                    if target <= int(r["timestamp"]) <= end and r["high"] > 0 and r["low"] > 0
+                ]
                 max_p = max((r["high"] for r in future), default=None)
                 min_p = min((r["low"] for r in future), default=None)
             else:
-                ps = [row_price(r) for r in market if target <= inum(r.get("timestamp")) <= end and row_price(r)]
+                ps = [
+                    row_price(r) for r in market
+                    if target <= inum(r.get("timestamp")) <= end and row_price(r)
+                ]
                 max_p = max(ps) if ps else None
                 min_p = min(ps) if ps else None
             mfe = bps(entry_price, max_p)
@@ -511,7 +639,34 @@ def analyze_event(
                 mark = None
             ret = bps(entry_price, mark)
             event[f"entry_{delay}s_to_{horizon}s_bps"] = round(ret, 3) if ret is not None else None
+
     return event
+
+
+def process_candidate(
+    kol: Dict[str, Any],
+    item: Dict[str, Any],
+    args: argparse.Namespace,
+) -> Tuple[str, Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    mint = item.get("tokenContractAddress")
+    if not mint:
+        return "skip", None, None
+    try:
+        history, complete, pages = fetch_kol_history(
+            kol["address"], kol["chain_id"], mint, args.max_kol_history_rows
+        )
+        if not complete:
+            return "skip", None, {
+                "kol": kol["name"], "mint": mint, "symbol": item.get("tokenSymbol"),
+                "stage": "incomplete_history", "history_rows": len(history), "history_pages": pages,
+            }
+        event = analyze_event(kol, item, history, complete, pages, args)
+        return "event" if event else "skip", event, None
+    except Exception as exc:  # noqa: BLE001
+        return "error", None, {
+            "kol": kol["name"], "mint": mint, "symbol": item.get("tokenSymbol"),
+            "stage": "event", "error": str(exc),
+        }
 
 
 def med(values: List[float]) -> Optional[float]:
@@ -524,7 +679,9 @@ def mean(values: List[float]) -> Optional[float]:
 
 def metric(values: List[float]) -> Dict[str, Any]:
     return {
-        "n": len(values), "median_bps": med(values), "mean_bps": mean(values),
+        "n": len(values),
+        "median_bps": med(values),
+        "mean_bps": mean(values),
         "win_rate": round(sum(v > 0 for v in values) / len(values), 4) if values else None,
     }
 
@@ -532,7 +689,12 @@ def metric(values: List[float]) -> Dict[str, Any]:
 def bucket_metric(events: List[Dict[str, Any]], key: str) -> Dict[str, Any]:
     r10 = [float(e["entry_1s_to_10s_bps"]) for e in events if e.get("entry_1s_to_10s_bps") is not None]
     r30 = [float(e["entry_1s_to_30s_bps"]) for e in events if e.get("entry_1s_to_30s_bps") is not None]
-    return {"events": len(events), "key": key, "entry1_to10": metric(r10), "entry1_to30": metric(r30)}
+    return {
+        "events": len(events),
+        "key": key,
+        "entry1_to10": metric(r10),
+        "entry1_to30": metric(r30),
+    }
 
 
 def summarize(events: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -544,6 +706,17 @@ def summarize(events: List[Dict[str, Any]]) -> Dict[str, Any]:
         "price_valid_event_count": len(valid),
         "follower_valid_event_count": len(follower_valid),
         "kol_closed_round_count": len(closed),
+        "fetch_performance": {
+            "market_fetch_median_seconds": med([
+                float(e["market_fetch_seconds"]) for e in events
+                if e.get("market_fetch_seconds") is not None
+            ]),
+            "market_pages_median": med([
+                float(e["market_pages"]) for e in events
+                if e.get("market_fetch_seconds") is not None
+            ]),
+            "history_pages_median": med([float(e["history_pages"]) for e in events]),
+        },
         "kol_own": {
             "first_buy_to_first_sell": metric([
                 float(e["kol_first_buy_to_first_sell_bps"]) for e in events
@@ -554,7 +727,10 @@ def summarize(events: List[Dict[str, Any]]) -> Dict[str, Any]:
                 if e.get("kol_round_realized_roi_bps") is not None
             ]),
         },
-        "by_kol": {}, "delay_metrics": {}, "follower_pressure": {}, "condition_buckets": {},
+        "by_kol": {},
+        "delay_metrics": {},
+        "follower_pressure": {},
+        "condition_buckets": {},
     }
 
     names = sorted({e["kol"] for e in events})
@@ -567,10 +743,12 @@ def summarize(events: List[Dict[str, Any]]) -> Dict[str, Any]:
         r30 = [float(e["entry_1s_to_30s_bps"]) for e in es if e.get("entry_1s_to_30s_bps") is not None]
         sell = [float(e["entry_1s_to_kol_first_sell_bps"]) for e in es if e.get("entry_1s_to_kol_first_sell_bps") is not None]
         out["by_kol"][name] = {
-            "events": len(all_es), "price_valid": len(es),
+            "events": len(all_es),
+            "price_valid": len(es),
             "kol_first_buy_to_first_sell": metric(own),
             "kol_closed_round_roi": metric(own_closed),
-            "entry1_to10": metric(r10), "entry1_to30": metric(r30),
+            "entry1_to10": metric(r10),
+            "entry1_to30": metric(r30),
             "entry1_to_first_sell": metric(sell),
         }
 
@@ -578,46 +756,85 @@ def summarize(events: List[Dict[str, Any]]) -> Dict[str, Any]:
         d: Dict[str, Any] = {}
         penalty_key = f"entry_{delay}s_vs_kol_entry_bps"
         sell_key = f"entry_{delay}s_to_kol_first_sell_bps"
-        d["entry_penalty_vs_kol"] = metric([float(e[penalty_key]) for e in valid if e.get(penalty_key) is not None])
-        d["to_kol_first_sell"] = metric([float(e[sell_key]) for e in valid if e.get(sell_key) is not None])
+        d["entry_penalty_vs_kol"] = metric([
+            float(e[penalty_key]) for e in valid if e.get(penalty_key) is not None
+        ])
+        d["to_kol_first_sell"] = metric([
+            float(e[sell_key]) for e in valid if e.get(sell_key) is not None
+        ])
         for horizon in HORIZONS_S:
             if horizon <= delay:
                 continue
             key = f"entry_{delay}s_to_{horizon}s_bps"
-            d[f"to_{horizon}s"] = metric([float(e[key]) for e in valid if e.get(key) is not None])
-        d["median_mfe_bps"] = med([float(e[f"entry_{delay}s_mfe_bps"]) for e in valid if e.get(f"entry_{delay}s_mfe_bps") is not None])
-        d["median_mae_bps"] = med([float(e[f"entry_{delay}s_mae_bps"]) for e in valid if e.get(f"entry_{delay}s_mae_bps") is not None])
+            d[f"to_{horizon}s"] = metric([
+                float(e[key]) for e in valid if e.get(key) is not None
+            ])
+        d["median_mfe_bps"] = med([
+            float(e[f"entry_{delay}s_mfe_bps"]) for e in valid
+            if e.get(f"entry_{delay}s_mfe_bps") is not None
+        ])
+        d["median_mae_bps"] = med([
+            float(e[f"entry_{delay}s_mae_bps"]) for e in valid
+            if e.get(f"entry_{delay}s_mae_bps") is not None
+        ])
         out["delay_metrics"][str(delay)] = d
 
     for sec in PRESSURE_WINDOWS_S:
-        unique = [float(e[f"followers_{sec}s_unique_buyers"]) for e in follower_valid if e.get(f"followers_{sec}s_unique_buyers") is not None]
-        usd = [float(e[f"followers_{sec}s_buy_usd"]) for e in follower_valid if e.get(f"followers_{sec}s_buy_usd") is not None]
-        net = [float(e[f"followers_{sec}s_net_buy_usd"]) for e in follower_valid if e.get(f"followers_{sec}s_net_buy_usd") is not None]
+        unique = [
+            float(e[f"followers_{sec}s_unique_buyers"]) for e in follower_valid
+            if e.get(f"followers_{sec}s_unique_buyers") is not None
+        ]
+        usd = [
+            float(e[f"followers_{sec}s_buy_usd"]) for e in follower_valid
+            if e.get(f"followers_{sec}s_buy_usd") is not None
+        ]
+        net = [
+            float(e[f"followers_{sec}s_net_buy_usd"]) for e in follower_valid
+            if e.get(f"followers_{sec}s_net_buy_usd") is not None
+        ]
         out["follower_pressure"][str(sec)] = {
-            "n": len(unique), "median_unique_buyers": med(unique),
-            "median_buy_usd": med(usd), "median_net_buy_usd": med(net),
+            "n": len(unique),
+            "median_unique_buyers": med(unique),
+            "median_buy_usd": med(usd),
+            "median_net_buy_usd": med(net),
         }
 
     size_defs = [
-        ("100_200", 100, 200), ("200_500", 200, 500),
-        ("500_1000", 500, 1000), ("1000_plus", 1000, math.inf),
+        ("100_200", 100, 200),
+        ("200_500", 200, 500),
+        ("500_1000", 500, 1000),
+        ("1000_plus", 1000, math.inf),
     ]
     out["condition_buckets"]["first_buy_usd"] = {
         label: bucket_metric([e for e in valid if lo <= fnum(e.get("first_buy_usd")) < hi], label)
         for label, lo, hi in size_defs
     }
-    pressure_defs = [("0_2", 0, 3), ("3_5", 3, 6), ("6_10", 6, 11), ("11_plus", 11, math.inf)]
+
+    pressure_defs = [
+        ("0_2", 0, 3),
+        ("3_5", 3, 6),
+        ("6_10", 6, 11),
+        ("11_plus", 11, math.inf),
+    ]
     out["condition_buckets"]["followers_3s_unique_buyers"] = {
         label: bucket_metric([
-            e for e in follower_valid if e.get("price_window_complete")
+            e for e in follower_valid
+            if e.get("price_window_complete")
             and lo <= fnum(e.get("followers_3s_unique_buyers")) < hi
         ], label)
         for label, lo, hi in pressure_defs
     }
-    net_defs = [("non_positive", -math.inf, 0.000001), ("0_200", 0.000001, 200), ("200_500", 200, 500), ("500_plus", 500, math.inf)]
+
+    net_defs = [
+        ("non_positive", -math.inf, 0.000001),
+        ("0_200", 0.000001, 200),
+        ("200_500", 200, 500),
+        ("500_plus", 500, math.inf),
+    ]
     out["condition_buckets"]["followers_5s_net_buy_usd"] = {
         label: bucket_metric([
-            e for e in follower_valid if e.get("price_window_complete")
+            e for e in follower_valid
+            if e.get("price_window_complete")
             and lo <= fnum(e.get("followers_5s_net_buy_usd")) < hi
         ], label)
         for label, lo, hi in net_defs
@@ -638,7 +855,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-follower-event-age-hours", type=float, default=72.0)
     p.add_argument("--pre-window-seconds", type=int, default=5)
     p.add_argument("--post-window-seconds", type=int, default=300)
-    p.add_argument("--max-market-pages", type=int, default=120)
+    p.add_argument("--max-market-pages", type=int, default=30)
+    p.add_argument("--workers", type=int, default=4)
     return p.parse_args()
 
 
@@ -648,50 +866,74 @@ def main() -> None:
     tiers = {x.strip() for x in a.tiers.split(",") if x.strip()}
     watch = json.loads(Path(a.watchlist).read_text(encoding="utf-8"))
     kols = [k for k in watch["kols"] if k["chain_id"] in chains and k["tier"] in tiers]
+
     out_dir = Path(a.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     events: List[Dict[str, Any]] = []
     errors: List[Dict[str, Any]] = []
-    print("KOL_COUNT", len(kols))
+    candidates: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
 
+    print("KOL_COUNT", len(kols))
+    print("WORKERS", max(1, a.workers))
+    print("TRADE_PAGE_LIMIT", TRADE_PAGE_LIMIT)
+
+    # PnL 发现阶段请求量很小，顺序做；真正重的 Mint/Event 阶段并行。
     for kol in kols:
-        print(f"\n=== {kol['name']} {kol['address']} chain={kol['chain_id']} ===")
+        print(f"DISCOVER {kol['name']} {kol['address']} chain={kol['chain_id']}")
         try:
             mints = fetch_recent_mints(kol["address"], kol["chain_id"], a.recent_mints)
         except Exception as exc:  # noqa: BLE001
             errors.append({"kol": kol["name"], "stage": "recent_mints", "error": str(exc)})
-            print("ERROR recent_mints", exc)
+            print("ERROR recent_mints", kol["name"], exc)
             continue
         for item in mints:
-            mint = item.get("tokenContractAddress")
-            if not mint:
-                continue
-            try:
-                history, complete = fetch_kol_history(kol["address"], kol["chain_id"], mint, a.max_kol_history_rows)
-                if not complete:
-                    print("SKIP incomplete_history", kol["name"], item.get("tokenSymbol"), mint, len(history))
-                    continue
-                event = analyze_event(kol, item, history, complete, a)
-                if event:
-                    events.append(event)
-                    print("EVENT", json.dumps({
-                        "kol": event["kol"], "symbol": event["symbol"],
-                        "first_buy_usd": event["first_buy_usd"],
-                        "kol_first_sell_bps": event["kol_first_buy_to_first_sell_bps"],
-                        "kol_round_closed": event["kol_round_closed_est"],
-                        "kol_round_roi_bps": event["kol_round_realized_roi_bps"],
-                        "sell_delay_s": event["first_sell_delay_s"],
-                        "probe_buys": event["pre_first_sell_small_probe_buys"],
-                        "price_source": event["price_source"],
-                        "market_complete": event["market_window_complete"],
-                    }, ensure_ascii=False))
-            except Exception as exc:  # noqa: BLE001
-                errors.append({
-                    "kol": kol["name"], "mint": mint, "symbol": item.get("tokenSymbol"),
-                    "stage": "event", "error": str(exc),
-                })
-                print("ERROR event", kol["name"], item.get("tokenSymbol"), exc)
+            if item.get("tokenContractAddress"):
+                candidates.append((kol, item))
 
+    print("CANDIDATE_COUNT", len(candidates))
+    with ThreadPoolExecutor(max_workers=max(1, a.workers)) as pool:
+        future_map = {
+            pool.submit(process_candidate, kol, item, a): (kol, item)
+            for kol, item in candidates
+        }
+        for future in as_completed(future_map):
+            kol, item = future_map[future]
+            try:
+                status, event, err = future.result()
+            except Exception as exc:  # defensive
+                status, event, err = "error", None, {
+                    "kol": kol["name"],
+                    "mint": item.get("tokenContractAddress"),
+                    "symbol": item.get("tokenSymbol"),
+                    "stage": "future",
+                    "error": str(exc),
+                }
+
+            if err:
+                errors.append(err)
+                if status == "error":
+                    print("ERROR", json.dumps(err, ensure_ascii=False))
+                else:
+                    print("SKIP", json.dumps(err, ensure_ascii=False))
+            if event:
+                events.append(event)
+                print("EVENT", json.dumps({
+                    "kol": event["kol"],
+                    "symbol": event["symbol"],
+                    "first_buy_usd": event["first_buy_usd"],
+                    "kol_first_sell_bps": event["kol_first_buy_to_first_sell_bps"],
+                    "kol_round_closed": event["kol_round_closed_est"],
+                    "kol_round_roi_bps": event["kol_round_realized_roi_bps"],
+                    "sell_delay_s": event["first_sell_delay_s"],
+                    "probe_buys": event["pre_first_sell_small_probe_buys"],
+                    "history_pages": event["history_pages"],
+                    "market_pages": event["market_pages"],
+                    "market_fetch_s": event["market_fetch_seconds"],
+                    "market_complete": event["market_window_complete"],
+                    "price_source": event["price_source"],
+                }, ensure_ascii=False))
+
+    events.sort(key=lambda e: (e.get("kol") or "", inum(e.get("t0_ms"))))
     summary = summarize(events)
     (out_dir / "events.jsonl").write_text(
         "".join(json.dumps(x, ensure_ascii=False) + "\n" for x in events), encoding="utf-8"
