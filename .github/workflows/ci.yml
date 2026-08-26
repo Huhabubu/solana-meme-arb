@@ -82,10 +82,10 @@ jobs:
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         timeout-minutes: 2
         env:
-          HELIUS_API_KEY: ${{ secrets.HELIUS_API_KEY }}
+          HELIUS_API_KEY_V2: ${{ secrets.HELIUS_API_KEY_V2 }}
         run: |
-          if [ -z "$HELIUS_API_KEY" ]; then
-            echo "HELIUS_API_KEY secret is not configured; V1 live verification skipped."
+          if [ -z "$HELIUS_API_KEY_V2" ]; then
+            echo "HELIUS_API_KEY_V2 secret is not configured; V1 live verification skipped."
             exit 0
           fi
           cargo run -- helius-check
@@ -95,10 +95,10 @@ jobs:
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         timeout-minutes: 2
         env:
-          HELIUS_API_KEY: ${{ secrets.HELIUS_API_KEY }}
+          HELIUS_API_KEY_V2: ${{ secrets.HELIUS_API_KEY_V2 }}
         run: |
-          if [ -z "$HELIUS_API_KEY" ]; then
-            echo "HELIUS_API_KEY secret is not configured; V2 Raydium live verification skipped."
+          if [ -z "$HELIUS_API_KEY_V2" ]; then
+            echo "HELIUS_API_KEY_V2 secret is not configured; V2 Raydium live verification skipped."
             exit 0
           fi
           cargo run -- raydium-quote-check
@@ -108,10 +108,10 @@ jobs:
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         timeout-minutes: 2
         env:
-          HELIUS_API_KEY: ${{ secrets.HELIUS_API_KEY }}
+          HELIUS_API_KEY_V2: ${{ secrets.HELIUS_API_KEY_V2 }}
         run: |
-          if [ -z "$HELIUS_API_KEY" ]; then
-            echo "HELIUS_API_KEY secret is not configured; V2 Orca live verification skipped."
+          if [ -z "$HELIUS_API_KEY_V2" ]; then
+            echo "HELIUS_API_KEY_V2 secret is not configured; V2 Orca live verification skipped."
             exit 0
           fi
           cargo run -- orca-quote-check
@@ -121,10 +121,10 @@ jobs:
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         timeout-minutes: 2
         env:
-          HELIUS_API_KEY: ${{ secrets.HELIUS_API_KEY }}
+          HELIUS_API_KEY_V2: ${{ secrets.HELIUS_API_KEY_V2 }}
         run: |
-          if [ -z "$HELIUS_API_KEY" ]; then
-            echo "HELIUS_API_KEY secret is not configured; V2 Meteora live verification skipped."
+          if [ -z "$HELIUS_API_KEY_V2" ]; then
+            echo "HELIUS_API_KEY_V2 secret is not configured; V2 Meteora live verification skipped."
             exit 0
           fi
           cargo run -- meteora-quote-check
@@ -134,10 +134,10 @@ jobs:
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         timeout-minutes: 3
         env:
-          HELIUS_API_KEY: ${{ secrets.HELIUS_API_KEY }}
+          HELIUS_API_KEY_V2: ${{ secrets.HELIUS_API_KEY_V2 }}
         run: |
-          if [ -z "$HELIUS_API_KEY" ]; then
-            echo "HELIUS_API_KEY secret is not configured; V3 multi-size round-trip verification skipped."
+          if [ -z "$HELIUS_API_KEY_V2" ]; then
+            echo "HELIUS_API_KEY_V2 secret is not configured; V3 multi-size round-trip verification skipped."
             exit 0
           fi
           cargo run -- round-trip-check
@@ -147,11 +147,11 @@ jobs:
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         timeout-minutes: 4
         env:
-          HELIUS_API_KEY: ${{ secrets.HELIUS_API_KEY }}
+          HELIUS_API_KEY_V2: ${{ secrets.HELIUS_API_KEY_V2 }}
           OPPORTUNITY_LOG_PATH: ${{ runner.temp }}/opportunity-events.jsonl
         run: |
-          if [ -z "$HELIUS_API_KEY" ]; then
-            echo "HELIUS_API_KEY secret is not configured; V3.6 opportunity persistence verification skipped."
+          if [ -z "$HELIUS_API_KEY_V2" ]; then
+            echo "HELIUS_API_KEY_V2 secret is not configured; V3.6 opportunity persistence verification skipped."
             exit 0
           fi
           rm -f "$OPPORTUNITY_LOG_PATH"
@@ -165,15 +165,15 @@ jobs:
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         timeout-minutes: 4
         env:
-          HELIUS_API_KEY: ${{ secrets.HELIUS_API_KEY }}
+          HELIUS_API_KEY_V2: ${{ secrets.HELIUS_API_KEY_V2 }}
           OPPORTUNITY_LOG_PATH: ${{ runner.temp }}/event-driven-monitor.jsonl
           OPPORTUNITY_MONITOR_UPDATES: "2"
           OPPORTUNITY_MONITOR_MAX_SECONDS: "120"
           OPPORTUNITY_MONITOR_UPDATE_TIMEOUT_SECONDS: "45"
           OPPORTUNITY_MONITOR_MAX_RECONNECTS: "2"
         run: |
-          if [ -z "$HELIUS_API_KEY" ]; then
-            echo "HELIUS_API_KEY secret is not configured; V4 event monitor verification skipped."
+          if [ -z "$HELIUS_API_KEY_V2" ]; then
+            echo "HELIUS_API_KEY_V2 secret is not configured; V4 event monitor verification skipped."
             exit 0
           fi
           rm -f "$OPPORTUNITY_LOG_PATH"
