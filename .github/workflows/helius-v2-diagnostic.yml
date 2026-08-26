@@ -8,7 +8,7 @@ on:
       - .github/workflows/helius-v2-diagnostic.yml
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   diagnose:
@@ -17,6 +17,12 @@ jobs:
     env:
       HELIUS_API_KEY_V2: ${{ secrets.HELIUS_API_KEY_V2 }}
     steps:
+      - name: Checkout branch
+        uses: actions/checkout@v4
+        with:
+          ref: agent/event-driven-monitor-v2
+          fetch-depth: 0
+
       - name: Require V2 secret
         run: test -n "$HELIUS_API_KEY_V2"
 
@@ -37,11 +43,7 @@ jobs:
           if not key:
               raise SystemExit("HELIUS_API_KEY_V2 is empty")
 
-          result = {
-              "secret_present": True,
-              "http": {},
-              "wss": {},
-          }
+          result = {"secret_present": True, "http": {}, "wss": {}}
 
           http_url = "https://mainnet.helius-rpc.com/?api-key=" + urllib.parse.quote(key, safe="")
           payload = json.dumps({
@@ -62,13 +64,12 @@ jobs:
                   result["http"] = {
                       "status": resp.status,
                       "jsonrpc_ok": isinstance(body.get("result"), int),
-                      "rpc_error": body.get("error"),
+                      "rpc_error_code": (body.get("error") or {}).get("code") if isinstance(body.get("error"), dict) else None,
                   }
           except urllib.error.HTTPError as exc:
-              body = exc.read().decode(errors="replace")[:500]
-              result["http"] = {"status": exc.code, "body": body}
+              result["http"] = {"status": exc.code}
           except Exception as exc:
-              result["http"] = {"exception": type(exc).__name__, "message": str(exc)}
+              result["http"] = {"exception": type(exc).__name__}
 
           host = "mainnet.helius-rpc.com"
           path = "/?api-key=" + urllib.parse.quote(key, safe="")
@@ -101,20 +102,31 @@ jobs:
               status = int(parts[1]) if len(parts) >= 2 and parts[1].isdigit() else None
               result["wss"] = {"status": status, "status_line": status_line}
           except Exception as exc:
-              result["wss"] = {"exception": type(exc).__name__, "message": str(exc)}
+              result["wss"] = {"exception": type(exc).__name__}
 
-          out = "/tmp/helius-v2-diagnostic.json"
+          out = ".github/diagnostics/helius-v2-latest.json"
+          os.makedirs(os.path.dirname(out), exist_ok=True)
           with open(out, "w", encoding="utf-8") as fh:
               json.dump(result, fh, ensure_ascii=False, indent=2)
+              fh.write("\n")
           print(json.dumps(result, ensure_ascii=False))
-
-          # Diagnostic itself succeeds even when an endpoint is unhealthy;
-          # the JSON result is the evidence we want to inspect.
           PY
+
+      - name: Persist sanitized diagnostic
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .github/diagnostics/helius-v2-latest.json
+          if git diff --cached --quiet; then
+            echo "Diagnostic unchanged"
+            exit 0
+          fi
+          git commit -m "ci: persist sanitized Helius V2 diagnostic"
+          git push origin HEAD:agent/event-driven-monitor-v2
 
       - name: Upload sanitized diagnostic
         uses: actions/upload-artifact@v4
         with:
           name: helius-v2-diagnostic
-          path: /tmp/helius-v2-diagnostic.json
+          path: .github/diagnostics/helius-v2-latest.json
           retention-days: 3
