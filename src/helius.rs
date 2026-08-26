@@ -278,30 +278,32 @@ impl AccountSubscriptionClient {
     ) -> Result<Self> {
         validate_subscription_scope(addresses, accepted_addresses)?;
         let wss_url = config.wss_url();
-        let (socket, _) = connect_async(wss_url.as_str())
-            .await
-            .map_err(|_| anyhow::anyhow!("Helius WSS connection failed"))?;
-        let mut client = Self {
-            socket,
-            tracker: AddressSubscriptionTracker::new(addresses)?,
-            accepted_addresses: accepted_addresses.clone(),
-            buffered_updates: VecDeque::new(),
-        };
-
-        for (index, address) in addresses.iter().enumerate() {
-            let request_id = (index + 1) as u64;
-            let request = build_account_subscribe_request(request_id, address);
-            client
-                .socket
-                .send(Message::Text(request.into()))
+        timeout(acknowledge_timeout, async {
+            let (socket, _) = connect_async(wss_url.as_str())
                 .await
-                .map_err(|_| anyhow::anyhow!("failed to send Helius subscription request"))?;
-        }
+                .map_err(|_| anyhow::anyhow!("Helius WSS connection failed"))?;
+            let mut client = Self {
+                socket,
+                tracker: AddressSubscriptionTracker::new(addresses)?,
+                accepted_addresses: accepted_addresses.clone(),
+                buffered_updates: VecDeque::new(),
+            };
 
-        timeout(acknowledge_timeout, client.wait_for_acknowledgements())
-            .await
-            .context("timed out waiting for Helius subscription acknowledgements")??;
-        Ok(client)
+            for (index, address) in addresses.iter().enumerate() {
+                let request_id = (index + 1) as u64;
+                let request = build_account_subscribe_request(request_id, address);
+                client
+                    .socket
+                    .send(Message::Text(request.into()))
+                    .await
+                    .map_err(|_| anyhow::anyhow!("failed to send Helius subscription request"))?;
+            }
+
+            client.wait_for_acknowledgements().await?;
+            Ok::<Self, anyhow::Error>(client)
+        })
+        .await
+        .context("timed out connecting or subscribing to Helius WSS")?
     }
 
     pub async fn next_update(&mut self, wait_timeout: Duration) -> Result<RawAccountUpdate> {

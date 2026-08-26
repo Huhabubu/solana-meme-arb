@@ -13,6 +13,7 @@ ExecStart=/opt/solana-meme-arb/solana-meme-arb opportunity-monitor
 Restart=on-failure
 RestartSec=5s
 TimeoutStopSec=20s
+UMask=0027
 
 # 研究监控器只需要网络和数据目录写权限；程序与系统配置保持只读。
 NoNewPrivileges=true

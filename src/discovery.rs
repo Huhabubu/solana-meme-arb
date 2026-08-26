@@ -26,6 +26,24 @@ pub async fn discover_pair(client: &Client, mint_x: &str, mint_y: &str) -> Resul
     Ok(pools)
 }
 
+pub async fn discover_quote_pair(
+    client: &Client,
+    mint_x: &str,
+    mint_y: &str,
+) -> Result<Vec<PoolInfo>> {
+    let (raydium, orca, meteora_dlmm) = tokio::try_join!(
+        raydium::fetch_pools(client, mint_x, mint_y),
+        orca::fetch_pools(client, mint_x, mint_y),
+        meteora::fetch_dlmm_pools(client, mint_x, mint_y),
+    )?;
+
+    let mut pools = Vec::new();
+    pools.extend(raydium);
+    pools.extend(orca);
+    pools.extend(meteora_dlmm);
+    Ok(pools)
+}
+
 /// V0/V1 只保留有基本流动性的少量深池，避免订阅大量灰尘池浪费 RPC/WSS 配额。
 /// 传入的数据不要求预排序；返回结果始终按 TVL 从高到低排列。
 pub fn select_monitoring_candidates(

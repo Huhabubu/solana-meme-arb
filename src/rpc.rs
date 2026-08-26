@@ -2,6 +2,7 @@ use std::{error::Error as StdError, fmt, time::Duration};
 
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use futures_util::future::try_join_all;
 use reqwest::{header::RETRY_AFTER, Client, StatusCode};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -17,6 +18,8 @@ const MIN_CONTEXT_SLOT_RETRY_BASE_MS: u64 = 200;
 const TRANSIENT_HTTP_MAX_RETRIES: usize = 4;
 const TRANSIENT_HTTP_RETRY_BASE_MS: u64 = 1_000;
 const TRANSIENT_HTTP_RETRY_MAX_MS: u64 = 30_000;
+const GET_MULTIPLE_ACCOUNTS_MAX_ADDRESSES: usize = 100;
+const COHERENT_ACCOUNT_BATCH_MAX_ATTEMPTS: usize = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccountData {
@@ -112,7 +115,7 @@ pub async fn fetch_account_owners(
     if addresses.is_empty() {
         return Ok(Vec::new());
     }
-    if addresses.len() > 100 {
+    if addresses.len() > GET_MULTIPLE_ACCOUNTS_MAX_ADDRESSES {
         bail!("getMultipleAccounts supports at most 100 addresses per request");
     }
 
@@ -210,11 +213,65 @@ pub async fn fetch_accounts(
     }
 }
 
+/// 读取任意数量账户，并要求所有分片最终来自同一个 RPC context slot。
+///
+/// Solana `getMultipleAccounts` 单次最多 100 个地址。研究监控扩池后会超过该限制，
+/// 因此这里并发请求多个分片；若各分片落在不同 context slot，就把最高 slot 作为
+/// 下一轮 `minContextSlot` 并整体重试。只有所有分片 slot 完全一致时才返回。
+pub async fn fetch_accounts_coherent(
+    client: &Client,
+    rpc_url: &str,
+    addresses: &[String],
+    min_context_slot: Option<u64>,
+) -> Result<AccountBatch> {
+    if addresses.len() <= GET_MULTIPLE_ACCOUNTS_MAX_ADDRESSES {
+        return fetch_accounts(client, rpc_url, addresses, min_context_slot).await;
+    }
+
+    let mut required_slot = min_context_slot;
+    for attempt in 1..=COHERENT_ACCOUNT_BATCH_MAX_ATTEMPTS {
+        let batches = try_join_all(
+            addresses
+                .chunks(GET_MULTIPLE_ACCOUNTS_MAX_ADDRESSES)
+                .map(|chunk| fetch_accounts(client, rpc_url, chunk, required_slot)),
+        )
+        .await?;
+        let target_slot = batches
+            .iter()
+            .map(|batch| batch.slot)
+            .max()
+            .context("coherent account batch unexpectedly produced no chunks")?;
+        if batches.iter().all(|batch| batch.slot == target_slot) {
+            let accounts = batches
+                .into_iter()
+                .flat_map(|batch| batch.accounts)
+                .collect::<Vec<_>>();
+            if accounts.len() != addresses.len() {
+                bail!("coherent account batch result length mismatch");
+            }
+            return Ok(AccountBatch {
+                slot: target_slot,
+                accounts,
+            });
+        }
+        if attempt < COHERENT_ACCOUNT_BATCH_MAX_ATTEMPTS {
+            required_slot = Some(target_slot);
+        }
+    }
+
+    bail!(
+        "could not obtain one coherent RPC context slot across {} account chunks",
+        addresses
+            .len()
+            .div_ceil(GET_MULTIPLE_ACCOUNTS_MAX_ADDRESSES)
+    )
+}
+
 fn build_full_accounts_request(
     addresses: &[String],
     min_context_slot: Option<u64>,
 ) -> Result<Value> {
-    if addresses.len() > 100 {
+    if addresses.len() > GET_MULTIPLE_ACCOUNTS_MAX_ADDRESSES {
         bail!("getMultipleAccounts supports at most 100 addresses per request");
     }
 

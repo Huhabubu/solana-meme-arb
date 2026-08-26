@@ -103,8 +103,17 @@ impl QuoteState {
             bail!("pool address cannot be empty");
         }
 
+        let next_addresses = dependencies
+            .accounts
+            .iter()
+            .map(|account| account.address.as_str())
+            .collect::<HashSet<_>>();
         if let Some(previous) = self.dependencies_by_pool.remove(&pool_address) {
-            self.remove_reverse_index(&previous);
+            for account in &previous.accounts {
+                if !next_addresses.contains(account.address.as_str()) {
+                    self.remove_pool_reference(&pool_address, &account.address);
+                }
+            }
         }
 
         for account in &dependencies.accounts {
@@ -199,19 +208,17 @@ impl QuoteState {
             .collect())
     }
 
-    fn remove_reverse_index(&mut self, dependencies: &PoolDependencies) {
-        let pool_address = &dependencies.pool.address;
-        for account in &dependencies.accounts {
-            let remove_account_key =
-                if let Some(pools) = self.pools_by_account.get_mut(&account.address) {
-                    pools.remove(pool_address);
-                    pools.is_empty()
-                } else {
-                    false
-                };
-            if remove_account_key {
-                self.pools_by_account.remove(&account.address);
-            }
+    fn remove_pool_reference(&mut self, pool_address: &str, account_address: &str) {
+        let remove_account_key = if let Some(pools) = self.pools_by_account.get_mut(account_address)
+        {
+            pools.remove(pool_address);
+            pools.is_empty()
+        } else {
+            false
+        };
+        if remove_account_key {
+            self.pools_by_account.remove(account_address);
+            self.account_data.remove(account_address);
         }
     }
 }
@@ -340,6 +347,12 @@ mod tests {
             )
             .unwrap();
         state
+            .apply_account_update("pool-a", version(10, 1))
+            .unwrap();
+        state
+            .apply_account_update("tick-old", version(10, 2))
+            .unwrap();
+        state
             .replace_pool_dependencies(
                 PoolDependencies::new(
                     pool("pool-a"),
@@ -353,6 +366,8 @@ mod tests {
             .unwrap();
 
         assert!(state.affected_pools("tick-old").is_empty());
+        assert!(state.account_data("tick-old").is_none());
+        assert_eq!(state.account_data("pool-a").unwrap().slot, 10);
         assert_eq!(state.affected_pools("tick-new"), vec!["pool-a"]);
         assert_eq!(
             state.dependency_kind("pool-a", "tick-new"),

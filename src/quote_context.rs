@@ -11,9 +11,11 @@ use crate::{
     dex::{
         meteora::DLMM_PROGRAM_ID,
         meteora_dlmm::{
-            build_bin_array_map, decode_bin_array, decode_bitmap_extension, decode_lb_pair,
+            bin_array_addresses_for_swap, build_bin_array_map, decode_bin_array,
+            decode_bitmap_extension, decode_lb_pair,
             is_pool_out_of_liquidity as is_meteora_pool_out_of_liquidity,
             quote_exact_in as quote_meteora_exact_in, quote_mint_account, swap_for_y_for_input,
+            BIN_ARRAY_TAKE_COUNT,
         },
         orca_whirlpool::{
             decode_oracle, decode_tick_array_or_default, decode_whirlpool, needs_oracle,
@@ -260,6 +262,24 @@ impl MeteoraQuoteContext {
         } else {
             self.lb_pair.token_x_mint.to_string()
         };
+        let directional_bin_arrays = bin_array_addresses_for_swap(
+            &self.pool.address,
+            &self.lb_pair,
+            self.bitmap.as_ref(),
+            swap_for_y,
+            BIN_ARRAY_TAKE_COUNT,
+        )?
+        .into_iter()
+        .map(|address| {
+            let pubkey = MeteoraPubkey::from_str(&address)
+                .context("invalid Meteora directional BinArray address")?;
+            let bin_array = self
+                .bin_arrays
+                .get(&pubkey)
+                .with_context(|| format!("Meteora directional BinArray missing: {address}"))?;
+            Ok((pubkey, *bin_array))
+        })
+        .collect::<Result<HashMap<_, _>>>()?;
 
         let mut results = Vec::with_capacity(amounts_in.len());
         for &amount_in in amounts_in {
@@ -268,7 +288,7 @@ impl MeteoraQuoteContext {
                 &self.lb_pair,
                 amount_in,
                 swap_for_y,
-                self.bin_arrays.clone(),
+                directional_bin_arrays.clone(),
                 self.bitmap.as_ref(),
                 clock,
                 &self.mint_x_account,
@@ -306,7 +326,7 @@ fn build_pool_quote_context(state: &QuoteState, pool: &PoolInfo) -> Result<PoolQ
             pool.address
         );
     }
-    let snapshot_slot = newest_dependency_slot(state, pool)?;
+    let snapshot_slot = coherent_dependency_slot(state, pool)?;
 
     match pool.dex {
         Dex::Raydium => build_raydium_context(state, pool, snapshot_slot),
@@ -316,11 +336,11 @@ fn build_pool_quote_context(state: &QuoteState, pool: &PoolInfo) -> Result<PoolQ
     }
 }
 
-fn newest_dependency_slot(state: &QuoteState, pool: &PoolInfo) -> Result<u64> {
+fn coherent_dependency_slot(state: &QuoteState, pool: &PoolInfo) -> Result<u64> {
     let dependencies = state
         .dependencies_for_pool(&pool.address)
         .with_context(|| format!("missing dependency metadata for pool: {}", pool.address))?;
-    dependencies
+    let slots = dependencies
         .accounts
         .iter()
         .map(|dependency| {
@@ -334,10 +354,17 @@ fn newest_dependency_slot(state: &QuoteState, pool: &PoolInfo) -> Result<u64> {
                     )
                 })
         })
-        .collect::<Result<Vec<_>>>()?
-        .into_iter()
-        .max()
-        .context("pool has no local quote dependency slots")
+        .collect::<Result<Vec<_>>>()?;
+    let snapshot_slot = *slots
+        .first()
+        .context("pool has no local quote dependency slots")?;
+    if slots.iter().any(|slot| *slot != snapshot_slot) {
+        bail!(
+            "pool quote dependencies do not share one coherent RPC snapshot slot: {}",
+            pool.address
+        );
+    }
+    Ok(snapshot_slot)
 }
 
 fn build_raydium_context(
@@ -529,6 +556,7 @@ fn build_meteora_context(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::{DependencyAccount, PoolDependencies, VersionedAccountData};
 
     fn raydium_pool(address: &str) -> PoolInfo {
         PoolInfo {
@@ -575,6 +603,38 @@ mod tests {
         cache.insert_context(raydium_context("pool", 10)).unwrap();
         cache.insert_context(raydium_context("pool", 11)).unwrap();
         assert_eq!(cache.snapshot_slot("pool").unwrap(), 11);
+    }
+
+    #[test]
+    fn coherent_dependency_slot_rejects_mixed_rpc_snapshots() {
+        let pool = raydium_pool("pool");
+        let mut state = QuoteState::new();
+        state
+            .replace_pool_dependencies(
+                PoolDependencies::new(
+                    pool.clone(),
+                    vec![
+                        DependencyAccount::new("pool", DependencyKind::PoolState).unwrap(),
+                        DependencyAccount::new("vault", DependencyKind::TokenVault).unwrap(),
+                    ],
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        for (address, slot) in [("pool", 7), ("vault", 8)] {
+            state
+                .apply_account_update(
+                    address,
+                    VersionedAccountData {
+                        slot,
+                        owner: "owner".into(),
+                        data: vec![0],
+                    },
+                )
+                .unwrap();
+        }
+
+        assert!(coherent_dependency_slot(&state, &pool).is_err());
     }
 
     #[test]

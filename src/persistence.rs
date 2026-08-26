@@ -1,8 +1,8 @@
 use std::{
     collections::BTreeMap,
     fs::{self, File, OpenOptions},
-    io::{BufRead, BufReader, BufWriter, Write},
-    path::Path,
+    io::{BufRead, BufReader, BufWriter, Seek, SeekFrom, Write},
+    path::{Path, PathBuf},
 };
 
 use anyhow::{bail, Context, Result};
@@ -11,6 +11,48 @@ use serde::{Deserialize, Serialize};
 use crate::opportunity::{LiquidityStage, OpportunityEvent, OpportunityEventOutcome};
 
 pub const OPPORTUNITY_RECORD_SCHEMA_VERSION: u32 = 1;
+
+pub struct OpportunityLogWriter {
+    path: PathBuf,
+    writer: BufWriter<File>,
+}
+
+impl OpportunityLogWriter {
+    pub fn open(path: &Path) -> Result<Self> {
+        ensure_parent_directory(path)?;
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .with_context(|| format!("failed to open opportunity log: {}", path.display()))?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            writer: BufWriter::new(file),
+        })
+    }
+
+    pub fn append_records(&mut self, records: &[OpportunityRecord]) -> Result<()> {
+        if records.is_empty() {
+            bail!("cannot append an empty opportunity record batch");
+        }
+        for record in records {
+            record.validate()?;
+            serde_json::to_writer(&mut self.writer, record)
+                .context("failed to serialize opportunity record")?;
+            self.writer
+                .write_all(b"\n")
+                .context("failed to terminate opportunity JSONL record")?;
+        }
+        self.writer
+            .flush()
+            .with_context(|| format!("failed to flush opportunity log: {}", self.path.display()))?;
+        self.writer
+            .get_ref()
+            .sync_data()
+            .with_context(|| format!("failed to sync opportunity log: {}", self.path.display()))?;
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -197,6 +239,10 @@ pub fn append_records(path: &Path, records: &[OpportunityRecord]) -> Result<()> 
     if records.is_empty() {
         bail!("cannot append an empty opportunity record batch");
     }
+    OpportunityLogWriter::open(path)?.append_records(records)
+}
+
+fn ensure_parent_directory(path: &Path) -> Result<()> {
     if let Some(parent) = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -208,27 +254,95 @@ pub fn append_records(path: &Path, records: &[OpportunityRecord]) -> Result<()> 
             )
         })?;
     }
-    let file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .with_context(|| format!("failed to open opportunity log: {}", path.display()))?;
-    let mut writer = BufWriter::new(file);
-    for record in records {
-        record.validate()?;
-        serde_json::to_writer(&mut writer, record)
-            .context("failed to serialize opportunity record")?;
-        writer
-            .write_all(b"\n")
-            .context("failed to terminate opportunity JSONL record")?;
-    }
-    writer
-        .flush()
-        .context("failed to flush opportunity JSONL log")?;
     Ok(())
 }
 
-pub fn read_records(path: &Path) -> Result<Vec<OpportunityRecord>> {
+/// 流式校验并汇总 JSONL，内存只与单行和分组数量相关。
+/// 如果进程崩溃只留下最后一行的不完整 JSON，则截断该尾部；中间损坏仍直接失败。
+pub fn scan_records(path: &Path) -> Result<OpportunityStats> {
+    let file = File::open(path)
+        .with_context(|| format!("failed to open opportunity log: {}", path.display()))?;
+    let mut reader = BufReader::new(file);
+    let mut stats = OpportunityStats::default();
+    let mut line = Vec::new();
+    let mut valid_bytes = 0u64;
+    let mut line_number = 0usize;
+
+    loop {
+        line.clear();
+        let bytes_read = reader.read_until(b'\n', &mut line).with_context(|| {
+            format!("failed to read opportunity JSONL line {}", line_number + 1)
+        })?;
+        if bytes_read == 0 {
+            break;
+        }
+        line_number += 1;
+        let terminated = line.ends_with(b"\n");
+        let mut json_end = line.len() - usize::from(terminated);
+        if json_end > 0 && line[json_end - 1] == b'\r' {
+            json_end -= 1;
+        }
+        let json = &line[..json_end];
+
+        if json.iter().all(u8::is_ascii_whitespace) {
+            if !terminated {
+                drop(reader);
+                repair_log_tail(path, valid_bytes, false)?;
+                return Ok(stats);
+            }
+            bail!("opportunity JSONL contains blank line {line_number}");
+        }
+
+        let record = match serde_json::from_slice::<OpportunityRecord>(json) {
+            Ok(record) => record,
+            Err(_) if !terminated => {
+                drop(reader);
+                repair_log_tail(path, valid_bytes, false)?;
+                return Ok(stats);
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("invalid opportunity JSONL line {line_number}"));
+            }
+        };
+        record.validate().with_context(|| {
+            format!("invalid opportunity record semantics at line {line_number}")
+        })?;
+        stats.ingest_record(&record)?;
+        valid_bytes = valid_bytes
+            .checked_add(u64::try_from(bytes_read).context("opportunity log offset overflow")?)
+            .context("opportunity log offset overflow")?;
+
+        if !terminated {
+            drop(reader);
+            repair_log_tail(path, valid_bytes, true)?;
+            return Ok(stats);
+        }
+    }
+
+    Ok(stats)
+}
+
+fn repair_log_tail(path: &Path, valid_bytes: u64, append_newline: bool) -> Result<()> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .open(path)
+        .with_context(|| format!("failed to repair opportunity log: {}", path.display()))?;
+    file.set_len(valid_bytes)
+        .context("failed to truncate incomplete opportunity JSONL tail")?;
+    if append_newline {
+        file.seek(SeekFrom::End(0))
+            .context("failed to seek opportunity JSONL tail")?;
+        file.write_all(b"\n")
+            .context("failed to terminate final opportunity JSONL record")?;
+    }
+    file.sync_data()
+        .context("failed to sync repaired opportunity JSONL log")?;
+    Ok(())
+}
+
+#[cfg(test)]
+fn read_records(path: &Path) -> Result<Vec<OpportunityRecord>> {
     let file = File::open(path)
         .with_context(|| format!("failed to open opportunity log: {}", path.display()))?;
     let reader = BufReader::new(file);
@@ -332,7 +446,8 @@ impl OpportunityStats {
     }
 }
 
-pub fn summarize_records(records: &[OpportunityRecord]) -> Result<OpportunityStats> {
+#[cfg(test)]
+fn summarize_records(records: &[OpportunityRecord]) -> Result<OpportunityStats> {
     let mut stats = OpportunityStats::default();
     stats.ingest_records(records)?;
     Ok(stats)
@@ -434,10 +549,76 @@ mod tests {
     }
 
     #[test]
+    fn persistent_writer_reuses_one_file_handle_for_multiple_batches() {
+        let path = temp_path("persistent-writer");
+        let first = record(&evaluated_event(4_000, 10_000));
+        let second = record(&insufficient_event());
+        let mut writer = OpportunityLogWriter::open(&path).unwrap();
+        writer.append_records(std::slice::from_ref(&first)).unwrap();
+        writer
+            .append_records(std::slice::from_ref(&second))
+            .unwrap();
+        drop(writer);
+
+        assert_eq!(read_records(&path).unwrap(), vec![first, second]);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn malformed_jsonl_is_reported_instead_of_skipped() {
         let path = temp_path("bad");
         fs::write(&path, b"{not-json}\n").unwrap();
         assert!(read_records(&path).is_err());
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn streaming_scan_matches_batch_summary() {
+        let path = temp_path("scan");
+        let records = vec![
+            record(&evaluated_event(4_000, 10_000)),
+            record(&insufficient_event()),
+            record(&evaluated_event(-2_000, -1_000)),
+        ];
+        append_records(&path, &records).unwrap();
+        assert_eq!(
+            scan_records(&path).unwrap(),
+            summarize_records(&records).unwrap()
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn streaming_scan_truncates_only_an_unterminated_invalid_tail() {
+        let path = temp_path("truncated-tail");
+        let first = record(&evaluated_event(4_000, 10_000));
+        append_records(&path, std::slice::from_ref(&first)).unwrap();
+        OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"{\"schema_version\":")
+            .unwrap();
+
+        let stats = scan_records(&path).unwrap();
+        assert_eq!(stats.total, 1);
+        assert_eq!(read_records(&path).unwrap(), vec![first]);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn streaming_scan_rejects_terminated_corruption() {
+        let path = temp_path("interior-corruption");
+        let first = record(&evaluated_event(4_000, 10_000));
+        append_records(&path, std::slice::from_ref(&first)).unwrap();
+        OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"{not-json}\n")
+            .unwrap();
+
+        assert!(scan_records(&path).is_err());
         fs::remove_file(path).unwrap();
     }
 
