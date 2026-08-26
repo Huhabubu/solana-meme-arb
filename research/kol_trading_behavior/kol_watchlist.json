@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "notes": [
+    "地址用于公开链上行为研究，不代表地址所有交易均为纯手动。",
+    "identity_confidence 与 manual_confidence 分开记录；candidate 项需要继续核验。",
+    "BNB Chain chainId=56，Solana chainId=501。"
+  ],
+  "kols": [
+    {"name":"阿峰","aliases":["Afeng","@aa_AFeng"],"chain":"BNB Chain","chain_id":"56","address":"0xbf004bff64725914ee36d03b87d6965b0ced4903","tier":"primary","identity_confidence":"high","manual_confidence":"high","note":"OKX 有阿峰_Afeng标签；优先人工KOL样本。"},
+    {"name":"枯坐P小将","aliases":["枯坐p小将","@rob02643673_rob"],"chain":"BNB Chain","chain_id":"56","address":"0x2ce9d43d1cba6ae31d7f07bfe0098dfa2d833373","tier":"primary","identity_confidence":"high","manual_confidence":"high","note":"OKX 有枯坐p小将标签；优先人工KOL样本。"},
+    {"name":"西瓜","aliases":["西瓜🔶BNB","@XIGUA0903"],"chain":"BNB Chain","chain_id":"56","address":"0x5388668c4fa8da7f756ef8498ff24d7999999999","tier":"primary","identity_confidence":"high","manual_confidence":"high","note":"公开资料与OKX标签可交叉验证；优先人工样本。"},
+    {"name":"金狗挖掘机","aliases":["0xDavid"],"chain":"BNB Chain","chain_id":"56","address":"0x7a2363a401b2340c7941dd2eeff0196a5078d2e6","tier":"primary","identity_confidence":"medium","manual_confidence":"medium","note":"候选主样本，继续核验身份与执行方式。"},
+    {"name":"Felix","aliases":["@0xFelix"],"chain":"BNB Chain","chain_id":"56","address":"0x9ba457f105bffac35d67138fecb32a86428c02a2","tier":"primary","identity_confidence":"medium","manual_confidence":"medium","note":"候选主样本，继续核验身份与执行方式。"},
+    {"name":"Cowboy","aliases":[],"chain":"BNB Chain","chain_id":"56","address":"0x7d9471511a6c027e978adaf02014c3d2f40a0571","tier":"primary","identity_confidence":"medium","manual_confidence":"medium","note":"候选主样本，继续核验身份与执行方式。"},
+    {"name":"王小二","aliases":["王小二.eth"],"chain":"BNB Chain","chain_id":"56","address":"0x176e6378b7c9010f0456bee76ce3039d36dc37c8","tier":"primary","identity_confidence":"high","manual_confidence":"medium","note":"公开区块浏览器有王小二.eth标签；执行方式仍需研究。"},
+    {"name":"冷静冷静再冷静","aliases":["冷静冷静再冷静.eth"],"chain":"BNB Chain","chain_id":"56","address":"0xeb89055e16ae1c1e42ad6770a7344ff5c7b4f31d","tier":"primary","identity_confidence":"high","manual_confidence":"medium","note":"公开区块浏览器/OKX有身份标签；执行方式仍需研究。"},
+
+    {"name":"oxsun","aliases":[],"chain":"BNB Chain","chain_id":"56","address":"0x3e57efef507b4db7acfa2ee79ceca6b19e18d106","tier":"secondary","identity_confidence":"low","manual_confidence":"unknown","note":"来自公开聪明钱/KOL列表，正式入样前需核验。"},
+    {"name":"深大高材生","aliases":[],"chain":"BNB Chain","chain_id":"56","address":"0x51fbb0b8164231c116acdce55db3d5c0d9650987","tier":"secondary","identity_confidence":"low","manual_confidence":"unknown","note":"来自公开聪明钱/KOL列表，正式入样前需核验。"},
+    {"name":"dou/a10","aliases":["dou","a10"],"chain":"BNB Chain","chain_id":"56","address":"0x5e6ddc715680f941e732c636afec28a24c8f5738","tier":"secondary","identity_confidence":"low","manual_confidence":"unknown","note":"来自公开聪明钱/KOL列表，正式入样前需核验。"},
+    {"name":"海豚哥","aliases":[],"chain":"BNB Chain","chain_id":"56","address":"0x8f6448ea8a6a0d223acf4f2746dab5d032c65b72","tier":"secondary","identity_confidence":"low","manual_confidence":"unknown","note":"来自公开聪明钱/KOL列表，正式入样前需核验。"},
+    {"name":"Wick李","aliases":[],"chain":"BNB Chain","chain_id":"56","address":"0x7e8fb0392542812476d9f2d0d71c01d1fa0776c5","tier":"secondary","identity_confidence":"low","manual_confidence":"unknown","note":"来自公开聪明钱/KOL列表，正式入样前需核验。"},
+    {"name":"币圈慈善家/Ryan","aliases":["币圈慈善家","Ryan"],"chain":"BNB Chain","chain_id":"56","address":"0x558e254c1399766bddbabe6a5b3d44ccf627dbc4","tier":"secondary","identity_confidence":"low","manual_confidence":"unknown","note":"来自公开KOL/聪明钱列表，正式入样前需核验。"},
+    {"name":"Cupsey","aliases":[],"chain":"BNB Chain","chain_id":"56","address":"0x3475831749ea6c9992e638d01427453b9cc83a12","tier":"secondary","identity_confidence":"low","manual_confidence":"unknown","note":"来自公开聪明钱/KOL列表，正式入样前需核验。"},
+
+    {"name":"S","aliases":["@runitbackghost"],"chain":"Solana","chain_id":"501","address":"ApRnQN2HkbCn7W2WWiT2FEKvuKJp9LugRyAE1a9Hdz1","tier":"solana_candidate","identity_confidence":"low","manual_confidence":"unknown","note":"公开跟单研究列表候选；正式入样前需核验。"},
+    {"name":"KIKI","aliases":["@Kiki25140290"],"chain":"Solana","chain_id":"501","address":"33ejysPvHzoXPirP6dGRnA6FbK8QknRYPL8yJ7uzECgY","tier":"solana_candidate","identity_confidence":"low","manual_confidence":"unknown","note":"公开跟单研究列表候选；正式入样前需核验。"},
+    {"name":"mercy","aliases":["@mercularx"],"chain":"Solana","chain_id":"501","address":"F5jWYuiDLTiaLYa54D88YbpXgEsA6NKHzWy4SN4bMYjt","tier":"solana_candidate","identity_confidence":"low","manual_confidence":"unknown","note":"公开跟单研究列表候选；正式入样前需核验。"},
+    {"name":"kanye","aliases":[],"chain":"Solana","chain_id":"501","address":"86AEJExyjeNNgcp7GrAvCXTDicf5aGWgoERbXFiG1EdD","tier":"solana_candidate","identity_confidence":"low","manual_confidence":"unknown","note":"公开跟单研究列表候选；正式入样前需核验。"},
+    {"name":"0xMoco","aliases":[],"chain":"Solana","chain_id":"501","address":"FZVdsFTRTWwZEy6XC5GCtHNWdcAwiQtAeJ2NSpH6cQNz","tier":"solana_candidate","identity_confidence":"low","manual_confidence":"low","note":"公开资料描述速度极快，可能bot-assisted，仅作为对照组。"}
+  ]
+}
