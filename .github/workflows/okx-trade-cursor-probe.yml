@@ -1,0 +1,23 @@
+name: okx-trade-cursor-probe
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "research/kol_trading_behavior/OKX成交分页探针.py"
+      - ".github/workflows/okx-trade-cursor-probe.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Probe OKX cursor/time filters
+        run: python "research/kol_trading_behavior/OKX成交分页探针.py"
