@@ -1,0 +1,12 @@
+{
+  "secret_present": true,
+  "http": {
+    "status": 200,
+    "jsonrpc_ok": true,
+    "rpc_error_code": null
+  },
+  "wss": {
+    "status": 101,
+    "status_line": "HTTP/1.1 101 Switching Protocols"
+  }
+}
