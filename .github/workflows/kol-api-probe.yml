@@ -8,6 +8,7 @@ on:
     paths:
       - "research/kol_trading_behavior/kol_watchlist.json"
       - "research/kol_trading_behavior/KOL首买事件研究.py"
+      - "research/kol_trading_behavior/KOL首买事件研究_v2.py"
       - ".github/workflows/kol-api-probe.yml"
 
 permissions:
@@ -21,9 +22,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
-      - name: Run BNB primary KOL study
+      - name: Run BNB primary KOL study v2
         run: |
-          python "research/kol_trading_behavior/KOL首买事件研究.py" \
+          python "research/kol_trading_behavior/KOL首买事件研究_v2.py" \
             --chains 56 \
             --tiers primary \
             --recent-mints 20 \
@@ -33,16 +34,18 @@ jobs:
             --max-kol-history-rows 600 \
             --pre-window-seconds 5 \
             --post-window-seconds 300 \
+            --entry-window-seconds 16 \
+            --max-entry-pages 30 \
             --max-market-pages 30 \
             --workers 3 \
-            --output-dir /tmp/kol-first-buy-bnb-primary
+            --output-dir /tmp/kol-first-buy-bnb-primary-v2
 
-      - name: Upload BNB primary study
+      - name: Upload BNB primary study v2
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: kol-first-buy-bnb-primary-${{ github.sha }}
-          path: /tmp/kol-first-buy-bnb-primary/
+          name: kol-first-buy-bnb-primary-v2-${{ github.sha }}
+          path: /tmp/kol-first-buy-bnb-primary-v2/
           if-no-files-found: warn
           retention-days: 14
 
@@ -53,9 +56,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
-      - name: Run BNB secondary KOL study
+      - name: Run BNB secondary KOL study v2
         run: |
-          python "research/kol_trading_behavior/KOL首买事件研究.py" \
+          python "research/kol_trading_behavior/KOL首买事件研究_v2.py" \
             --chains 56 \
             --tiers secondary \
             --recent-mints 20 \
@@ -65,16 +68,18 @@ jobs:
             --max-kol-history-rows 600 \
             --pre-window-seconds 5 \
             --post-window-seconds 300 \
+            --entry-window-seconds 16 \
+            --max-entry-pages 30 \
             --max-market-pages 30 \
             --workers 3 \
-            --output-dir /tmp/kol-first-buy-bnb-secondary
+            --output-dir /tmp/kol-first-buy-bnb-secondary-v2
 
-      - name: Upload BNB secondary study
+      - name: Upload BNB secondary study v2
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: kol-first-buy-bnb-secondary-${{ github.sha }}
-          path: /tmp/kol-first-buy-bnb-secondary/
+          name: kol-first-buy-bnb-secondary-v2-${{ github.sha }}
+          path: /tmp/kol-first-buy-bnb-secondary-v2/
           if-no-files-found: warn
           retention-days: 14
 
@@ -85,9 +90,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
-      - name: Run Solana candidate study
+      - name: Run Solana candidate study v2
         run: |
-          python "research/kol_trading_behavior/KOL首买事件研究.py" \
+          python "research/kol_trading_behavior/KOL首买事件研究_v2.py" \
             --chains 501 \
             --tiers solana_candidate \
             --recent-mints 10 \
@@ -97,15 +102,17 @@ jobs:
             --max-kol-history-rows 600 \
             --pre-window-seconds 5 \
             --post-window-seconds 300 \
+            --entry-window-seconds 16 \
+            --max-entry-pages 30 \
             --max-market-pages 30 \
             --workers 2 \
-            --output-dir /tmp/kol-first-buy-solana
+            --output-dir /tmp/kol-first-buy-solana-v2
 
-      - name: Upload Solana study
+      - name: Upload Solana study v2
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: kol-first-buy-solana-${{ github.sha }}
-          path: /tmp/kol-first-buy-solana/
+          name: kol-first-buy-solana-v2-${{ github.sha }}
+          path: /tmp/kol-first-buy-solana-v2/
           if-no-files-found: warn
           retention-days: 14
