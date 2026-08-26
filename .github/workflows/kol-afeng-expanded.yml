@@ -7,6 +7,7 @@ on:
       - main
     paths:
       - "research/kol_trading_behavior/kol_watchlist_afeng.json"
+      - "research/kol_trading_behavior/KOL阿峰扩样本研究.py"
       - "research/kol_trading_behavior/KOL首买事件研究_v4.py"
       - "research/kol_trading_behavior/KOL首买事件研究_v3.py"
       - "research/kol_trading_behavior/KOL首买事件研究_v2.py"
@@ -18,14 +19,14 @@ permissions:
 jobs:
   afeng-expanded-30d:
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 120
     steps:
       - name: Checkout
         uses: actions/checkout@v7
 
-      - name: Run Afeng expanded 30-day study
+      - name: Run Afeng paginated 30-day study
         run: |
-          python "research/kol_trading_behavior/KOL首买事件研究_v4.py" \
+          python "research/kol_trading_behavior/KOL阿峰扩样本研究.py" \
             --watchlist "research/kol_trading_behavior/kol_watchlist_afeng.json" \
             --chains 56 \
             --tiers primary \
