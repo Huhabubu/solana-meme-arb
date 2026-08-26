@@ -1,0 +1,48 @@
+name: kol-afeng-500mints
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/kol-afeng-500mints.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  afeng-500mints:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Run Afeng 500-Mint expansion
+        run: |
+          python "research/kol_trading_behavior/KOL阿峰扩样本研究.py" \
+            --watchlist "research/kol_trading_behavior/kol_watchlist_afeng.json" \
+            --chains 56 \
+            --tiers primary \
+            --recent-mints 500 \
+            --min-first-buy-usd 100 \
+            --max-event-age-hours 720 \
+            --max-follower-event-age-hours 720 \
+            --max-kol-history-rows 5000 \
+            --pre-window-seconds 5 \
+            --post-window-seconds 300 \
+            --entry-window-seconds 16 \
+            --max-entry-pages 50 \
+            --max-market-pages 100 \
+            --workers 3 \
+            --output-dir /tmp/kol-afeng-500mints
+
+      - name: Upload Afeng 500-Mint expansion
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: kol-afeng-500mints-${{ github.sha }}
+          path: /tmp/kol-afeng-500mints/
+          if-no-files-found: warn
+          retention-days: 14
