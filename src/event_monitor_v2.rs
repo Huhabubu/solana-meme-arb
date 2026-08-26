@@ -37,7 +37,7 @@ const DEFAULT_MAX_RECONNECTS: usize = 20;
 const DEFAULT_POOL_CACHE_TTL_SECONDS: u64 = 300;
 const DEFAULT_PARSE_RETRIES: usize = 5;
 const SIGNATURE_DEDUP_CAPACITY: usize = 20_000;
-const EVENT_SCHEMA: &str = "event-driven-v2";
+const EVENT_SCHEMA: &str = "large-swap-event-v1";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RawProgramTransaction {
@@ -100,6 +100,7 @@ struct OpportunityRecord {
     first_pool: String,
     second_dex: String,
     second_pool: String,
+    route_contains_trigger_pool: Option<bool>,
     input_lamports: u64,
     status: &'static str,
     liquidity_stage: Option<&'static str>,
@@ -129,6 +130,7 @@ impl From<&OpportunityEvent> for OpportunityRecord {
                 first_pool: event.first_pool.clone(),
                 second_dex: event.second_dex.to_string(),
                 second_pool: event.second_pool.clone(),
+                route_contains_trigger_pool: None,
                 input_lamports: event.input_amount,
                 status: "evaluated",
                 liquidity_stage: None,
@@ -145,6 +147,7 @@ impl From<&OpportunityEvent> for OpportunityRecord {
                 first_pool: event.first_pool.clone(),
                 second_dex: event.second_dex.to_string(),
                 second_pool: event.second_pool.clone(),
+                route_contains_trigger_pool: None,
                 input_lamports: event.input_amount,
                 status: "insufficient_liquidity",
                 liquidity_stage: Some(match stage {
@@ -170,11 +173,20 @@ struct EventRecord {
     signature: String,
     event_slot: u64,
     trigger_program: String,
+    trigger_dex: Option<&'static str>,
+    trigger_pool: Option<String>,
+    trigger_pool_match_count: usize,
     source: String,
     direction: DirectSwapDirection,
     token_mint: String,
     wsol_amount_lamports: Option<u64>,
     token_amount_raw: Option<u64>,
+    trigger_received_at_unix_ms: u64,
+    tx_parsed_at_unix_ms: u64,
+    pool_discovery_done_at_unix_ms: u64,
+    quote_done_at_unix_ms: u64,
+    parse_ms: u64,
+    total_event_to_quote_ms: u64,
     pool_discovery_ok: bool,
     pool_discovery_ms: u64,
     candidate_pool_count: usize,
@@ -685,6 +697,37 @@ fn parse_direct_wsol_swap(
     }))
 }
 
+fn transaction_account_keys(transaction: &Value) -> HashSet<String> {
+    transaction
+        .get("accountData")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.get("account").and_then(Value::as_str))
+        .map(str::to_owned)
+        .collect()
+}
+
+fn trigger_dex_for_program(program_id: &str) -> Option<&'static str> {
+    match program_id {
+        RAYDIUM_AMM_V4_PROGRAM_ID => Some("raydium"),
+        ORCA_WHIRLPOOL_PROGRAM_ID => Some("orca"),
+        DLMM_PROGRAM_ID => Some("meteora_dlmm"),
+        _ => None,
+    }
+}
+
+fn resolve_trigger_pool(transaction: &Value, pools: &[PoolInfo]) -> (Option<String>, usize) {
+    let accounts = transaction_account_keys(transaction);
+    let matches = pools
+        .iter()
+        .filter(|pool| accounts.contains(&pool.address))
+        .collect::<Vec<_>>();
+    let count = matches.len();
+    let resolved = (count == 1).then(|| matches[0].address.clone());
+    (resolved, count)
+}
+
 fn is_supported_quote_pool(pool: &PoolInfo) -> bool {
     match pool.dex {
         Dex::Raydium => {
@@ -742,6 +785,7 @@ impl DynamicPoolRegistry {
 
 fn summarize_opportunities(
     events: &[OpportunityEvent],
+    trigger_pool: Option<&str>,
 ) -> (
     usize,
     usize,
@@ -775,7 +819,16 @@ fn summarize_opportunities(
         net_positive,
         best_profit,
         best_return,
-        events.iter().map(OpportunityRecord::from).collect(),
+        events
+            .iter()
+            .map(|event| {
+                let mut record = OpportunityRecord::from(event);
+                record.route_contains_trigger_pool = trigger_pool.map(|pool| {
+                    event.first_pool.as_str() == pool || event.second_pool.as_str() == pool
+                });
+                record
+            })
+            .collect(),
     )
 }
 
@@ -893,6 +946,9 @@ pub async fn run() -> Result<()> {
                 continue;
             }
 
+            let event_started = Instant::now();
+            let trigger_received_at_unix_ms = unix_timestamp_millis()?;
+            let parse_started = Instant::now();
             let parsed = match fetch_enhanced_transaction(
                 &client,
                 &config,
@@ -919,6 +975,8 @@ pub async fn run() -> Result<()> {
                 non_direct_swaps += 1;
                 continue;
             };
+            let parse_ms = u64::try_from(parse_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            let tx_parsed_at_unix_ms = unix_timestamp_millis()?;
             if monitor_config.min_wsol_lamports > 0 {
                 let passes = event
                     .wsol_amount_lamports
@@ -944,6 +1002,9 @@ pub async fn run() -> Result<()> {
                 };
             let pool_discovery_ms =
                 u64::try_from(discovery_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            let pool_discovery_done_at_unix_ms = unix_timestamp_millis()?;
+            let trigger_dex = trigger_dex_for_program(&event.trigger_program);
+            let (trigger_pool, trigger_pool_match_count) = resolve_trigger_pool(&parsed, &pools);
 
             let quote_started = Instant::now();
             let (quote_status, quote_snapshot_slot, route_count, opportunity_events) =
@@ -979,8 +1040,11 @@ pub async fn run() -> Result<()> {
                 };
             let quote_eval_ms =
                 u64::try_from(quote_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            let quote_done_at_unix_ms = unix_timestamp_millis()?;
+            let total_event_to_quote_ms =
+                u64::try_from(event_started.elapsed().as_millis()).unwrap_or(u64::MAX);
             let (evaluated_count, net_positive_count, best_profit, best_return, opportunities) =
-                summarize_opportunities(&opportunity_events);
+                summarize_opportunities(&opportunity_events, trigger_pool.as_deref());
             if net_positive_count > 0 {
                 net_positive_events += 1;
             }
@@ -992,11 +1056,20 @@ pub async fn run() -> Result<()> {
                 signature: event.signature.clone(),
                 event_slot: event.slot,
                 trigger_program: event.trigger_program.clone(),
+                trigger_dex,
+                trigger_pool: trigger_pool.clone(),
+                trigger_pool_match_count,
                 source: event.source.clone(),
                 direction: event.direction,
                 token_mint: event.token_mint.clone(),
                 wsol_amount_lamports: event.wsol_amount_lamports,
                 token_amount_raw: event.token_amount_raw,
+                trigger_received_at_unix_ms,
+                tx_parsed_at_unix_ms,
+                pool_discovery_done_at_unix_ms,
+                quote_done_at_unix_ms,
+                parse_ms,
+                total_event_to_quote_ms,
                 pool_discovery_ok,
                 pool_discovery_ms,
                 candidate_pool_count: candidate_pools.len(),
@@ -1014,19 +1087,22 @@ pub async fn run() -> Result<()> {
             append_event_record(&log_path, &record)?;
             accepted_events += 1;
             println!(
-                "Event-driven V2 event #{accepted_events}: event_slot={} quote_slot={:?} mint={} direction={:?} wsol_lamports={:?} pools={} routes={} evaluated={} net_positive={} best_net_lamports={:?} discovery_ms={} quote_ms={} signature={}",
+                "Event-driven V2 event #{accepted_events}: event_slot={} quote_slot={:?} mint={} direction={:?} wsol_lamports={:?} trigger_pool={:?} pools={} routes={} evaluated={} net_positive={} best_net_lamports={:?} parse_ms={} discovery_ms={} quote_ms={} total_ms={} signature={}",
                 event.slot,
                 quote_snapshot_slot,
                 event.token_mint,
                 event.direction,
                 event.wsol_amount_lamports,
+                trigger_pool,
                 pools.len(),
                 route_count,
                 evaluated_count,
                 net_positive_count,
                 best_profit,
+                parse_ms,
                 pool_discovery_ms,
                 quote_eval_ms,
+                total_event_to_quote_ms,
                 event.signature
             );
         }
@@ -1093,6 +1169,33 @@ mod tests {
         assert!(parse_direct_wsol_swap(&transaction, &trigger("sig-b"))
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn resolves_trigger_pool_from_enhanced_account_data() {
+        let transaction = json!({
+            "accountData": [
+                {"account": "user"},
+                {"account": "ray-trigger"},
+                {"account": "vault"}
+            ]
+        });
+        let pools = vec![PoolInfo {
+            dex: Dex::Raydium,
+            address: "ray-trigger".into(),
+            pool_type: "Standard".into(),
+            program_id: Some(RAYDIUM_AMM_V4_PROGRAM_ID.into()),
+            mint_a: "M".into(),
+            mint_b: WSOL.into(),
+            tvl_usd: 10_000.0,
+        }];
+        let (pool, count) = resolve_trigger_pool(&transaction, &pools);
+        assert_eq!(pool.as_deref(), Some("ray-trigger"));
+        assert_eq!(count, 1);
+        assert_eq!(
+            trigger_dex_for_program(RAYDIUM_AMM_V4_PROGRAM_ID),
+            Some("raydium")
+        );
     }
 
     #[test]
