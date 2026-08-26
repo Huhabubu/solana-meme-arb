@@ -8,7 +8,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 8
     env:
-      HELIUS_API_KEY: ${{ secrets.HELIUS_API_KEY }}
+      HELIUS_API_KEY_V2: ${{ secrets.HELIUS_API_KEY_V2 }}
       EVENT_LOG_PATH: /tmp/event-driven-v2.jsonl
       EVENT_MONITOR_MAX_EVENTS: "1"
       EVENT_MONITOR_MAX_SECONDS: "180"
@@ -19,8 +19,8 @@ jobs:
       - name: Checkout branch
         uses: actions/checkout@v7
 
-      - name: Require Helius key
-        run: test -n "$HELIUS_API_KEY"
+      - name: Require replacement Helius key
+        run: test -n "$HELIUS_API_KEY_V2"
 
       - name: Install stable Rust
         run: |
