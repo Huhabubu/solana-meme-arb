@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""KOL 首笔建仓事件研究（只读）。
+"""KOL 首买事件研究（只读）。
 
 研究问题：公开 KOL 对某 Mint 的历史首笔明显买入出现后，延迟 1/2/3/5/10 秒
-跟入，价格路径是否仍有正收益窗口；同时观察首买后的非 KOL 跟单压力。
+跟入，价格路径是否仍有正收益窗口；同时比较 KOL 自身收益、跟单压力和跟随者收益。
 
 口径：
-- pnl/token-list 只用于发现近期活跃 Mint，不使用网页/PnL 的交易次数。
+- pnl/token-list 只用于发现近期活跃 Mint，并保留其 PnL 字段作为参考；不使用网页/PnL 的交易次数。
 - trading-history/filter-list + userAddressList=[KOL] 恢复 KOL×Mint 历史成交。
 - userAddressList=[] 恢复事件附近全市场逐笔成交，统计跟单压力。
 - 价格路径优先使用 OKX 1 秒 K 线；若 K 线窗口不可用，仅在逐笔窗口完整时回退逐笔价格。
-- 本研究计算的是价格层面的毛收益，不包含实际跟单滑点、Gas、税费和 MEV。
+- KOL 首买->首卖收益按逐笔实际成交价计算。
+- 整轮 KOL 收益仅在按成交数量估算剩余仓位 <=1% 时，将 SELL USD - BUY USD 视为已完成轮次毛收益。
+- 所有收益均未扣除跟随者自己的 Gas、买卖税、滑点、价格冲击和 MEV。
 """
 
 from __future__ import annotations
@@ -34,7 +36,7 @@ UA = (
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 )
 DELAYS_S = (1, 2, 3, 5, 10)
-HORIZONS_S = (5, 10, 30, 60, 300)
+HORIZONS_S = (5, 10, 20, 30, 60, 300)
 PRESSURE_WINDOWS_S = (1, 3, 5, 10)
 
 
@@ -121,12 +123,9 @@ def trade_payload(chain_id: str, mint: str, users: List[str], data_id: Optional[
             "type": "0",
             "currentUserWalletAddress": "",
             "userAddressList": users,
-            "volumeMin": "",
-            "volumeMax": "",
-            "priceMin": "",
-            "priceMax": "",
-            "amountMin": "",
-            "amountMax": "",
+            "volumeMin": "", "volumeMax": "",
+            "priceMin": "", "priceMax": "",
+            "amountMin": "", "amountMax": "",
         },
     }
     if data_id:
@@ -163,7 +162,7 @@ def fetch_kol_history(wallet: str, chain_id: str, mint: str, max_rows: int) -> T
     data_id: Optional[str] = None
     complete = False
     pages = 0
-    while len(rows) < max_rows and pages < 200:
+    while len(rows) < max_rows and pages < 300:
         data = fetch_trade_page(chain_id, mint, [wallet], data_id)
         page = data.get("list") or []
         if not page:
@@ -178,7 +177,7 @@ def fetch_kol_history(wallet: str, chain_id: str, mint: str, max_rows: int) -> T
         if not next_id or next_id == data_id:
             break
         data_id = next_id
-        time.sleep(0.03)
+        time.sleep(0.025)
     return dedup_rows(rows)[:max_rows], complete
 
 
@@ -211,14 +210,13 @@ def fetch_market_window(
         if str(data.get("hasMore", "0")) != "1" or not next_id or next_id == data_id:
             break
         data_id = next_id
-        time.sleep(0.02)
+        time.sleep(0.015)
     rows = dedup_rows(rows)
     rows.sort(key=lambda r: inum(r.get("timestamp")))
     return rows, covered_start, pages
 
 
 def fetch_candles(chain_id: str, mint: str, start_ms: int, end_ms: int) -> Tuple[List[Dict[str, float]], bool]:
-    """请求覆盖事件窗口的 1 秒 K 线；OKX after 按向过去分页口径使用。"""
     limit = min(1000, max(420, int((end_ms - start_ms) / 1000) + 60))
     params = {
         "chainId": chain_id,
@@ -234,26 +232,21 @@ def fetch_candles(chain_id: str, mint: str, start_ms: int, end_ms: int) -> Tuple
     )
     if status != 200 or str(body.get("code")) != "0":
         return [], False
-    raw = body.get("data") or []
     rows: List[Dict[str, float]] = []
-    for item in raw:
+    for item in body.get("data") or []:
         if not isinstance(item, list) or len(item) < 5:
             continue
         ts = inum(item[0])
         if start_ms <= ts <= end_ms + 2000:
             rows.append({
                 "timestamp": float(ts),
-                "open": fnum(item[1]),
-                "high": fnum(item[2]),
-                "low": fnum(item[3]),
-                "close": fnum(item[4]),
+                "open": fnum(item[1]), "high": fnum(item[2]),
+                "low": fnum(item[3]), "close": fnum(item[4]),
             })
     rows.sort(key=lambda r: int(r["timestamp"]))
     if not rows:
         return [], False
-    min_ts = int(rows[0]["timestamp"])
-    max_ts = int(rows[-1]["timestamp"])
-    covered = min_ts <= start_ms + 5000 and max_ts >= end_ms - 5000
+    covered = int(rows[0]["timestamp"]) <= start_ms + 5000 and int(rows[-1]["timestamp"]) >= end_ms - 5000
     return rows, covered
 
 
@@ -266,6 +259,16 @@ def row_price(r: Optional[Dict[str, Any]]) -> Optional[float]:
         return None
     p = fnum(r.get("price"))
     return p if p > 0 else None
+
+
+def token_qty(r: Dict[str, Any]) -> float:
+    for key in ("amount", "tokenAmount", "tokenQuantity", "quantity"):
+        q = fnum(r.get(key))
+        if q > 0:
+            return q
+    p = row_price(r)
+    v = fnum(r.get("volume"))
+    return (v / p) if p and p > 0 and v > 0 else 0.0
 
 
 def first_trade_after(rows: List[Dict[str, Any]], target_ms: int, wait_ms: int = 5000) -> Optional[Dict[str, Any]]:
@@ -282,8 +285,7 @@ def first_trade_after(rows: List[Dict[str, Any]], target_ms: int, wait_ms: int =
 def candle_price(rows: List[Dict[str, float]], target_ms: int, tolerance_ms: int = 5000) -> Optional[float]:
     best: Optional[Tuple[int, float]] = None
     for r in rows:
-        ts = int(r["timestamp"])
-        d = abs(ts - target_ms)
+        d = abs(int(r["timestamp"]) - target_ms)
         if d <= tolerance_ms and r["close"] > 0 and (best is None or d < best[0]):
             best = (d, r["close"])
     return best[1] if best else None
@@ -304,25 +306,55 @@ def pressure(rows: List[Dict[str, Any]], wallet: str, t0: int, sec: int) -> Dict
     ]
     buys = [r for r in xs if is_buy(r)]
     sells = [r for r in xs if not is_buy(r)]
-    buy_usd = sum(fnum(r.get("volume")) for r in buys)
-    sell_usd = sum(fnum(r.get("volume")) for r in sells)
+    buy_value = sum(fnum(r.get("volume")) for r in buys)
+    sell_value = sum(fnum(r.get("volume")) for r in sells)
     buyers = {str(r.get("userAddress") or "").lower() for r in buys if r.get("userAddress")}
     return {
         f"followers_{sec}s_buy_trades": len(buys),
         f"followers_{sec}s_unique_buyers": len(buyers),
-        f"followers_{sec}s_buy_usd": round(buy_usd, 6),
-        f"followers_{sec}s_sell_usd": round(sell_usd, 6),
-        f"followers_{sec}s_net_buy_usd": round(buy_usd - sell_usd, 6),
+        f"followers_{sec}s_buy_usd": round(buy_value, 6),
+        f"followers_{sec}s_sell_usd": round(sell_value, 6),
+        f"followers_{sec}s_net_buy_usd": round(buy_value - sell_value, 6),
     }
 
 
-def buy_usd(rows: List[Dict[str, Any]], wallet: str, start: int, end: int) -> float:
+def non_kol_buy_usd(rows: List[Dict[str, Any]], wallet: str, start: int, end: int) -> float:
     return sum(
         fnum(r.get("volume")) for r in rows
         if start <= inum(r.get("timestamp")) < end
         and is_buy(r)
         and str(r.get("userAddress") or "").lower() != wallet.lower()
     )
+
+
+def kol_round_metrics(chron: List[Dict[str, Any]]) -> Dict[str, Any]:
+    buys = [r for r in chron if is_buy(r)]
+    sells = [r for r in chron if not is_buy(r)]
+    buy_usd = sum(fnum(r.get("volume")) for r in buys)
+    sell_usd = sum(fnum(r.get("volume")) for r in sells)
+    buy_qty = sum(token_qty(r) for r in buys)
+    sell_qty = sum(token_qty(r) for r in sells)
+    remaining_qty = buy_qty - sell_qty
+    remaining_pct = remaining_qty / buy_qty if buy_qty > 0 else None
+    closed = remaining_pct is not None and abs(remaining_pct) <= 0.01
+    cashflow = sell_usd - buy_usd
+    roi_bps = (cashflow / buy_usd * 10000.0) if closed and buy_usd > 0 else None
+    buy_vwap = (buy_usd / buy_qty) if buy_qty > 0 else None
+    sell_vwap = (sell_usd / sell_qty) if sell_qty > 0 else None
+    return {
+        "kol_total_buy_usd": round(buy_usd, 6),
+        "kol_total_sell_usd": round(sell_usd, 6),
+        "kol_total_buy_qty": buy_qty,
+        "kol_total_sell_qty": sell_qty,
+        "kol_remaining_qty_est": remaining_qty,
+        "kol_remaining_pct_est": round(remaining_pct, 6) if remaining_pct is not None else None,
+        "kol_round_closed_est": closed,
+        "kol_round_cashflow_usd": round(cashflow, 6),
+        "kol_round_realized_pnl_usd": round(cashflow, 6) if closed else None,
+        "kol_round_realized_roi_bps": round(roi_bps, 3) if roi_bps is not None else None,
+        "kol_buy_vwap": buy_vwap,
+        "kol_sell_vwap": sell_vwap,
+    }
 
 
 def analyze_event(
@@ -349,8 +381,8 @@ def analyze_event(
         return None
 
     later = [r for r in chron if inum(r.get("timestamp")) > t0]
-    sells = [r for r in later if not is_buy(r)]
-    first_sell = sells[0] if sells else None
+    later_sells = [r for r in later if not is_buy(r)]
+    first_sell = later_sells[0] if later_sells else None
     sell_ts = inum(first_sell.get("timestamp")) if first_sell else None
     sell_delay = (sell_ts - t0) / 1000 if sell_ts else None
     before_sell_buys = [
@@ -361,56 +393,58 @@ def analyze_event(
 
     start = t0 - args.pre_window_seconds * 1000
     end = t0 + args.post_window_seconds * 1000
-    market, market_complete, market_pages = fetch_market_window(
-        chain_id, mint, start, end, args.max_market_pages
-    )
     try:
         candles, candle_complete = fetch_candles(chain_id, mint, start, end)
     except Exception:  # noqa: BLE001
         candles, candle_complete = [], False
 
+    market: List[Dict[str, Any]] = []
+    market_complete = False
+    market_pages = 0
+    if age_h <= args.max_follower_event_age_hours:
+        try:
+            market, market_complete, market_pages = fetch_market_window(
+                chain_id, mint, start, end, args.max_market_pages
+            )
+        except Exception:  # noqa: BLE001
+            market, market_complete, market_pages = [], False, 0
+
     price_source = "kline_1s" if candle_complete else ("market_trades" if market_complete else None)
     price_complete = price_source is not None
+    first_sell_ret = bps(row_price(first), row_price(first_sell))
 
     event: Dict[str, Any] = {
-        "kol": kol["name"],
-        "kol_address": wallet,
-        "chain": kol["chain"],
-        "chain_id": chain_id,
-        "tier": kol["tier"],
-        "symbol": pnl_item.get("tokenSymbol"),
-        "mint": mint,
-        "t0_ms": t0,
-        "event_age_hours": round(age_h, 4),
-        "first_buy_usd": round(first_usd, 6),
-        "first_buy_price": row_price(first),
-        "first_buy_id": first.get("id"),
-        "first_buy_tx_hash": tx_hash(first),
-        "history_rows": len(chron),
-        "history_complete": history_complete,
-        "kol_buy_rows": len(buys),
-        "kol_sell_rows": len([r for r in chron if not is_buy(r)]),
+        "kol": kol["name"], "kol_address": wallet,
+        "chain": kol["chain"], "chain_id": chain_id, "tier": kol["tier"],
+        "symbol": pnl_item.get("tokenSymbol"), "mint": mint,
+        "t0_ms": t0, "event_age_hours": round(age_h, 4),
+        "first_buy_usd": round(first_usd, 6), "first_buy_price": row_price(first),
+        "first_buy_id": first.get("id"), "first_buy_tx_hash": tx_hash(first),
+        "history_rows": len(chron), "history_complete": history_complete,
+        "kol_buy_rows": len(buys), "kol_sell_rows": len([r for r in chron if not is_buy(r)]),
         "first_sell_delay_s": round(sell_delay, 3) if sell_delay is not None else None,
         "first_sell_usd": round(fnum(first_sell.get("volume")), 6) if first_sell else None,
-        "first_sell_price": row_price(first_sell),
-        "first_sell_tx_hash": tx_hash(first_sell),
+        "first_sell_price": row_price(first_sell), "first_sell_tx_hash": tx_hash(first_sell),
+        "kol_first_buy_to_first_sell_bps": round(first_sell_ret, 3) if first_sell_ret is not None else None,
         "pre_first_sell_extra_buys": len(before_sell_buys),
         "pre_first_sell_small_probe_buys": len(probes),
-        "small_probe_buy_usd": [round(fnum(r.get("volume")), 6) for r in probes[:30]],
-        "small_probe_tx_hashes": probe_hashes[:30],
+        "small_probe_buy_usd": [round(fnum(r.get("volume")), 6) for r in probes[:50]],
+        "small_probe_tx_hashes": probe_hashes[:50],
         "small_probe_unique_tx_hashes": len(set(probe_hashes)) if probe_hashes else None,
-        "market_rows": len(market),
-        "market_window_complete": market_complete,
-        "market_pages": market_pages,
-        "candle_rows": len(candles),
-        "candle_window_complete": candle_complete,
-        "price_window_complete": price_complete,
-        "price_source": price_source,
+        "market_rows": len(market), "market_window_complete": market_complete, "market_pages": market_pages,
+        "candle_rows": len(candles), "candle_window_complete": candle_complete,
+        "price_window_complete": price_complete, "price_source": price_source,
+        "pnl_reference_total_pnl_usd": fnum(pnl_item.get("totalPnl")),
+        "pnl_reference_total_pnl_pct": fnum(pnl_item.get("totalPnlPercentage")),
+        "pnl_reference_realized_pnl_usd": fnum(pnl_item.get("realizedPnl")),
+        "pnl_reference_unrealized_pnl_usd": fnum(pnl_item.get("unrealizedPnl")),
+        "pnl_reference_balance": fnum(pnl_item.get("balance")),
     }
+    event.update(kol_round_metrics(chron))
 
     if market_complete:
-        pre5 = buy_usd(market, wallet, t0 - 5000, t0)
-        post5 = buy_usd(market, wallet, t0, t0 + 5000)
+        pre5 = non_kol_buy_usd(market, wallet, t0 - 5000, t0)
+        post5 = non_kol_buy_usd(market, wallet, t0, t0 + 5000)
         event["followers_pre5s_buy_usd"] = round(pre5, 6)
         event["followers_post5s_buy_usd"] = round(post5, 6)
         event["followers_post5_vs_pre5_ratio"] = round(post5 / pre5, 6) if pre5 > 0 else None
@@ -438,20 +472,16 @@ def analyze_event(
             entry_ts = None
         event[f"entry_{delay}s_price"] = entry_price
         event[f"entry_{delay}s_actual_delay_ms"] = (entry_ts - t0) if entry_ts else None
+        penalty = bps(row_price(first), entry_price)
+        event[f"entry_{delay}s_vs_kol_entry_bps"] = round(penalty, 3) if penalty is not None else None
 
         if entry_price and price_complete:
             if candle_complete:
-                future = [
-                    r for r in candles
-                    if target <= int(r["timestamp"]) <= end and r["high"] > 0 and r["low"] > 0
-                ]
+                future = [r for r in candles if target <= int(r["timestamp"]) <= end and r["high"] > 0 and r["low"] > 0]
                 max_p = max((r["high"] for r in future), default=None)
                 min_p = min((r["low"] for r in future), default=None)
             else:
-                ps = [
-                    row_price(r) for r in market
-                    if target <= inum(r.get("timestamp")) <= end and row_price(r)
-                ]
+                ps = [row_price(r) for r in market if target <= inum(r.get("timestamp")) <= end and row_price(r)]
                 max_p = max(ps) if ps else None
                 min_p = min(ps) if ps else None
             mfe = bps(entry_price, max_p)
@@ -464,6 +494,10 @@ def analyze_event(
 
         sell_ret = bps(entry_price, row_price(first_sell))
         event[f"entry_{delay}s_to_kol_first_sell_bps"] = round(sell_ret, 3) if sell_ret is not None else None
+        if sell_ret is not None and first_sell_ret is not None:
+            event[f"entry_{delay}s_first_sell_edge_vs_kol_bps"] = round(sell_ret - first_sell_ret, 3)
+        else:
+            event[f"entry_{delay}s_first_sell_edge_vs_kol_bps"] = None
 
         for horizon in HORIZONS_S:
             if horizon <= delay:
@@ -490,44 +524,61 @@ def mean(values: List[float]) -> Optional[float]:
 
 def metric(values: List[float]) -> Dict[str, Any]:
     return {
-        "n": len(values),
-        "median_bps": med(values),
-        "mean_bps": mean(values),
+        "n": len(values), "median_bps": med(values), "mean_bps": mean(values),
         "win_rate": round(sum(v > 0 for v in values) / len(values), 4) if values else None,
     }
+
+
+def bucket_metric(events: List[Dict[str, Any]], key: str) -> Dict[str, Any]:
+    r10 = [float(e["entry_1s_to_10s_bps"]) for e in events if e.get("entry_1s_to_10s_bps") is not None]
+    r30 = [float(e["entry_1s_to_30s_bps"]) for e in events if e.get("entry_1s_to_30s_bps") is not None]
+    return {"events": len(events), "key": key, "entry1_to10": metric(r10), "entry1_to30": metric(r30)}
 
 
 def summarize(events: List[Dict[str, Any]]) -> Dict[str, Any]:
     valid = [e for e in events if e.get("price_window_complete")]
     follower_valid = [e for e in events if e.get("market_window_complete")]
+    closed = [e for e in events if e.get("kol_round_closed_est")]
     out: Dict[str, Any] = {
         "event_count": len(events),
         "price_valid_event_count": len(valid),
         "follower_valid_event_count": len(follower_valid),
-        "by_kol": {},
-        "delay_metrics": {},
-        "follower_pressure": {},
+        "kol_closed_round_count": len(closed),
+        "kol_own": {
+            "first_buy_to_first_sell": metric([
+                float(e["kol_first_buy_to_first_sell_bps"]) for e in events
+                if e.get("kol_first_buy_to_first_sell_bps") is not None
+            ]),
+            "closed_round_roi": metric([
+                float(e["kol_round_realized_roi_bps"]) for e in closed
+                if e.get("kol_round_realized_roi_bps") is not None
+            ]),
+        },
+        "by_kol": {}, "delay_metrics": {}, "follower_pressure": {}, "condition_buckets": {},
     }
-    by: Dict[str, Dict[str, Any]] = defaultdict(lambda: {"events": 0, "price_valid": 0})
-    for e in events:
-        by[e["kol"]]["events"] += 1
-        if e.get("price_window_complete"):
-            by[e["kol"]]["price_valid"] += 1
-    for name, item in by.items():
+
+    names = sorted({e["kol"] for e in events})
+    for name in names:
+        all_es = [e for e in events if e["kol"] == name]
         es = [e for e in valid if e["kol"] == name]
+        own = [float(e["kol_first_buy_to_first_sell_bps"]) for e in all_es if e.get("kol_first_buy_to_first_sell_bps") is not None]
+        own_closed = [float(e["kol_round_realized_roi_bps"]) for e in all_es if e.get("kol_round_realized_roi_bps") is not None]
         r10 = [float(e["entry_1s_to_10s_bps"]) for e in es if e.get("entry_1s_to_10s_bps") is not None]
         r30 = [float(e["entry_1s_to_30s_bps"]) for e in es if e.get("entry_1s_to_30s_bps") is not None]
         sell = [float(e["entry_1s_to_kol_first_sell_bps"]) for e in es if e.get("entry_1s_to_kol_first_sell_bps") is not None]
-        item.update({
-            "entry1_to10_median_bps": med(r10),
-            "entry1_to30_median_bps": med(r30),
-            "entry1_to_first_sell_median_bps": med(sell),
-        })
-        out["by_kol"][name] = item
+        out["by_kol"][name] = {
+            "events": len(all_es), "price_valid": len(es),
+            "kol_first_buy_to_first_sell": metric(own),
+            "kol_closed_round_roi": metric(own_closed),
+            "entry1_to10": metric(r10), "entry1_to30": metric(r30),
+            "entry1_to_first_sell": metric(sell),
+        }
 
     for delay in DELAYS_S:
         d: Dict[str, Any] = {}
+        penalty_key = f"entry_{delay}s_vs_kol_entry_bps"
         sell_key = f"entry_{delay}s_to_kol_first_sell_bps"
+        d["entry_penalty_vs_kol"] = metric([float(e[penalty_key]) for e in valid if e.get(penalty_key) is not None])
         d["to_kol_first_sell"] = metric([float(e[sell_key]) for e in valid if e.get(sell_key) is not None])
         for horizon in HORIZONS_S:
             if horizon <= delay:
@@ -541,11 +592,36 @@ def summarize(events: List[Dict[str, Any]]) -> Dict[str, Any]:
     for sec in PRESSURE_WINDOWS_S:
         unique = [float(e[f"followers_{sec}s_unique_buyers"]) for e in follower_valid if e.get(f"followers_{sec}s_unique_buyers") is not None]
         usd = [float(e[f"followers_{sec}s_buy_usd"]) for e in follower_valid if e.get(f"followers_{sec}s_buy_usd") is not None]
+        net = [float(e[f"followers_{sec}s_net_buy_usd"]) for e in follower_valid if e.get(f"followers_{sec}s_net_buy_usd") is not None]
         out["follower_pressure"][str(sec)] = {
-            "n": len(unique),
-            "median_unique_buyers": med(unique),
-            "median_buy_usd": med(usd),
+            "n": len(unique), "median_unique_buyers": med(unique),
+            "median_buy_usd": med(usd), "median_net_buy_usd": med(net),
         }
+
+    size_defs = [
+        ("100_200", 100, 200), ("200_500", 200, 500),
+        ("500_1000", 500, 1000), ("1000_plus", 1000, math.inf),
+    ]
+    out["condition_buckets"]["first_buy_usd"] = {
+        label: bucket_metric([e for e in valid if lo <= fnum(e.get("first_buy_usd")) < hi], label)
+        for label, lo, hi in size_defs
+    }
+    pressure_defs = [("0_2", 0, 3), ("3_5", 3, 6), ("6_10", 6, 11), ("11_plus", 11, math.inf)]
+    out["condition_buckets"]["followers_3s_unique_buyers"] = {
+        label: bucket_metric([
+            e for e in follower_valid if e.get("price_window_complete")
+            and lo <= fnum(e.get("followers_3s_unique_buyers")) < hi
+        ], label)
+        for label, lo, hi in pressure_defs
+    }
+    net_defs = [("non_positive", -math.inf, 0.000001), ("0_200", 0.000001, 200), ("200_500", 200, 500), ("500_plus", 500, math.inf)]
+    out["condition_buckets"]["followers_5s_net_buy_usd"] = {
+        label: bucket_metric([
+            e for e in follower_valid if e.get("price_window_complete")
+            and lo <= fnum(e.get("followers_5s_net_buy_usd")) < hi
+        ], label)
+        for label, lo, hi in net_defs
+    }
     return out
 
 
@@ -555,13 +631,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--output-dir", default="research/kol_trading_behavior/out_first_buy_study")
     p.add_argument("--chains", default="56")
     p.add_argument("--tiers", default="primary")
-    p.add_argument("--recent-mints", type=int, default=5)
-    p.add_argument("--max-kol-history-rows", type=int, default=300)
+    p.add_argument("--recent-mints", type=int, default=20)
+    p.add_argument("--max-kol-history-rows", type=int, default=600)
     p.add_argument("--min-first-buy-usd", type=float, default=100.0)
-    p.add_argument("--max-event-age-hours", type=float, default=48.0)
+    p.add_argument("--max-event-age-hours", type=float, default=168.0)
+    p.add_argument("--max-follower-event-age-hours", type=float, default=72.0)
     p.add_argument("--pre-window-seconds", type=int, default=5)
     p.add_argument("--post-window-seconds", type=int, default=300)
-    p.add_argument("--max-market-pages", type=int, default=160)
+    p.add_argument("--max-market-pages", type=int, default=120)
     return p.parse_args()
 
 
@@ -598,23 +675,20 @@ def main() -> None:
                 if event:
                     events.append(event)
                     print("EVENT", json.dumps({
-                        "kol": event["kol"],
-                        "symbol": event["symbol"],
+                        "kol": event["kol"], "symbol": event["symbol"],
                         "first_buy_usd": event["first_buy_usd"],
+                        "kol_first_sell_bps": event["kol_first_buy_to_first_sell_bps"],
+                        "kol_round_closed": event["kol_round_closed_est"],
+                        "kol_round_roi_bps": event["kol_round_realized_roi_bps"],
                         "sell_delay_s": event["first_sell_delay_s"],
                         "probe_buys": event["pre_first_sell_small_probe_buys"],
-                        "probe_unique_tx": event["small_probe_unique_tx_hashes"],
                         "price_source": event["price_source"],
                         "market_complete": event["market_window_complete"],
-                        "candle_complete": event["candle_window_complete"],
                     }, ensure_ascii=False))
             except Exception as exc:  # noqa: BLE001
                 errors.append({
-                    "kol": kol["name"],
-                    "mint": mint,
-                    "symbol": item.get("tokenSymbol"),
-                    "stage": "event",
-                    "error": str(exc),
+                    "kol": kol["name"], "mint": mint, "symbol": item.get("tokenSymbol"),
+                    "stage": "event", "error": str(exc),
                 })
                 print("ERROR event", kol["name"], item.get("tokenSymbol"), exc)
 
