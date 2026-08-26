@@ -1,0 +1,52 @@
+name: kol-afeng-expanded
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - "research/kol_trading_behavior/kol_watchlist_afeng.json"
+      - "research/kol_trading_behavior/KOL首买事件研究_v4.py"
+      - "research/kol_trading_behavior/KOL首买事件研究_v3.py"
+      - "research/kol_trading_behavior/KOL首买事件研究_v2.py"
+      - ".github/workflows/kol-afeng-expanded.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  afeng-expanded-30d:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Run Afeng expanded 30-day study
+        run: |
+          python "research/kol_trading_behavior/KOL首买事件研究_v4.py" \
+            --watchlist "research/kol_trading_behavior/kol_watchlist_afeng.json" \
+            --chains 56 \
+            --tiers primary \
+            --recent-mints 100 \
+            --min-first-buy-usd 100 \
+            --max-event-age-hours 720 \
+            --max-follower-event-age-hours 720 \
+            --max-kol-history-rows 2000 \
+            --pre-window-seconds 5 \
+            --post-window-seconds 300 \
+            --entry-window-seconds 16 \
+            --max-entry-pages 50 \
+            --max-market-pages 100 \
+            --workers 4 \
+            --output-dir /tmp/kol-afeng-expanded-v4
+
+      - name: Upload Afeng expanded study
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: kol-afeng-expanded-v4-${{ github.sha }}
+          path: /tmp/kol-afeng-expanded-v4/
+          if-no-files-found: warn
+          retention-days: 14
