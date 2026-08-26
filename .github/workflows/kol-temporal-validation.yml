@@ -1,0 +1,48 @@
+name: kol-temporal-validation
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - "research/kol_trading_behavior/KOL首买事件研究_v5_temporal.py"
+      - ".github/workflows/kol-temporal-validation.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  bnb-primary-temporal:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Validate frozen rules on 8-30 day history
+        run: |
+          python "research/kol_trading_behavior/KOL首买事件研究_v5_temporal.py" \
+            --chains 56 \
+            --tiers primary \
+            --recent-mints 50 \
+            --min-first-buy-usd 100 \
+            --max-event-age-hours 720 \
+            --max-follower-event-age-hours 720 \
+            --max-kol-history-rows 1000 \
+            --pre-window-seconds 5 \
+            --post-window-seconds 300 \
+            --entry-window-seconds 16 \
+            --max-entry-pages 30 \
+            --max-market-pages 100 \
+            --workers 3 \
+            --output-dir /tmp/kol-temporal-validation
+
+      - name: Upload temporal validation
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: kol-temporal-validation-${{ github.sha }}
+          path: /tmp/kol-temporal-validation/
+          if-no-files-found: warn
+          retention-days: 14
