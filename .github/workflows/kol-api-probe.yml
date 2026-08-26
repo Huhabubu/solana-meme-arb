@@ -16,7 +16,7 @@ permissions:
 jobs:
   bnb-primary-study:
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -33,7 +33,8 @@ jobs:
             --max-kol-history-rows 600 \
             --pre-window-seconds 5 \
             --post-window-seconds 300 \
-            --max-market-pages 120 \
+            --max-market-pages 30 \
+            --workers 4 \
             --output-dir /tmp/kol-first-buy-bnb-primary
 
       - name: Upload BNB primary study
@@ -47,7 +48,7 @@ jobs:
 
   bnb-secondary-study:
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -64,7 +65,8 @@ jobs:
             --max-kol-history-rows 600 \
             --pre-window-seconds 5 \
             --post-window-seconds 300 \
-            --max-market-pages 120 \
+            --max-market-pages 30 \
+            --workers 4 \
             --output-dir /tmp/kol-first-buy-bnb-secondary
 
       - name: Upload BNB secondary study
@@ -78,7 +80,7 @@ jobs:
 
   solana-candidate-study:
     runs-on: ubuntu-24.04
-    timeout-minutes: 35
+    timeout-minutes: 25
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -95,7 +97,8 @@ jobs:
             --max-kol-history-rows 600 \
             --pre-window-seconds 5 \
             --post-window-seconds 300 \
-            --max-market-pages 100 \
+            --max-market-pages 30 \
+            --workers 3 \
             --output-dir /tmp/kol-first-buy-solana
 
       - name: Upload Solana study
