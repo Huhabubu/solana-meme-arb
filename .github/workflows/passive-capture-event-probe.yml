@@ -1,0 +1,31 @@
+name: Passive Capture Event Probe
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "research/passive_capture_event_probe.py"
+      - ".github/workflows/passive-capture-event-probe.yml"
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      HELIUS_API_KEY: ${{ secrets.HELIUS_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Syntax check
+        run: python -m py_compile research/passive_capture_event_probe.py
+      - name: Probe clean SELL-shock events
+        run: python research/passive_capture_event_probe.py
+      - name: Show result
+        run: cat research/output/passive_capture/event_probe.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: passive-capture-event-probe
+          path: research/output/passive_capture/
