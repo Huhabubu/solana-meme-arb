@@ -9,12 +9,13 @@ on:
       - "research/arb_bot_event_blocks.py"
       - "research/arb_bot_chain_order.py"
       - "research/arb_bot_confirmed_events.py"
+      - "research/arb_bot_mev_audit.py"
       - ".github/workflows/arb-bot-event-study.yml"
 
 jobs:
   sample:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 30
     env:
       HELIUS_API_KEY: ${{ secrets.HELIUS_API_KEY }}
     steps:
@@ -29,6 +30,7 @@ jobs:
           python -m py_compile research/arb_bot_event_blocks.py
           python -m py_compile research/arb_bot_chain_order.py
           python -m py_compile research/arb_bot_confirmed_events.py
+          python -m py_compile research/arb_bot_mev_audit.py
       - name: Run live candidate scan
         run: |
           python research/arb_bot_event_study.py \
@@ -57,6 +59,12 @@ jobs:
           python research/arb_bot_chain_order.py \
             --input-dir research/output/arb_bot_events/candidates \
             --output-dir research/output/arb_bot_events/candidates/chain_order
+      - name: Audit bot-before-trigger candidates
+        run: |
+          python research/arb_bot_mev_audit.py \
+            --input-dir research/output/arb_bot_events/candidates/chain_order \
+            --output-dir research/output/arb_bot_events/mev_audit \
+            --slot-radius 5
       - name: Select confirmed top 10 trigger events
         run: |
           python research/arb_bot_confirmed_events.py \
@@ -64,15 +72,17 @@ jobs:
             --output-dir research/output/arb_bot_events/confirmed_top10 \
             --top-events 10 \
             --min-trigger-usd 1000
-      - name: Show confirmed top 10
+      - name: Show confirmed top 10 and MEV audit
         if: always()
         run: |
           echo '=== candidate chain meta ==='
           cat research/output/arb_bot_events/candidates/chain_order/chain_order_meta.json || true
+          echo '=== MEV audit summary ==='
+          cat research/output/arb_bot_events/mev_audit/mev_audit_summary.csv || true
+          echo '=== MEV audit detail ==='
+          cat research/output/arb_bot_events/mev_audit/mev_audit.md || true
           echo '=== confirmed_events_summary.csv ==='
           cat research/output/arb_bot_events/confirmed_top10/confirmed_events_summary.csv || true
-          echo '=== confirmed event blocks (first 220 lines) ==='
-          head -n 220 research/output/arb_bot_events/confirmed_top10/confirmed_event_blocks.md || true
       - name: Upload event study output
         if: always()
         uses: actions/upload-artifact@v4
