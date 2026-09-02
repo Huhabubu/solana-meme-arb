@@ -1,0 +1,20 @@
+name: SLIM Kline Crosscheck
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "research/slim_kline_crosscheck.py"
+      - ".github/workflows/slim-kline-crosscheck.yml"
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Run SLIM kline cross-check
+        run: python research/slim_kline_crosscheck.py
