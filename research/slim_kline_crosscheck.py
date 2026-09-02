@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import time
+import urllib.parse
 from pathlib import Path
 
 BASE_PATH = Path(__file__).parent / "kol_trading_behavior" / "KOL首买事件研究.py"
@@ -18,37 +20,57 @@ T0 = 1788278910000  # 2026-09-02 00:08:30 UTC+8, OKX trigger timestamp
 START = T0 - 10_000
 END = T0 + 20_000
 
-rows, complete = base.fetch_candles(CHAIN_ID, MINT, START, END)
-print("rows", len(rows), "complete", complete)
-for r in rows:
-    rel = (int(r["timestamp"]) - T0) / 1000
-    print(f"{rel:+.0f}s O={r['open']:.12f} H={r['high']:.12f} L={r['low']:.12f} C={r['close']:.12f}")
-
-pre = [r for r in rows if T0 - 5_000 <= int(r["timestamp"]) < T0]
-post5 = [r for r in rows if T0 <= int(r["timestamp"]) <= T0 + 5_000]
-post10 = [r for r in rows if T0 <= int(r["timestamp"]) <= T0 + 10_000]
-post20 = [r for r in rows if T0 <= int(r["timestamp"]) <= T0 + 20_000]
 
 def bps(a: float, b: float) -> float:
     return (b / a - 1.0) * 10000.0
 
-def low(xs):
-    return min((float(r["low"]) for r in xs), default=None)
 
-def high(xs):
-    return max((float(r["high"]) for r in xs), default=None)
+def fetch_bar(bar: str, after_ms: int, limit: int = 30):
+    params = {
+        "chainId": CHAIN_ID,
+        "address": MINT,
+        "after": str(after_ms),
+        "bar": bar,
+        "limit": str(limit),
+        "t": str(int(time.time() * 1000)),
+    }
+    status, body = base.request_json(
+        base.KLINE_URL + "?" + urllib.parse.urlencode(params),
+        referer=f"https://web3.okx.com/zh-hans/token/{CHAIN_ID}/{MINT}",
+    )
+    out = []
+    for item in body.get("data") or []:
+        if isinstance(item, list) and len(item) >= 5:
+            out.append({
+                "timestamp": base.inum(item[0]),
+                "open": base.fnum(item[1]),
+                "high": base.fnum(item[2]),
+                "low": base.fnum(item[3]),
+                "close": base.fnum(item[4]),
+            })
+    out.sort(key=lambda r: r["timestamp"])
+    return status, out
 
-def close_before():
-    xs = [r for r in rows if int(r["timestamp"]) < T0]
-    return float(xs[-1]["close"]) if xs else None
+rows, complete = base.fetch_candles(CHAIN_ID, MINT, START, END)
+print("=== 1s ===")
+print("rows", len(rows), "complete", complete)
+for r in rows:
+    rel = (int(r["timestamp"]) - T0) / 1000
+    print(f"{rel:+.0f}s O={r['open']:.12f} H={r['high']:.12f} L={r['low']:.12f} C={r['close']:.12f}")
+if rows:
+    event = min(rows, key=lambda r: abs(int(r["timestamp"]) - T0))
+    print("1s_event_open_to_low_bps", bps(event["open"], event["low"]))
+    print("1s_event_high_to_low_bps", bps(event["high"], event["low"]))
+    print("1s_event_open_to_close_bps", bps(event["open"], event["close"]))
 
-metrics = {"complete": complete, "row_count": len(rows), "pre5_high": high(pre), "pre_last_close": close_before()}
-for name, xs in (("post5", post5), ("post10", post10), ("post20", post20)):
-    lo = low(xs)
-    metrics[name + "_low"] = lo
-    if lo and metrics["pre5_high"]:
-        metrics[name + "_from_pre5_high_bps"] = bps(metrics["pre5_high"], lo)
-    if lo and metrics["pre_last_close"]:
-        metrics[name + "_from_preclose_bps"] = bps(metrics["pre_last_close"], lo)
+print("=== 1m ===")
+status, mins = fetch_bar("1m", T0 + 180_000, 20)
+print("status", status, "rows", len(mins))
+near = [r for r in mins if T0 - 180_000 <= r["timestamp"] <= T0 + 180_000]
+for r in near:
+    rel = (r["timestamp"] - T0) / 1000
+    print(f"{rel:+.0f}s O={r['open']:.12f} H={r['high']:.12f} L={r['low']:.12f} C={r['close']:.12f} open_low_bps={bps(r['open'], r['low']):.3f} high_low_bps={bps(r['high'], r['low']):.3f}")
 
-print("METRICS", json.dumps(metrics, ensure_ascii=False, indent=2))
+print("=== all-market event prints from prior event-study reference ===")
+print("trigger avg execution price ~0.004605 USDC/SLIM")
+print("known event-second OKX prints include ~0.004577 buys and ~0.004618-0.004625 sells")
