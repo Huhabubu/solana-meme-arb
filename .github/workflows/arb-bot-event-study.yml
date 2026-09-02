@@ -1,0 +1,47 @@
+name: Arb Bot Event Study
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "research/arb_bot_event_study.py"
+      - ".github/workflows/arb-bot-event-study.yml"
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Syntax check
+        run: python -m py_compile research/arb_bot_event_study.py
+      - name: Run small live sample
+        run: |
+          python research/arb_bot_event_study.py \
+            --mint-limit 5 \
+            --bot-history-rows 100 \
+            --arb-events-per-mint 3 \
+            --search-window-ms 2000 \
+            --event-window-ms 2000 \
+            --min-large-usd 1000 \
+            --max-market-pages 20 \
+            --output-dir research/output/arb_bot_events
+      - name: Show outputs
+        if: always()
+        run: |
+          echo '=== run_meta.json ==='
+          cat research/output/arb_bot_events/run_meta.json || true
+          echo '=== events_summary.csv ==='
+          head -n 20 research/output/arb_bot_events/events_summary.csv || true
+          echo '=== event_windows.csv ==='
+          head -n 40 research/output/arb_bot_events/event_windows.csv || true
+      - name: Upload event study output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: arb-bot-event-study
+          path: research/output/arb_bot_events/
+          if-no-files-found: warn
