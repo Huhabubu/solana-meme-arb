@@ -9,6 +9,7 @@ on:
       - "research/ray_clean_event_price_reconstruct_fixed.py"
       - "research/ray_amm_second_order_probe.py"
       - "research/ray_followon_pool_activity.py"
+      - "research/ray_followon_route_probe.py"
       - ".github/workflows/ray-clean-event-pool-probe.yml"
 
 jobs:
@@ -29,6 +30,7 @@ jobs:
           python -m py_compile research/ray_clean_event_price_reconstruct_fixed.py
           python -m py_compile research/ray_amm_second_order_probe.py
           python -m py_compile research/ray_followon_pool_activity.py
+          python -m py_compile research/ray_followon_route_probe.py
       - name: Decode RAY event
         run: python research/ray_clean_event_pool_probe.py
       - name: Reconstruct CLMM prices and bot route
@@ -37,6 +39,8 @@ jobs:
         run: python research/ray_amm_second_order_probe.py
       - name: Scan follow-on pool activity
         run: python research/ray_followon_pool_activity.py
+      - name: Decode follow-on routes
+        run: python research/ray_followon_route_probe.py
       - name: Show reconstruction
         run: |
           cat research/output/ray_clean_event_reconstruct/reconstruction.md
@@ -44,6 +48,8 @@ jobs:
           cat research/output/ray_clean_event_reconstruct/amm_second_order.json
           echo '=== follow-on pool activity ==='
           cat research/output/ray_clean_event_reconstruct/followon_pool_activity.json
+          echo '=== follow-on routes ==='
+          cat research/output/ray_clean_event_reconstruct/followon_route_probe.json
       - uses: actions/upload-artifact@v4
         if: always()
         with:
