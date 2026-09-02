@@ -8,6 +8,7 @@ on:
       - "research/ray_clean_event_price_reconstruct.py"
       - "research/ray_clean_event_price_reconstruct_fixed.py"
       - "research/ray_amm_second_order_probe.py"
+      - "research/ray_followon_pool_activity.py"
       - ".github/workflows/ray-clean-event-pool-probe.yml"
 
 jobs:
@@ -27,17 +28,22 @@ jobs:
           python -m py_compile research/ray_clean_event_price_reconstruct.py
           python -m py_compile research/ray_clean_event_price_reconstruct_fixed.py
           python -m py_compile research/ray_amm_second_order_probe.py
+          python -m py_compile research/ray_followon_pool_activity.py
       - name: Decode RAY event
         run: python research/ray_clean_event_pool_probe.py
       - name: Reconstruct CLMM prices and bot route
         run: python research/ray_clean_event_price_reconstruct_fixed.py
       - name: Measure AMM second-order impact
         run: python research/ray_amm_second_order_probe.py
+      - name: Scan follow-on pool activity
+        run: python research/ray_followon_pool_activity.py
       - name: Show reconstruction
         run: |
           cat research/output/ray_clean_event_reconstruct/reconstruction.md
           echo '=== AMM second-order ==='
           cat research/output/ray_clean_event_reconstruct/amm_second_order.json
+          echo '=== follow-on pool activity ==='
+          cat research/output/ray_clean_event_reconstruct/followon_pool_activity.json
       - uses: actions/upload-artifact@v4
         if: always()
         with:
