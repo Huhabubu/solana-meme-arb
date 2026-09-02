@@ -8,12 +8,13 @@ on:
       - "research/arb_bot_event_report.py"
       - "research/arb_bot_event_blocks.py"
       - "research/arb_bot_chain_order.py"
+      - "research/arb_bot_confirmed_events.py"
       - ".github/workflows/arb-bot-event-study.yml"
 
 jobs:
   sample:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     env:
       HELIUS_API_KEY: ${{ secrets.HELIUS_API_KEY }}
     steps:
@@ -27,6 +28,7 @@ jobs:
           python -m py_compile research/arb_bot_event_report.py
           python -m py_compile research/arb_bot_event_blocks.py
           python -m py_compile research/arb_bot_chain_order.py
+          python -m py_compile research/arb_bot_confirmed_events.py
       - name: Run live candidate scan
         run: |
           python research/arb_bot_event_study.py \
@@ -38,40 +40,43 @@ jobs:
             --min-large-usd 1000 \
             --max-market-pages 50 \
             --only-two-sided \
-            --output-dir research/output/arb_bot_events
-      - name: Build trigger-centered top 10 report
+            --output-dir research/output/arb_bot_events/raw
+      - name: Build larger trigger candidate pool
         run: |
           python research/arb_bot_event_report.py \
-            --input-dir research/output/arb_bot_events \
-            --output-dir research/output/arb_bot_events/top10 \
-            --top-events 10
-      - name: Build chronological event blocks
-        run: |
-          python research/arb_bot_event_blocks.py \
-            --input-dir research/output/arb_bot_events/top10 \
-            --output-dir research/output/arb_bot_events/top10/blocks
-      - name: Resolve Solana chain order
+            --input-dir research/output/arb_bot_events/raw \
+            --output-dir research/output/arb_bot_events/candidates \
+            --top-events 20 \
+            --min-trigger-usd 1000
+      - name: Resolve all candidate Solana chain order
         run: |
           if [ -z "$HELIUS_API_KEY" ]; then
             echo "HELIUS_API_KEY secret is required for chain-order enrichment."
             exit 1
           fi
           python research/arb_bot_chain_order.py \
-            --input-dir research/output/arb_bot_events/top10 \
-            --output-dir research/output/arb_bot_events/top10/chain_order
-      - name: Show chain-order event summary
+            --input-dir research/output/arb_bot_events/candidates \
+            --output-dir research/output/arb_bot_events/candidates/chain_order
+      - name: Select confirmed top 10 trigger events
+        run: |
+          python research/arb_bot_confirmed_events.py \
+            --input-dir research/output/arb_bot_events/candidates/chain_order \
+            --output-dir research/output/arb_bot_events/confirmed_top10 \
+            --top-events 10 \
+            --min-trigger-usd 1000
+      - name: Show confirmed top 10
         if: always()
         run: |
-          echo '=== chain_order_meta.json ==='
-          cat research/output/arb_bot_events/top10/chain_order/chain_order_meta.json || true
-          echo '=== event_chain_summary.csv ==='
-          cat research/output/arb_bot_events/top10/chain_order/event_chain_summary.csv || true
-          echo '=== chain ordered blocks (first 180 lines) ==='
-          head -n 180 research/output/arb_bot_events/top10/chain_order/event_blocks_chain_ordered.md || true
+          echo '=== candidate chain meta ==='
+          cat research/output/arb_bot_events/candidates/chain_order/chain_order_meta.json || true
+          echo '=== confirmed_events_summary.csv ==='
+          cat research/output/arb_bot_events/confirmed_top10/confirmed_events_summary.csv || true
+          echo '=== confirmed event blocks (first 220 lines) ==='
+          head -n 220 research/output/arb_bot_events/confirmed_top10/confirmed_event_blocks.md || true
       - name: Upload event study output
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: arb-bot-event-study-chain-order
+          name: arb-bot-confirmed-top10
           path: research/output/arb_bot_events/
           if-no-files-found: warn
