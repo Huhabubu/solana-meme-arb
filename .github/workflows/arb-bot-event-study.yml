@@ -7,12 +7,15 @@ on:
       - "research/arb_bot_event_study.py"
       - "research/arb_bot_event_report.py"
       - "research/arb_bot_event_blocks.py"
+      - "research/arb_bot_chain_order.py"
       - ".github/workflows/arb-bot-event-study.yml"
 
 jobs:
   sample:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
+    env:
+      HELIUS_API_KEY: ${{ secrets.HELIUS_API_KEY }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -23,6 +26,7 @@ jobs:
           python -m py_compile research/arb_bot_event_study.py
           python -m py_compile research/arb_bot_event_report.py
           python -m py_compile research/arb_bot_event_blocks.py
+          python -m py_compile research/arb_bot_chain_order.py
       - name: Run live candidate scan
         run: |
           python research/arb_bot_event_study.py \
@@ -46,17 +50,28 @@ jobs:
           python research/arb_bot_event_blocks.py \
             --input-dir research/output/arb_bot_events/top10 \
             --output-dir research/output/arb_bot_events/top10/blocks
-      - name: Show event blocks
+      - name: Resolve Solana chain order
+        run: |
+          if [ -z "$HELIUS_API_KEY" ]; then
+            echo "HELIUS_API_KEY secret is required for chain-order enrichment."
+            exit 1
+          fi
+          python research/arb_bot_chain_order.py \
+            --input-dir research/output/arb_bot_events/top10 \
+            --output-dir research/output/arb_bot_events/top10/chain_order
+      - name: Show chain-order event summary
         if: always()
         run: |
-          echo '=== event_blocks.md (first 180 lines) ==='
-          head -n 180 research/output/arb_bot_events/top10/blocks/event_blocks.md || true
-          echo '=== event_timeline.csv (first 80 lines) ==='
-          head -n 80 research/output/arb_bot_events/top10/blocks/event_timeline.csv || true
+          echo '=== chain_order_meta.json ==='
+          cat research/output/arb_bot_events/top10/chain_order/chain_order_meta.json || true
+          echo '=== event_chain_summary.csv ==='
+          cat research/output/arb_bot_events/top10/chain_order/event_chain_summary.csv || true
+          echo '=== chain ordered blocks (first 180 lines) ==='
+          head -n 180 research/output/arb_bot_events/top10/chain_order/event_blocks_chain_ordered.md || true
       - name: Upload event study output
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: arb-bot-event-study-top10
+          name: arb-bot-event-study-chain-order
           path: research/output/arb_bot_events/
           if-no-files-found: warn
