@@ -9,6 +9,7 @@ on:
       - "research/slim_passive_capture_timeline.py"
       - "research/slim_followon_destination_probe.py"
       - "research/slim_b2_passive_capture.py"
+      - "research/slim_postfill_a_recovery.py"
       - ".github/workflows/passive-capture-event-probe.yml"
 
 jobs:
@@ -29,6 +30,7 @@ jobs:
           python -m py_compile research/slim_passive_capture_timeline.py
           python -m py_compile research/slim_followon_destination_probe.py
           python -m py_compile research/slim_b2_passive_capture.py
+          python -m py_compile research/slim_postfill_a_recovery.py
       - name: Probe clean SELL-shock events
         run: python research/passive_capture_event_probe.py
       - name: Reconstruct SLIM passive-capture economics
@@ -39,12 +41,16 @@ jobs:
         run: python research/slim_followon_destination_probe.py
       - name: Evaluate later B2 passive capture
         run: python research/slim_b2_passive_capture.py
+      - name: Trace post-fill A recovery
+        run: python research/slim_postfill_a_recovery.py
       - name: Show result
         run: |
           echo '=== SLIM capture opportunities ==='
           cat research/output/passive_capture/slim_capture_opportunities.csv
           echo '=== SLIM B2 reconstruction ==='
           cat research/output/passive_capture/slim_b2_reconstruction.json
+          echo '=== SLIM post-fill recovery ==='
+          cat research/output/passive_capture/slim_postfill_recovery.json
       - uses: actions/upload-artifact@v4
         if: always()
         with:
