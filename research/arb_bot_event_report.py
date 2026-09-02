@@ -7,17 +7,20 @@
 - 只保留 search/event window 完整、且发现时锚定机器人 tx 为双边 BUY+SELL 的候选；
 - 候选按 trigger_usd 从大到小排序，默认取前 10 个；
 - summary 一行一个触发事件，并聚合该 ±event window 内 MRiYA4... 的所有交易；
-- windows 保留这 10 个事件窗口内的全部逐笔成交。
+- windows 保留这 10 个事件窗口内的全部逐笔成交；
+- 时间统一由 epoch 毫秒生成显式 UTC 与 UTC+8 两列，避免 Runner 本地时区歧义。
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Tuple
+from typing import Any, Dict, List, Tuple
 
 BOT_DEFAULT = "MRiYA4oN3158fCV8evhuCofrDzbHyYvYnGZUDJvoCsa"
+UTC8 = timezone(timedelta(hours=8))
 
 
 def truthy(v: Any) -> bool:
@@ -36,6 +39,14 @@ def inum(v: Any) -> int:
         return int(float(v or 0))
     except (TypeError, ValueError):
         return 0
+
+
+def fmt_ms(ts_ms: Any, tz: timezone) -> str:
+    ts = inum(ts_ms)
+    if ts <= 0:
+        return ""
+    dt = datetime.fromtimestamp(ts / 1000, tz=tz)
+    return dt.isoformat(timespec="milliseconds")
 
 
 def read_csv(path: Path) -> List[Dict[str, str]]:
@@ -78,7 +89,6 @@ def main() -> None:
     summaries = read_csv(src / "events_summary.csv")
     windows = read_csv(src / "event_windows.csv")
 
-    # 一个 trigger 只保留一次；优先保留 trigger 金额更高/事件窗口更完整的记录。
     unique: Dict[Tuple[str, str], Dict[str, str]] = {}
     for row in summaries:
         if not truthy(row.get("bot_two_sided")):
@@ -104,7 +114,11 @@ def main() -> None:
     for rank, event in enumerate(selected, start=1):
         event_id = str(event.get("event_id") or "")
         rows = by_event.get(event_id, [])
-        bot_rows = [r for r in rows if truthy(r.get("is_bot_trade")) or str(r.get("trader_address") or "").lower() == args.bot.lower()]
+        bot_rows = [
+            r for r in rows
+            if truthy(r.get("is_bot_trade"))
+            or str(r.get("trader_address") or "").lower() == args.bot.lower()
+        ]
         bot_hashes: List[str] = []
         seen_hashes = set()
         for r in bot_rows:
@@ -113,12 +127,14 @@ def main() -> None:
                 seen_hashes.add(h)
                 bot_hashes.append(h)
         bot_rel = [inum(r.get("relative_to_trigger_ms")) for r in bot_rows]
+        trigger_ts = inum(event.get("trigger_timestamp_ms"))
         normalized_summary.append({
             "rank": rank,
             "symbol": event.get("symbol", ""),
             "mint": event.get("mint", ""),
-            "trigger_time": event.get("trigger_time", ""),
-            "trigger_timestamp_ms": event.get("trigger_timestamp_ms", ""),
+            "trigger_timestamp_ms": trigger_ts,
+            "trigger_time_utc": fmt_ms(trigger_ts, timezone.utc),
+            "trigger_time_utc8": fmt_ms(trigger_ts, UTC8),
             "trigger_side": event.get("trigger_side", ""),
             "trigger_usd": round(fnum(event.get("trigger_usd")), 6),
             "trigger_tx_hash": event.get("trigger_tx_hash", ""),
@@ -133,11 +149,15 @@ def main() -> None:
             "event_id": event_id,
         })
 
-    # 详细窗口按 Top-N 排名 + 相对时间排序。
     rank_by_id = {str(r["event_id"]): int(r["rank"]) for r in normalized_summary}
     detailed: List[Dict[str, Any]] = []
     for row in selected_windows:
-        out: Dict[str, Any] = {"rank": rank_by_id.get(str(row.get("event_id") or ""), 0)}
+        trade_ts = inum(row.get("trade_timestamp_ms"))
+        out: Dict[str, Any] = {
+            "rank": rank_by_id.get(str(row.get("event_id") or ""), 0),
+            "trade_time_utc": fmt_ms(trade_ts, timezone.utc),
+            "trade_time_utc8": fmt_ms(trade_ts, UTC8),
+        }
         out.update(row)
         detailed.append(out)
     detailed.sort(key=lambda r: (int(r["rank"]), inum(r.get("trade_timestamp_ms")), str(r.get("trade_tx_hash") or "")))
