@@ -1,0 +1,48 @@
+name: RAY Clean Event Pool Probe
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "research/ray_clean_event_pool_probe.py"
+      - ".github/workflows/ray-clean-event-pool-probe.yml"
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      HELIUS_API_KEY: ${{ secrets.HELIUS_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Syntax check
+        run: python -m py_compile research/ray_clean_event_pool_probe.py
+      - name: Decode RAY event
+        run: python research/ray_clean_event_pool_probe.py
+      - name: Show compact result
+        run: |
+          python - <<'PY'
+          import json
+          p='research/output/ray_clean_event_pool_probe.json'
+          d=json.load(open(p,encoding='utf-8'))
+          for side in ('trigger','arb'):
+              x=d[side]
+              print('===', side, '===')
+              print('slot',x['slot'])
+              print('programs',x['nonbasic_programs'])
+              print('candidate_state')
+              for r in x['candidate_program_owned_writable_state_accounts']:
+                  print(r)
+              print('net_deltas')
+              for r in x['owner_mint_net_deltas']:
+                  print(r)
+          print('shared_candidate_state',d['shared_candidate_state_accounts'])
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ray-clean-event-pool-probe
+          path: research/output/ray_clean_event_pool_probe.json
