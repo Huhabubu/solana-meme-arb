@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """Trace the full same-slot SLIM convergence sequence after the clean SELL shock.
 
-For each transaction after the trigger, track realized reserve changes in:
+For each transaction after the trigger, track exact vault changes in:
   A = Raydium AMM v4 SLIM/WSOL (shocked pool)
   B = Orca legacy token-swap SLIM/USDC (first observed arb destination)
 
@@ -11,8 +11,12 @@ counterfactual: if a passive bid had absorbed that exact B sale at its observed
 aggregate B execution price, what would an immediate exact-input taker sale of
 that SLIM into A return using A's ledger state available after that transaction?
 
+Important: Raydium's 5Q544... authority is shared across AMM-v4 pools, so this
+script intentionally tracks exact token-vault addresses rather than aggregating
+balances by token-account owner.
+
 This does NOT prove maker execution on B. B is an AMM in this sample. Results are
-therefore labeled economic counterfactuals, not executable resting-limit PnL.
+therefore economic counterfactuals, not executable resting-limit PnL.
 """
 from __future__ import annotations
 
@@ -33,17 +37,22 @@ FIRST_BOT_INDEX=161
 TRIGGER="2Z5fgLBVCyaHjGuNsHamWdVKSaJMniGne8GiswwgHg87cWT4CznwEcjiVCyvTBMzZULddFnaZapJ9MkuQHHhRU3B"
 FIRST_BOT="5oK4st7Rc8TzmeGYWS8Qrn9MfpjNhZ9v44KoLwanVeWs2YYESbaDtvKrLJSzKtyVtN6vPzcfLZXw7RYQzqg2fBtz"
 A_POOL="8idN93ZBpdtMp4672aS4GGMDy7LdVWCCXH7FKFdMw9P4"
-A_AUTH="5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1"
 B_POOL="8JPid6GtND2tU3A7x7GDfPPEWwS36rMtzF7YoHU44UoA"
-B_AUTH="749y4fXb9SzqmrLEetQdui5iDucnNiMgCJ2uzc3y7cou"
 SLIM="xxxxa1sKNGwFtw2kFn8XauW9xq8hBZ5kVtcSesTT9fW"
 WSOL="So11111111111111111111111111111111111111112"
 USDC="EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+
+# Exact vaults identified from A AmmInfo and the landed B swap.
+A_SLIM_VAULT="6FoSD24CM2MyadTwVUqgZQ17kXozfMa3DfusbnuqYduy"
+A_SOL_VAULT="EDL73XTnmr56U4ohW5uXXh6LJwsQQdoRLragMYEWLGPn"
+B_SLIM_VAULT="ErcxwkPgLdyoVL6j2SsekZ5iysPZEDRGfAggh282kQb8"
+B_USDC_VAULT="EFYW6YEiCGpavuMPS1zoXhgfNkPisWkQ3bQz1b4UfKek"
 SOLUSD_REF=Decimal("101.75")
 
 COIN_DECIMALS_OFFSET=32; PC_DECIMALS_OFFSET=40
 SWAP_FEE_NUMERATOR_OFFSET=176; SWAP_FEE_DENOMINATOR_OFFSET=184
 NEED_TAKE_PNL_COIN_OFFSET=192; NEED_TAKE_PNL_PC_OFFSET=200
+COIN_VAULT_OFFSET=336; PC_VAULT_OFFSET=368
 COIN_MINT_OFFSET=400; PC_MINT_OFFSET=432
 B58="123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 
@@ -81,6 +90,7 @@ def load_a_static()->Dict[str,Any]:
     return {"coin_decimals":u64(raw,COIN_DECIMALS_OFFSET),"pc_decimals":u64(raw,PC_DECIMALS_OFFSET),
             "fee_num":u64(raw,SWAP_FEE_NUMERATOR_OFFSET),"fee_den":u64(raw,SWAP_FEE_DENOMINATOR_OFFSET),
             "need_take_pnl_coin":u64(raw,NEED_TAKE_PNL_COIN_OFFSET),"need_take_pnl_pc":u64(raw,NEED_TAKE_PNL_PC_OFFSET),
+            "coin_vault":pk(raw,COIN_VAULT_OFFSET),"pc_vault":pk(raw,PC_VAULT_OFFSET),
             "coin_mint":pk(raw,COIN_MINT_OFFSET),"pc_mint":pk(raw,PC_MINT_OFFSET)}
 
 def account_keys(txwrap:Dict[str,Any])->List[str]:
@@ -90,19 +100,19 @@ def account_keys(txwrap:Dict[str,Any])->List[str]:
         out.append(str(x if isinstance(x,str) else x.get("pubkey") or ""))
     return out
 
-def token_owner_mint(txwrap:Dict[str,Any],owner:str,mint:str)->Optional[Tuple[int,int,int]]:
+def token_account_balance(txwrap:Dict[str,Any],pubkey:str)->Optional[Tuple[int,int,int,str]]:
+    keys=account_keys(txwrap)
+    try:i=keys.index(pubkey)
+    except ValueError:return None
     meta=txwrap.get("meta") or {}
     pre={int(x["accountIndex"]):x for x in meta.get("preTokenBalances") or []}
     post={int(x["accountIndex"]):x for x in meta.get("postTokenBalances") or []}
-    pre_sum=post_sum=0; dec=None; found=False
-    for i in set(pre)|set(post):
-        a,b=pre.get(i,{}),post.get(i,{})
-        ref=b or a
-        if str(ref.get("owner") or "")!=owner or str(ref.get("mint") or "")!=mint:continue
-        found=True; dec=int(((ref.get("uiTokenAmount") or {}).get("decimals") or 0))
-        def raw(v:Dict[str,Any])->int:return int(((v.get("uiTokenAmount") or {}).get("amount") or 0))
-        pre_sum+=raw(a); post_sum+=raw(b)
-    return (pre_sum,post_sum,int(dec or 0)) if found else None
+    a,b=pre.get(i,{}),post.get(i,{})
+    ref=b or a
+    if not ref:return None
+    ta=ref.get("uiTokenAmount") or {}; dec=int(ta.get("decimals") or 0); mint=str(ref.get("mint") or "")
+    def raw(v:Dict[str,Any])->int:return int(((v.get("uiTokenAmount") or {}).get("amount") or 0))
+    return raw(a),raw(b),dec,mint
 
 def signature(txwrap:Dict[str,Any])->str:
     sigs=(txwrap.get("transaction") or {}).get("signatures") or []
@@ -133,16 +143,20 @@ def classify(base_delta:int,quote_delta:int,base_name:str,venue:str)->str:
     if base_delta==0 and quote_delta==0:return "NO_CHANGE"
     return "OTHER_FLOW"
 
+def apply_snapshot(current:int,snap:Optional[Tuple[int,int,int,str]],idx:int,label:str)->Tuple[int,int,bool]:
+    if snap is None:return current,0,False
+    pre,post,_,_=snap
+    if pre!=current:raise RuntimeError(f"{label} vault state discontinuity at {idx}: carried={current} tx_pre={pre}")
+    return post,post-pre,(post!=pre)
+
 def main()->None:
     static=load_a_static()
-    if static["coin_mint"]==SLIM:
-        slim_pnl=static["need_take_pnl_coin"]; sol_pnl=static["need_take_pnl_pc"]
-        slim_dec=static["coin_decimals"]; sol_dec=static["pc_decimals"]
-    elif static["pc_mint"]==SLIM:
-        slim_pnl=static["need_take_pnl_pc"]; sol_pnl=static["need_take_pnl_coin"]
-        slim_dec=static["pc_decimals"]; sol_dec=static["coin_decimals"]
-    else:raise RuntimeError("A is not SLIM pair")
-    usdc_dec=6
+    if static["coin_vault"]!=A_SLIM_VAULT or static["pc_vault"]!=A_SOL_VAULT:
+        raise RuntimeError(f"A vault mapping changed: {static}")
+    if static["coin_mint"]!=SLIM or static["pc_mint"]!=WSOL:
+        raise RuntimeError(f"unexpected A pair: {static}")
+    slim_dec=int(static["coin_decimals"]); sol_dec=int(static["pc_decimals"]); usdc_dec=6
+    slim_pnl=int(static["need_take_pnl_coin"]); sol_pnl=int(static["need_take_pnl_pc"])
 
     block=rpc("getBlock",[SLOT,{"commitment":"finalized","transactionDetails":"full","encoding":"jsonParsed","rewards":False,"maxSupportedTransactionVersion":0}])
     txs=block.get("transactions") or []
@@ -150,46 +164,37 @@ def main()->None:
     if signature(txs[TRIGGER_INDEX])!=TRIGGER or signature(txs[FIRST_BOT_INDEX])!=FIRST_BOT:
         raise RuntimeError("ledger anchors mismatch")
 
-    # Anchor A/B states from first bot pre/post.
-    first=txs[FIRST_BOT_INDEX]
-    a_s=token_owner_mint(first,A_AUTH,SLIM); a_q=token_owner_mint(first,A_AUTH,WSOL)
-    b_s=token_owner_mint(first,B_AUTH,SLIM); b_q=token_owner_mint(first,B_AUTH,USDC)
-    if not all([a_s,a_q,b_s,b_q]):raise RuntimeError("first bot missing A/B balances")
-    assert a_s and a_q and b_s and b_q
-    a_state=[a_s[1],a_q[1]]; b_state=[b_s[1],b_q[1]]
-    a_pre_trigger_s=token_owner_mint(txs[TRIGGER_INDEX],A_AUTH,SLIM)
-    a_pre_trigger_q=token_owner_mint(txs[TRIGGER_INDEX],A_AUTH,WSOL)
-    if not a_pre_trigger_s or not a_pre_trigger_q:raise RuntimeError("trigger A balances missing")
-    a_pre_price=reserve_price(a_pre_trigger_q[0]-sol_pnl,a_pre_trigger_s[0]-slim_pnl,sol_dec,slim_dec)
+    trigger=txs[TRIGGER_INDEX]; first=txs[FIRST_BOT_INDEX]
+    t_as=token_account_balance(trigger,A_SLIM_VAULT); t_aq=token_account_balance(trigger,A_SOL_VAULT)
+    f_as=token_account_balance(first,A_SLIM_VAULT); f_aq=token_account_balance(first,A_SOL_VAULT)
+    f_bs=token_account_balance(first,B_SLIM_VAULT); f_bq=token_account_balance(first,B_USDC_VAULT)
+    if not all([t_as,t_aq,f_as,f_aq,f_bs,f_bq]):raise RuntimeError("anchor vault balance metadata missing")
+    assert t_as and t_aq and f_as and f_aq and f_bs and f_bq
+    if t_as[3]!=SLIM or f_as[3]!=SLIM or f_bs[3]!=SLIM or t_aq[3]!=WSOL or f_aq[3]!=WSOL or f_bq[3]!=USDC:
+        raise RuntimeError("vault mint mismatch")
+    if t_as[1]!=f_as[0] or t_aq[1]!=f_aq[0]:raise RuntimeError("trigger->first bot A continuity mismatch")
+
+    a_pre_price=reserve_price(t_aq[0]-sol_pnl,t_as[0]-slim_pnl,sol_dec,slim_dec)
+    # Start immediately before index 161, then apply every exact-vault change in order.
+    a_slim,a_sol=f_as[0],f_aq[0]
+    b_slim,b_usdc=f_bs[0],f_bq[0]
 
     rows=[]; capture=[]
     for idx in range(FIRST_BOT_INDEX,len(txs)):
         tx=txs[idx]; sig=signature(tx)
-        asnap=token_owner_mint(tx,A_AUTH,SLIM); aqnap=token_owner_mint(tx,A_AUTH,WSOL)
-        bsnap=token_owner_mint(tx,B_AUTH,SLIM); bqnap=token_owner_mint(tx,B_AUTH,USDC)
+        asnap=token_account_balance(tx,A_SLIM_VAULT); aqnap=token_account_balance(tx,A_SOL_VAULT)
+        bsnap=token_account_balance(tx,B_SLIM_VAULT); bqnap=token_account_balance(tx,B_USDC_VAULT)
 
-        a_changed=False; b_changed=False
-        a_ds=a_dq=b_ds=b_dq=0
-        a_pre_local=list(a_state); b_pre_local=list(b_state)
-        if asnap and aqnap:
-            a_ds=asnap[1]-asnap[0]; a_dq=aqnap[1]-aqnap[0]
-            if a_ds or a_dq:
-                a_changed=True
-                # Verify our carried state before replacing it.
-                if idx!=FIRST_BOT_INDEX and (a_state[0]!=asnap[0] or a_state[1]!=aqnap[0]):
-                    raise RuntimeError(f"A state discontinuity at {idx}")
-                a_state=[asnap[1],aqnap[1]]
-        if bsnap and bqnap:
-            b_ds=bsnap[1]-bsnap[0]; b_dq=bqnap[1]-bqnap[0]
-            if b_ds or b_dq:
-                b_changed=True
-                if idx!=FIRST_BOT_INDEX and (b_state[0]!=bsnap[0] or b_state[1]!=bqnap[0]):
-                    raise RuntimeError(f"B state discontinuity at {idx}")
-                b_state=[bsnap[1],bqnap[1]]
+        a_slim_new,a_ds,a_sc=apply_snapshot(a_slim,asnap,idx,"A_SLIM")
+        a_sol_new,a_dq,a_qc=apply_snapshot(a_sol,aqnap,idx,"A_SOL")
+        b_slim_new,b_ds,b_sc=apply_snapshot(b_slim,bsnap,idx,"B_SLIM")
+        b_usdc_new,b_dq,b_qc=apply_snapshot(b_usdc,bqnap,idx,"B_USDC")
+        a_changed=a_sc or a_qc; b_changed=b_sc or b_qc
         if not (a_changed or b_changed):continue
+        a_slim,a_sol=a_slim_new,a_sol_new; b_slim,b_usdc=b_slim_new,b_usdc_new
 
-        a_price=reserve_price(a_state[1]-sol_pnl,a_state[0]-slim_pnl,sol_dec,slim_dec)
-        b_price=reserve_price(b_state[1],b_state[0],usdc_dec,slim_dec)
+        a_price=reserve_price(a_sol-sol_pnl,a_slim-slim_pnl,sol_dec,slim_dec)
+        b_price=reserve_price(b_usdc,b_slim,usdc_dec,slim_dec)
         row={
             "index":idx,"signature":sig,"signers":";".join(signers(tx)),
             "A_flow":classify(a_ds,a_dq,"SLIM","A") if a_changed else "NO_CHANGE",
@@ -201,16 +206,13 @@ def main()->None:
         }
         rows.append(row)
 
-        # Actual landed B sell flow = B receives SLIM and pays USDC.
         if b_changed and b_ds>0 and b_dq<0:
             qty=b_ds; cost=-b_dq
             avg=ui(cost,usdc_dec)/ui(qty,slim_dec)
-            q=quote_out(a_state[0]-slim_pnl,a_state[1]-sol_pnl,qty,static["fee_num"],static["fee_den"])
-            exit_sol=ui(q["amount_out"],sol_dec)
-            exit_usd=exit_sol*SOLUSD_REF
-            cost_usd=ui(cost,usdc_dec)
+            q=quote_out(a_slim-slim_pnl,a_sol-sol_pnl,qty,static["fee_num"],static["fee_den"])
+            exit_sol=ui(q["amount_out"],sol_dec); cost_usd=ui(cost,usdc_dec); exit_usd=exit_sol*SOLUSD_REF
             pnl=exit_usd-cost_usd
-            cap={
+            capture.append({
                 "index":idx,"signature":sig,"signers":";".join(signers(tx)),
                 "observed_B_sell_slim":str(ui(qty,slim_dec)),"observed_B_usdc_out":str(cost_usd),
                 "observed_B_avg_usdc_per_slim":str(avg),
@@ -219,12 +221,12 @@ def main()->None:
                 "SOLUSD_ref":str(SOLUSD_REF),"economic_exit_value_usd":str(exit_usd),
                 "economic_pnl_usd":str(pnl),"economic_pnl_bps":str(pnl/cost_usd*Decimal(10000)),
                 "maker_executability_proven":False,
-            }
-            capture.append(cap)
+            })
 
     outdir=Path("research/output/passive_capture"); outdir.mkdir(parents=True,exist_ok=True)
     (outdir/"slim_timeline.json").write_text(json.dumps({
-        "slot":SLOT,"A_pool":A_POOL,"B_pool":B_POOL,"SOLUSD_reference":str(SOLUSD_REF),
+        "slot":SLOT,"A_pool":A_POOL,"B_pool":B_POOL,"A_vaults":[A_SLIM_VAULT,A_SOL_VAULT],
+        "B_vaults":[B_SLIM_VAULT,B_USDC_VAULT],"SOLUSD_reference":str(SOLUSD_REF),
         "maker_executability_proven":False,"timeline":rows,"B_sell_capture_counterfactuals":capture
     },ensure_ascii=False,indent=2),encoding="utf-8")
     headers=list(rows[0].keys()) if rows else []
@@ -237,7 +239,7 @@ def main()->None:
             w=csv.DictWriter(f,fieldnames=cheaders); w.writeheader(); w.writerows(capture)
 
     print("# SLIM same-slot passive-capture timeline")
-    print("relevant A/B transactions",len(rows),"B-sell opportunities",len(capture))
+    print("relevant exact-vault transactions",len(rows),"B-sell opportunities",len(capture))
     for r in rows:
         print("TX",r["index"],r["A_flow"],"A_vs_pre",r["A_vs_pre_trigger_bps"],"|",r["B_flow"],"Bpost",r["B_post_usdc_per_slim"])
     print("\n# Event-local passive-capture counterfactuals @ SOLUSD",SOLUSD_REF)
