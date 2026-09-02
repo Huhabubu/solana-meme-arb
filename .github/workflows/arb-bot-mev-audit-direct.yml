@@ -1,0 +1,70 @@
+name: Arb Bot MEV Audit Direct
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "research/arb_bot_mev_audit.py"
+      - "research/arb_bot_mev_audit_v2.py"
+      - ".github/workflows/arb-bot-mev-audit-direct.yml"
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      HELIUS_API_KEY: ${{ secrets.HELIUS_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Prepare two known bot-before-trigger candidates
+        run: |
+          mkdir -p research/output/mev_direct/input
+          python - <<'PY'
+          import csv
+          from pathlib import Path
+          rows = [
+              {
+                  "rank":"4","category":"大额卖出触发","symbol":"ORCA","mint":"orcaEKTdK7LKz57vaAYr9QeNsVEPfiu6QeMU1kektZE",
+                  "trigger_usd":"5181.32848","trigger_side":"SELL",
+                  "trigger_tx_hash":"2V9aJvXGCn7p7Thup9hFKNqKjBg8ohnoaGpTvqW6bR1M19hzyo4TK5eWhMhftZCnoNgVzTSJzD4A5ENHRxrssm7d",
+                  "trigger_slot":"442908556","trigger_tx_index":"263",
+                  "bot_tx_count":"1","bot_tx_hashes":"5Mg2GFZBS9J5DxUaKmcWa99Vt6LmBcrasx4FHrWnxweH7HUZYGuwno55khGcacmhJ93axwHv2Ki75k3CcTdi2HaM",
+                  "bot_slot_indexes":"442908551:100","chain_relation":"ALL_BOTS_BEFORE_TRIGGER","event_id":"ORCA-1788102206000-5Mg2GFZB"
+              },
+              {
+                  "rank":"19","category":"大额卖出触发","symbol":"ZEC","mint":"A7bdiYdS5GjqGFtxf17ppRHtDKPkkRqbKtR27dxvQXaS",
+                  "trigger_usd":"1000.060082","trigger_side":"SELL",
+                  "trigger_tx_hash":"4khGvHL23uV5Uf3YejML9B2q8rXJFG2YBKLk3LEgXSBRTzsu5iDH24xHm7RXN4Y51n1F7uFbh2DSTmbdtQ7kjTAP",
+                  "trigger_slot":"443498913","trigger_tx_index":"710",
+                  "bot_tx_count":"1","bot_tx_hashes":"5H5dZvc6YL8zP4x9Wnq9gHGZ6WqYM5PB4KoXE3rR7w85mC7bNWmJDn887cFaLmn7Gfv6fGXZqW9h52pu7uetdzmU",
+                  "bot_slot_indexes":"443498912:1586","chain_relation":"ALL_BOTS_BEFORE_TRIGGER","event_id":"ZEC-1788289700000-5H5dZvc6"
+              },
+          ]
+          p=Path("research/output/mev_direct/input/event_chain_summary.csv")
+          with p.open("w",encoding="utf-8-sig",newline="") as f:
+              w=csv.DictWriter(f,fieldnames=list(rows[0]))
+              w.writeheader(); w.writerows(rows)
+          PY
+      - name: Syntax check
+        run: |
+          python -m py_compile research/arb_bot_mev_audit.py research/arb_bot_mev_audit_v2.py
+      - name: Run corrected MEV audit
+        run: |
+          python research/arb_bot_mev_audit_v2.py \
+            --input-dir research/output/mev_direct/input \
+            --output-dir research/output/mev_direct/result \
+            --slot-radius 5
+      - name: Show result
+        if: always()
+        run: |
+          cat research/output/mev_direct/result/mev_audit_summary.csv || true
+          echo '=== detail ==='
+          cat research/output/mev_direct/result/mev_audit.md || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mev-direct-audit
+          path: research/output/mev_direct/
