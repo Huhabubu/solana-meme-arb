@@ -6,6 +6,7 @@ on:
     paths:
       - "research/arb_bot_event_study.py"
       - "research/arb_bot_event_report.py"
+      - "research/arb_bot_event_blocks.py"
       - ".github/workflows/arb-bot-event-study.yml"
 
 jobs:
@@ -21,6 +22,7 @@ jobs:
         run: |
           python -m py_compile research/arb_bot_event_study.py
           python -m py_compile research/arb_bot_event_report.py
+          python -m py_compile research/arb_bot_event_blocks.py
       - name: Run live candidate scan
         run: |
           python research/arb_bot_event_study.py \
@@ -39,15 +41,18 @@ jobs:
             --input-dir research/output/arb_bot_events \
             --output-dir research/output/arb_bot_events/top10 \
             --top-events 10
-      - name: Show top 10
+      - name: Build chronological event blocks
+        run: |
+          python research/arb_bot_event_blocks.py \
+            --input-dir research/output/arb_bot_events/top10 \
+            --output-dir research/output/arb_bot_events/top10/blocks
+      - name: Show event blocks
         if: always()
         run: |
-          echo '=== run_meta.json ==='
-          cat research/output/arb_bot_events/run_meta.json || true
-          echo '=== top_events_summary.csv ==='
-          cat research/output/arb_bot_events/top10/top_events_summary.csv || true
-          echo '=== top_event_windows.csv (first 120 lines) ==='
-          head -n 120 research/output/arb_bot_events/top10/top_event_windows.csv || true
+          echo '=== event_blocks.md (first 180 lines) ==='
+          head -n 180 research/output/arb_bot_events/top10/blocks/event_blocks.md || true
+          echo '=== event_timeline.csv (first 80 lines) ==='
+          head -n 80 research/output/arb_bot_events/top10/blocks/event_timeline.csv || true
       - name: Upload event study output
         if: always()
         uses: actions/upload-artifact@v4
