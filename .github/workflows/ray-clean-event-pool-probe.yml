@@ -5,6 +5,7 @@ on:
   push:
     paths:
       - "research/ray_clean_event_pool_probe.py"
+      - "research/ray_clean_event_price_reconstruct.py"
       - ".github/workflows/ray-clean-event-pool-probe.yml"
 
 jobs:
@@ -19,30 +20,19 @@ jobs:
         with:
           python-version: "3.12"
       - name: Syntax check
-        run: python -m py_compile research/ray_clean_event_pool_probe.py
+        run: |
+          python -m py_compile research/ray_clean_event_pool_probe.py
+          python -m py_compile research/ray_clean_event_price_reconstruct.py
       - name: Decode RAY event
         run: python research/ray_clean_event_pool_probe.py
-      - name: Show compact result
-        run: |
-          python - <<'PY'
-          import json
-          p='research/output/ray_clean_event_pool_probe.json'
-          d=json.load(open(p,encoding='utf-8'))
-          for side in ('trigger','arb'):
-              x=d[side]
-              print('===', side, '===')
-              print('slot',x['slot'])
-              print('programs',x['nonbasic_programs'])
-              print('candidate_state')
-              for r in x['candidate_program_owned_writable_state_accounts']:
-                  print(r)
-              print('net_deltas')
-              for r in x['owner_mint_net_deltas']:
-                  print(r)
-          print('shared_candidate_state',d['shared_candidate_state_accounts'])
-          PY
+      - name: Reconstruct CLMM prices and bot route
+        run: python research/ray_clean_event_price_reconstruct.py
+      - name: Show reconstruction
+        run: cat research/output/ray_clean_event_reconstruct/reconstruction.md
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: ray-clean-event-pool-probe
-          path: research/output/ray_clean_event_pool_probe.json
+          name: ray-clean-event-reconstruction
+          path: |
+            research/output/ray_clean_event_pool_probe.json
+            research/output/ray_clean_event_reconstruct/
