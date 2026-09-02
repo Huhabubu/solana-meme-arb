@@ -5,43 +5,53 @@ on:
   push:
     paths:
       - "research/arb_bot_event_study.py"
+      - "research/arb_bot_event_report.py"
       - ".github/workflows/arb-bot-event-study.yml"
 
 jobs:
-  smoke:
+  sample:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - name: Syntax check
-        run: python -m py_compile research/arb_bot_event_study.py
-      - name: Run small live sample
+        run: |
+          python -m py_compile research/arb_bot_event_study.py
+          python -m py_compile research/arb_bot_event_report.py
+      - name: Run live candidate scan
         run: |
           python research/arb_bot_event_study.py \
-            --mint-limit 5 \
-            --bot-history-rows 100 \
-            --arb-events-per-mint 3 \
+            --mint-limit 20 \
+            --bot-history-rows 300 \
+            --arb-events-per-mint 5 \
             --search-window-ms 2000 \
             --event-window-ms 2000 \
             --min-large-usd 1000 \
-            --max-market-pages 20 \
+            --max-market-pages 50 \
+            --only-two-sided \
             --output-dir research/output/arb_bot_events
-      - name: Show outputs
+      - name: Build trigger-centered top 10 report
+        run: |
+          python research/arb_bot_event_report.py \
+            --input-dir research/output/arb_bot_events \
+            --output-dir research/output/arb_bot_events/top10 \
+            --top-events 10
+      - name: Show top 10
         if: always()
         run: |
           echo '=== run_meta.json ==='
           cat research/output/arb_bot_events/run_meta.json || true
-          echo '=== events_summary.csv ==='
-          head -n 20 research/output/arb_bot_events/events_summary.csv || true
-          echo '=== event_windows.csv ==='
-          head -n 40 research/output/arb_bot_events/event_windows.csv || true
+          echo '=== top_events_summary.csv ==='
+          cat research/output/arb_bot_events/top10/top_events_summary.csv || true
+          echo '=== top_event_windows.csv (first 120 lines) ==='
+          head -n 120 research/output/arb_bot_events/top10/top_event_windows.csv || true
       - name: Upload event study output
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: arb-bot-event-study
+          name: arb-bot-event-study-top10
           path: research/output/arb_bot_events/
           if-no-files-found: warn
