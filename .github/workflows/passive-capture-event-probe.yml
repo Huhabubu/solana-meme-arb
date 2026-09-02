@@ -6,6 +6,7 @@ on:
     paths:
       - "research/passive_capture_event_probe.py"
       - "research/slim_passive_capture_reconstruct.py"
+      - "research/slim_passive_capture_timeline.py"
       - ".github/workflows/passive-capture-event-probe.yml"
 
 jobs:
@@ -23,16 +24,19 @@ jobs:
         run: |
           python -m py_compile research/passive_capture_event_probe.py
           python -m py_compile research/slim_passive_capture_reconstruct.py
+          python -m py_compile research/slim_passive_capture_timeline.py
       - name: Probe clean SELL-shock events
         run: python research/passive_capture_event_probe.py
       - name: Reconstruct SLIM passive-capture economics
         run: python research/slim_passive_capture_reconstruct.py
+      - name: Trace SLIM convergence timeline
+        run: python research/slim_passive_capture_timeline.py
       - name: Show result
         run: |
-          echo '=== event probe ==='
-          cat research/output/passive_capture/event_probe.json
           echo '=== SLIM reconstruction ==='
           cat research/output/passive_capture/slim_reconstruction.json
+          echo '=== SLIM capture opportunities ==='
+          cat research/output/passive_capture/slim_capture_opportunities.csv
       - uses: actions/upload-artifact@v4
         if: always()
         with:
