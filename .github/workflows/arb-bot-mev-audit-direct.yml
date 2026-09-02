@@ -6,6 +6,7 @@ on:
     paths:
       - "research/arb_bot_mev_audit.py"
       - "research/arb_bot_mev_audit_v2.py"
+      - "research/arb_bot_mev_flow_probe.py"
       - ".github/workflows/arb-bot-mev-audit-direct.yml"
 
 jobs:
@@ -23,7 +24,7 @@ jobs:
         run: |
           mkdir -p research/output/mev_direct/input
           python - <<'PY'
-          import csv
+          import csv, json
           from pathlib import Path
           rows = [
               {
@@ -47,22 +48,52 @@ jobs:
           with p.open("w",encoding="utf-8-sig",newline="") as f:
               w=csv.DictWriter(f,fieldnames=list(rows[0]))
               w.writeheader(); w.writerows(rows)
+
+          cases = [
+              {
+                  "case":"ORCA",
+                  "mint":"orcaEKTdK7LKz57vaAYr9QeNsVEPfiu6QeMU1kektZE",
+                  "transactions":[
+                      {"label":"bot_pre_1","relation":"BEFORE_TRIGGER","tx_hash":"5Mg2GFZBS9J5DxUaKmcWa99Vt6LmBcrasx4FHrWnxweH7HUZYGuwno55khGcacmhJ93axwHv2Ki75k3CcTdi2HaM"},
+                      {"label":"bot_pre_2","relation":"BEFORE_TRIGGER","tx_hash":"5ceUS2wZZTRYBk43p48pM2EyHGyVCtJfZCSbqvxnjJhf1CtABcECaKy1uRCD4auv2MNUuu96xvq8SXyn56PB1xRv"},
+                      {"label":"trigger","relation":"TRIGGER","tx_hash":"2V9aJvXGCn7p7Thup9hFKNqKjBg8ohnoaGpTvqW6bR1M19hzyo4TK5eWhMhftZCnoNgVzTSJzD4A5ENHRxrssm7d"},
+                      {"label":"bot_post_1","relation":"AFTER_TRIGGER","tx_hash":"4JHg2vsKybCYAFDd1P2hrY8RbP2UJKRXKCdSubJ8LonAFCg1kJXivhroEXp5UEAiE82rDASKHWsKUJxt2czfVui"},
+                      {"label":"bot_post_2","relation":"AFTER_TRIGGER","tx_hash":"5QaiuYSwFXxk9sPKfSuf92P9QbjEExZNB3HUphifbwxgDboxMR8hBaDENZbJW5a12ghLzsYr3NZ2JUsnJ5GJYbij"}
+                  ]
+              },
+              {
+                  "case":"ZEC",
+                  "mint":"A7bdiYdS5GjqGFtxf17ppRHtDKPkkRqbKtR27dxvQXaS",
+                  "transactions":[
+                      {"label":"bot_pre_1","relation":"BEFORE_TRIGGER","tx_hash":"5H5dZvc6YL8zP4x9Wnq9gHGZ6WqYM5PB4KoXE3rR7w85mC7bNWmJDn887cFaLmn7Gfv6fGXZqW9h52pu7uetdzmU"},
+                      {"label":"trigger","relation":"TRIGGER","tx_hash":"4khGvHL23uV5Uf3YejML9B2q8rXJFG2YBKLk3LEgXSBRTzsu5iDH24xHm7RXN4Y51n1F7uFbh2DSTmbdtQ7kjTAP"}
+                  ]
+              }
+          ]
+          Path("research/output/mev_direct/input/flow_cases.json").write_text(json.dumps(cases,ensure_ascii=False,indent=2),encoding="utf-8")
           PY
       - name: Syntax check
         run: |
-          python -m py_compile research/arb_bot_mev_audit.py research/arb_bot_mev_audit_v2.py
+          python -m py_compile research/arb_bot_mev_audit.py research/arb_bot_mev_audit_v2.py research/arb_bot_mev_flow_probe.py
       - name: Run corrected MEV audit
         run: |
           python research/arb_bot_mev_audit_v2.py \
             --input-dir research/output/mev_direct/input \
             --output-dir research/output/mev_direct/result \
             --slot-radius 5
+      - name: Probe target mint exposure
+        run: |
+          python research/arb_bot_mev_flow_probe.py \
+            --cases-json research/output/mev_direct/input/flow_cases.json \
+            --output research/output/mev_direct/result/flow_probe.json
       - name: Show result
         if: always()
         run: |
           cat research/output/mev_direct/result/mev_audit_summary.csv || true
           echo '=== detail ==='
           cat research/output/mev_direct/result/mev_audit.md || true
+          echo '=== flow probe ==='
+          cat research/output/mev_direct/result/flow_probe.json || true
       - uses: actions/upload-artifact@v4
         if: always()
         with:
